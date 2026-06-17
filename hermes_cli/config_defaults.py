@@ -97,6 +97,10 @@ DEFAULT_CONFIG = {
         # on flaky primaries; raise it if you prefer to tolerate longer
         # provider hiccups on a single provider.
         "api_max_retries": 3,
+        # Base delay (seconds) for the first API retry backoff. Default 2s.
+        "retry_base_delay": 2.0,
+        # Upper cap (seconds) on any single API retry backoff wait. Default 60s.
+        "retry_max_delay": 60.0,
         "service_tier": "",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.

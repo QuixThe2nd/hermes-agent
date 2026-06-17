@@ -1861,6 +1861,17 @@ def init_agent(
         _api_retries = 3
     agent._api_max_retries = _api_retries
 
+    # Backoff timing for API retries. Defaults preserve the legacy retry
+    # behavior while allowing flaky-network users to tolerate longer outages.
+    try:
+        agent._retry_base_delay = float(_agent_section.get("retry_base_delay", 2.0))
+    except (TypeError, ValueError):
+        agent._retry_base_delay = 2.0
+    try:
+        agent._retry_max_delay = float(_agent_section.get("retry_max_delay", 60.0))
+    except (TypeError, ValueError):
+        agent._retry_max_delay = 60.0
+
     # Initialize context compressor for automatic context management
     # Compresses conversation when approaching model's context limit
     # Configuration via config.yaml (compression section)
