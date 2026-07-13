@@ -23,6 +23,7 @@ keep the exact logger name (``"agent.conversation_loop"``).
 from __future__ import annotations
 
 import os
+import time
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
@@ -84,6 +85,8 @@ def finalize_turn(
     _turn_exit_reason,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
+    turn_api_time=0.0,
+    turn_tool_time=0.0,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -139,7 +142,14 @@ def finalize_turn(
                 f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
                 "— requesting summary..."
             )
-        final_response = agent._handle_max_iterations(messages, api_call_count)
+        _summary_api_started = time.perf_counter()
+        try:
+            final_response = agent._handle_max_iterations(messages, api_call_count)
+        finally:
+            # The budget-exhaustion summary is a real API call made after the
+            # main loop, so include it in both timing and call-count metadata.
+            turn_api_time += time.perf_counter() - _summary_api_started
+            api_call_count += 1
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:
@@ -658,6 +668,8 @@ def finalize_turn(
         "last_reasoning": last_reasoning,
         "messages": messages,
         "api_calls": api_call_count,
+        "api_time": float(turn_api_time or 0.0),
+        "tool_time": float(turn_tool_time or 0.0),
         "completed": completed,
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,

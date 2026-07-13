@@ -779,6 +779,12 @@ class AIAgent:
         self.session_api_calls = 0
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
+        # Per-turn timing accumulators. The conversation loop mutates these
+        # in-place during a turn; the AIAgent.run_conversation forwarder
+        # copies them onto the result dict so the gateway footer always
+        # surfaces real values regardless of which return path executed.
+        self._turn_api_time = 0.0
+        self._turn_tool_time = 0.0
         self.session_cost_source = "none"
         
         # Turn counter (added after reset_session_state was first written — #2635)
