@@ -1185,6 +1185,10 @@ def build_turn_context(
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
 
+    # Keep hook provenance before gateway notes join the same API-content
+    # channel; display attribution must not call a gateway note a plugin.
+    _has_plugin_user_context = bool(plugin_user_context)
+
     # Gateway must-deliver notes (auto-reset note, first-contact intro,
     # voice-channel change) ride the same user-message injection channel as
     # plugin context so the ephemeral system prompt can stay byte-stable.
@@ -1264,9 +1268,11 @@ def build_turn_context(
     # MoA turns append per-call aggregated reference context to the same API
     # copy AFTER this composition, so the stamped bytes would never match the
     # wire either — skip the stamp rather than persist provably wrong "exact
-    # sent bytes" (MoA keeps its pre-sidecar cache behavior).
+    # sent bytes" (MoA keeps its pre-sidecar cache behavior). The virtual
+    # provider is also a MoA path even when no per-turn moa_config was passed.
+    _moa_turn = bool(moa_active or getattr(agent, "provider", None) == "moa")
     if (
-        not moa_active
+        not _moa_turn
         and getattr(agent, "api_mode", None) != "codex_app_server"
         and 0 <= current_turn_user_idx < len(messages)
         and messages[current_turn_user_idx].get("role") == "user"
@@ -1352,7 +1358,7 @@ def build_turn_context(
     # build, so claiming an injection there would be a lie).
     _progress_callback = getattr(agent, "tool_progress_callback", None)
     if (
-        not moa_active
+        not _moa_turn
         and getattr(agent, "api_mode", None) != "codex_app_server"
         and callable(_progress_callback)
         and 0 <= current_turn_user_idx < len(messages)
@@ -1375,7 +1381,6 @@ def build_turn_context(
             if (
                 isinstance(_clean, str)
                 and isinstance(_api, str)
-                and _clean
                 and _api != _clean
             ):
                 # Split into the exact bytes added around the clean text.
@@ -1412,14 +1417,13 @@ def build_turn_context(
                         _sources.append("gateway")
                     if ext_prefetch_cache:
                         _sources.append("memory")
-                    if plugin_user_context:
-                        _sources.append("plugin/gateway")
+                    if _has_plugin_user_context:
+                        _sources.append("plugin")
+                    if _gateway_notes and "gateway" not in _sources:
+                        _sources.append("gateway")
                     if not _sources:
                         _sources.append("gateway")
-                    if _prefix and _suffix:
-                        _display = _prefix + "\n[your message]\n" + _suffix
-                    else:
-                        _display = _prefix or _suffix
+                    _display = _prefix + _suffix
                     _progress_callback(
                         "context.injected",
                         "context",

@@ -272,7 +272,7 @@ class TestPrologueStamping:
         assert args[3] == {
             "content": "\n\nPLUGIN-CTX",
             "injected_chars": len("\n\nPLUGIN-CTX"),
-            "sources": ["plugin/gateway"],
+            "sources": ["plugin"],
         }
 
     def test_emits_combined_memory_and_plugin_suffix_exactly_once(self):
@@ -300,7 +300,7 @@ class TestPrologueStamping:
         assert "<memory-context>" in payload["content"]
         assert "RECALLED-MEMORY" in payload["content"]
         assert payload["content"].endswith("PLUGIN-CTX")
-        assert payload["sources"] == ["memory", "plugin/gateway"]
+        assert payload["sources"] == ["memory", "plugin"]
         assert payload["injected_chars"] == len(msg["api_content"]) - len(msg["content"])
 
     def test_callback_failure_never_blocks_api_content_stamp(self):
@@ -360,12 +360,66 @@ class TestPrologueStamping:
         args, _kwargs = agent.tool_progress_events[0]
         payload = args[3]
         assert payload["sources"] == ["gateway", "memory"]
-        assert payload["content"].startswith("[System note: restarted]\n\n")
-        assert "\n[your message]\n" in payload["content"]
-        assert payload["content"].endswith("</memory-context>")
+        prefix = "[System note: restarted]\n\n"
+        suffix = msg["api_content"][len(msg["content"]):]
+        assert payload["content"] == prefix + suffix
         assert payload["injected_chars"] == (
             len(msg["api_content"]) - len("explain agent communication")
         )
+
+    def test_emits_plugin_suffix_when_clean_text_is_empty(self):
+        agent = _FakeAgent()
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            return_value=[{"context": "PLUGIN-CTX"}],
+        ):
+            ctx = _build(agent, user_message="", persist_user_message="")
+
+        msg = ctx.messages[ctx.current_turn_user_idx]
+        assert msg["api_content"] == "\n\nPLUGIN-CTX"
+        assert len(agent.tool_progress_events) == 1
+        args, _kwargs = agent.tool_progress_events[0]
+        assert args[3] == {
+            "content": "\n\nPLUGIN-CTX",
+            "injected_chars": len("\n\nPLUGIN-CTX"),
+            "sources": ["plugin"],
+        }
+
+    def test_labels_gateway_turn_note_without_plugin_source(self):
+        agent = _FakeAgent()
+        setattr(agent, "_gateway_turn_context_notes", "GATEWAY-NOTE")
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            ctx = _build(agent)
+
+        msg = ctx.messages[ctx.current_turn_user_idx]
+        assert msg["api_content"] == "hello\n\nGATEWAY-NOTE"
+        assert len(agent.tool_progress_events) == 1
+        args, _kwargs = agent.tool_progress_events[0]
+        assert args[3] == {
+            "content": "\n\nGATEWAY-NOTE",
+            "injected_chars": len("\n\nGATEWAY-NOTE"),
+            "sources": ["gateway"],
+        }
+
+    def test_labels_plugin_and_gateway_turn_note_as_distinct_sources(self):
+        agent = _FakeAgent()
+        setattr(agent, "_gateway_turn_context_notes", "GATEWAY-NOTE")
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            return_value=[{"context": "PLUGIN-CTX"}],
+        ):
+            ctx = _build(agent)
+
+        msg = ctx.messages[ctx.current_turn_user_idx]
+        expected = "\n\nPLUGIN-CTX\n\nGATEWAY-NOTE"
+        assert msg["api_content"] == "hello" + expected
+        assert len(agent.tool_progress_events) == 1
+        args, _kwargs = agent.tool_progress_events[0]
+        assert args[3] == {
+            "content": expected,
+            "injected_chars": len(expected),
+            "sources": ["plugin", "gateway"],
+        }
 
     def test_no_stamp_without_injections(self):
         agent = _FakeAgent()
@@ -688,6 +742,17 @@ class TestPrologueMoaAndInPlaceBackfill:
         ):
             ctx = _build(agent, moa_active=True)
         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
+
+    def test_no_stamp_for_virtual_moa_provider_without_config(self):
+        agent = _FakeAgent()
+        agent.provider = "moa"
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            return_value=[{"context": "PLUGIN-CTX"}],
+        ):
+            ctx = _build(agent, moa_active=False)
+        assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
+        assert agent.tool_progress_events == []
 
     def test_inplace_compaction_backfills_sidecar_into_db(self):
         """In-place preflight compaction inserts the current-turn user row

@@ -3773,7 +3773,8 @@ def _format_context_injection_progress(
 ) -> list[str]:
     """Render API-bound ephemeral context as tool-style progress cards.
 
-    ``content`` is the exact suffix appended to the clean user message. The
+    ``content`` is the exact prefix and/or suffix added around the clean user
+    message, with the clean span removed and no synthetic separator bytes. The
     display copy is force-redacted and mention-neutralised before it leaves the
     gateway; the model still receives the untouched API content. Long blocks
     are split below the adapter's message cap so Discord/Telegram edits cannot
