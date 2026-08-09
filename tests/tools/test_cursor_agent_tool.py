@@ -79,6 +79,12 @@ class _FakeStdoutWithEof:
             self.eof_reached.set()
         return chunk
 
+    def read1(self, size: int = -1) -> bytes:
+        chunk = self._stream.read1(4096 if size < 0 else size)
+        if not chunk:
+            self.eof_reached.set()
+        return chunk
+
     def close(self):
         self._stream.close()
 
@@ -255,6 +261,7 @@ def test_parse_dedupes_duplicate_delegations():
     duplicate = json.dumps(
         {
             "type": "tool_call",
+            "call_id": "call-same-1",
             "tool_call": {
                 "taskToolCall": {
                     "args": {
@@ -268,6 +275,27 @@ def test_parse_dedupes_duplicate_delegations():
     )
     log = "\n".join([duplicate, duplicate])
     parsed = parse_cursor_agent_log(log)
+    assert len(parsed["delegations"]) == 1
+
+
+def test_parse_dedupes_duplicate_delegations_without_identity_keys():
+    from tools.cursor_agent_tool import parse_cursor_agent_log
+
+    duplicate = json.dumps(
+        {
+            "type": "tool_call",
+            "tool_call": {
+                "taskToolCall": {
+                    "args": {
+                        "description": "Same task",
+                        "subagentType": "explore",
+                        "model": "kimi-k3-high",
+                    }
+                }
+            },
+        }
+    )
+    parsed = parse_cursor_agent_log("\n".join([duplicate, duplicate]))
     assert len(parsed["delegations"]) == 1
 
 
@@ -575,3 +603,291 @@ def test_handler_force_string_false(monkeypatch, tmp_path):
 
     proc = _FakePopen.instances[0]
     assert "--force" not in proc.cmd
+
+
+def test_parse_distinct_call_ids_same_args_produce_two_records():
+    from tools.cursor_agent_tool import parse_cursor_agent_log
+
+    def _tool_call(call_id: str) -> str:
+        return json.dumps(
+            {
+                "type": "tool_call",
+                "call_id": call_id,
+                "tool_call": {
+                    "taskToolCall": {
+                        "args": {
+                            "description": "Same task",
+                            "subagentType": "explore",
+                            "model": "kimi-k3-high",
+                        }
+                    }
+                },
+            }
+        )
+
+    log = "\n".join([_tool_call("call-a"), _tool_call("call-b")])
+    parsed = parse_cursor_agent_log(log)
+    assert len(parsed["delegations"]) == 2
+    assert parsed["delegations"][0] == parsed["delegations"][1]
+
+
+def test_parse_started_and_completed_same_call_id_one_record():
+    from tools.cursor_agent_tool import parse_cursor_agent_log
+
+    started = json.dumps(
+        {
+            "type": "tool_call",
+            "call_id": "call-xyz",
+            "subtype": "started",
+            "tool_call": {
+                "taskToolCall": {
+                    "args": {
+                        "description": "Review module",
+                        "subagentType": "explore",
+                        "model": "kimi-k3-high",
+                    }
+                }
+            },
+        }
+    )
+    completed = json.dumps(
+        {
+            "type": "tool_call",
+            "call_id": "call-xyz",
+            "subtype": "completed",
+            "tool_call": {
+                "taskToolCall": {
+                    "args": {
+                        "description": "Review module",
+                        "subagentType": "explore",
+                        "model": "kimi-k3-high",
+                    }
+                }
+            },
+        }
+    )
+    parsed = parse_cursor_agent_log("\n".join([started, completed]))
+    assert len(parsed["delegations"]) == 1
+
+
+def test_parse_camel_and_snake_subagent_type_keys():
+    from tools.cursor_agent_tool import parse_cursor_agent_log
+
+    camel = json.dumps(
+        {
+            "type": "tool_call",
+            "call_id": "call-camel",
+            "tool_call": {
+                "taskToolCall": {
+                    "args": {
+                        "description": "Camel case",
+                        "subagentType": "explore",
+                        "model": "m1",
+                    }
+                }
+            },
+        }
+    )
+    snake = json.dumps(
+        {
+            "type": "tool_call",
+            "call_id": "call-snake",
+            "tool_call": {
+                "taskToolCall": {
+                    "args": {
+                        "description": "Snake case",
+                        "subagent_type": "implementer",
+                        "model": "m2",
+                    }
+                }
+            },
+        }
+    )
+    parsed = parse_cursor_agent_log("\n".join([camel, snake]))
+    assert len(parsed["delegations"]) == 2
+    assert parsed["delegations"][0]["subagent_type"] == "explore"
+    assert parsed["delegations"][1]["subagent_type"] == "implementer"
+
+
+def test_action_required_plain_text_line():
+    from tools.cursor_agent_tool import parse_cursor_agent_log
+
+    line = (
+        "ActionRequiredError: Named models unavailable Free plans can only use Auto. "
+        "Switch to Auto or upgrade plans to continue."
+    )
+    parsed = parse_cursor_agent_log(line)
+    assert parsed["action_required"] is not None
+    assert "Named models unavailable" in parsed["action_required"]["detail"]
+
+
+def test_action_required_json_string_line():
+    from tools.cursor_agent_tool import parse_cursor_agent_log
+
+    line = (
+        "ActionRequiredError: Named models unavailable Free plans can only use Auto. "
+        "Switch to Auto or upgrade plans to continue."
+    )
+    parsed = parse_cursor_agent_log(json.dumps(line))
+    assert parsed["action_required"] is not None
+    assert "Named models unavailable" in parsed["action_required"]["detail"]
+
+
+def test_action_required_json_string_prose_mention_not_triggered():
+    from tools.cursor_agent_tool import parse_cursor_agent_log
+
+    line = json.dumps("We saw an ActionRequiredError in docs but recovered.")
+    parsed = parse_cursor_agent_log(line)
+    assert parsed["action_required"] is None
+
+
+def test_action_required_malformed_lines_do_not_crash():
+    from tools.cursor_agent_tool import parse_cursor_agent_log
+
+    log = "\n".join(['{"broken json', "random garbage", "Error: something else"])
+    parsed = parse_cursor_agent_log(log)
+    assert parsed["action_required"] is None
+
+
+@pytest.mark.live_system_guard_bypass
+def test_incremental_stdout_updates_log_before_child_exit(monkeypatch, tmp_path):
+    import os
+    import sys
+
+    from tools import cursor_agent_tool
+
+    monkeypatch.setattr(cursor_agent_tool, "STALL_WATCHDOG_SECONDS", 5)
+    monkeypatch.setattr(cursor_agent_tool, "_MONITOR_POLL_SECONDS", 0.05)
+
+    child_script = (
+        "import sys, time\n"
+        "sys.stdout.write('chunk1\\n')\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(1.25)\n"
+        "sys.stdout.write('chunk2\\n')\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(0.1)\n"
+    )
+    cmd = [sys.executable, "-c", child_script]
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+
+    result_holder: dict = {}
+
+    def run() -> None:
+        result_holder["result"] = cursor_agent_tool._run_and_stream(
+            cmd,
+            workdir=str(tmp_path),
+            timeout_seconds=60,
+            log_dir=log_dir,
+            run_timestamp="test",
+        )
+
+    thread = threading.Thread(target=run)
+    thread.start()
+
+    found_chunk = False
+    child_pid: int | None = None
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        logs = list(log_dir.glob("*.jsonl"))
+        if logs and "chunk1" in logs[0].read_text(encoding="utf-8", errors="replace"):
+            found_chunk = True
+            assert thread.is_alive(), "run finished before chunk1 reached the log"
+            assert "result" not in result_holder, "run finished before chunk1 reached the log"
+            name_parts = logs[0].stem.rsplit("-", 1)
+            if len(name_parts) == 2 and name_parts[1].isdigit():
+                child_pid = int(name_parts[1])
+                os.kill(child_pid, 0)
+            break
+        time.sleep(0.05)
+
+    thread.join(timeout=10)
+    assert "result" in result_holder
+    error_code, _log_path, log_text, _duration, returncode = result_holder["result"]
+
+    assert found_chunk
+    if child_pid is not None:
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+    assert error_code != "stalled"
+    assert "chunk1" in log_text
+    assert "chunk2" in log_text
+    assert returncode == 0
+
+
+@pytest.mark.live_system_guard_bypass
+def test_terminate_process_kills_sigterm_resistant_descendant(tmp_path, monkeypatch):
+    import os
+    import signal
+    import subprocess
+    import sys
+
+    from tools.cursor_agent_tool import _terminate_process
+
+    monkeypatch.setattr("tools.cursor_agent_tool._TERMINATE_GRACE_SECONDS", 0.5)
+
+    desc_pid_file = tmp_path / "desc.pid"
+    leader_script = f"""
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+desc_script = '''
+import signal
+import time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+time.sleep(30)
+'''
+
+desc = subprocess.Popen([sys.executable, "-c", desc_script])
+Path({str(desc_pid_file)!r}).write_text(str(desc.pid))
+time.sleep(30)
+"""
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", leader_script],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    pgid: int | None = None
+    desc_pid: int | None = None
+    try:
+        for _ in range(100):
+            if desc_pid_file.is_file():
+                desc_pid = int(desc_pid_file.read_text(encoding="utf-8").strip())
+                break
+            time.sleep(0.05)
+        assert desc_pid is not None
+
+        try:
+            pgid = os.getpgid(proc.pid)
+        except (OSError, ProcessLookupError):
+            pgid = None
+
+        _terminate_process(proc, pgid)
+
+        assert proc.poll() is not None
+        assert proc.returncode == -signal.SIGTERM
+
+        with pytest.raises(ProcessLookupError):
+            os.kill(desc_pid, 0)
+    finally:
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+        elif proc.poll() is None:
+            try:
+                proc.kill()
+            except (OSError, ProcessLookupError):
+                pass
+        try:
+            proc.wait(timeout=1)
+        except Exception:
+            pass

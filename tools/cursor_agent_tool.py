@@ -145,6 +145,20 @@ def _extract_action_required_detail(event: Dict[str, Any]) -> str:
     return "Action required"
 
 
+def _is_action_required_plain_text(text: str) -> bool:
+    stripped = text.strip()
+    return stripped == "ActionRequiredError" or stripped.startswith("ActionRequiredError:")
+
+
+def _extract_action_required_plain_detail(text: str) -> str:
+    stripped = text.strip()
+    if stripped == "ActionRequiredError":
+        return ""
+    if stripped.startswith("ActionRequiredError:"):
+        return stripped[len("ActionRequiredError:") :].strip()
+    return "Action required"
+
+
 def _delegation_key(record: Dict[str, Any]) -> Tuple[Any, Any, Any]:
     return (
         record.get("description"),
@@ -153,11 +167,31 @@ def _delegation_key(record: Dict[str, Any]) -> Tuple[Any, Any, Any]:
     )
 
 
+def _delegation_dedupe_key(
+    event: Dict[str, Any],
+    task_call: Dict[str, Any],
+    record: Dict[str, Any],
+) -> Tuple[Any, ...]:
+    call_id = event.get("call_id")
+    if call_id is not None:
+        return ("call_id", call_id)
+
+    for source in (event, task_call):
+        if not isinstance(source, dict):
+            continue
+        for key in ("toolCallId", "agentId"):
+            value = source.get(key)
+            if value is not None:
+                return (key, value)
+
+    return ("content",) + _delegation_key(record)
+
+
 def parse_cursor_agent_log(log_text: str) -> Dict[str, Any]:
     """Parse a stream-json log into structured fields."""
     session_id: Optional[str] = None
     delegations: List[Dict[str, Any]] = []
-    seen_delegations: Set[Tuple[Any, Any, Any]] = set()
+    seen_delegations: Set[Tuple[Any, ...]] = set()
     final_report = ""
     action_required: Optional[Dict[str, Any]] = None
 
@@ -168,6 +202,17 @@ def parse_cursor_agent_log(log_text: str) -> Dict[str, Any]:
         try:
             event = json.loads(raw_line)
         except json.JSONDecodeError:
+            if _is_action_required_plain_text(raw_line):
+                action_required = {
+                    "detail": _extract_action_required_plain_detail(raw_line),
+                }
+            continue
+
+        if isinstance(event, str):
+            if _is_action_required_plain_text(event):
+                action_required = {
+                    "detail": _extract_action_required_plain_detail(event),
+                }
             continue
 
         if not isinstance(event, dict):
@@ -195,7 +240,7 @@ def parse_cursor_agent_log(log_text: str) -> Dict[str, Any]:
                     "subagent_type": args.get("subagentType") or args.get("subagent_type"),
                     "model": args.get("model"),
                 }
-                key = _delegation_key(record)
+                key = _delegation_dedupe_key(event, task_call, record)
                 if key not in seen_delegations:
                     seen_delegations.add(key)
                     delegations.append(record)
@@ -242,8 +287,36 @@ def _signal_process_group(proc: subprocess.Popen, sig: signal.Signals) -> bool:
         return False
 
 
-def _terminate_process(proc: subprocess.Popen) -> None:
-    if not _signal_process_group(proc, signal.SIGTERM):
+def _signal_pgid(pgid: int, sig: signal.Signals) -> bool:
+    try:
+        os.killpg(pgid, sig)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _wait_pgid_reap(pgid: int, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        except OSError as exc:
+            if getattr(exc, "errno", None) == 3:
+                return
+            return
+        time.sleep(0.05)
+
+
+def _terminate_process(proc: subprocess.Popen, pgid: Optional[int] = None) -> None:
+    if pgid is not None:
+        if not _signal_pgid(pgid, signal.SIGTERM):
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+    elif not _signal_process_group(proc, signal.SIGTERM):
         try:
             proc.terminate()
         except Exception:
@@ -251,11 +324,13 @@ def _terminate_process(proc: subprocess.Popen) -> None:
 
     try:
         proc.wait(timeout=_TERMINATE_GRACE_SECONDS)
-        return
     except Exception:
         pass
 
-    if not _signal_process_group(proc, signal.SIGKILL):
+    if pgid is not None:
+        _signal_pgid(pgid, signal.SIGKILL)
+        _wait_pgid_reap(pgid, _TERMINATE_GRACE_SECONDS)
+    elif not _signal_process_group(proc, signal.SIGKILL):
         try:
             proc.kill()
         except Exception:
@@ -321,6 +396,11 @@ def _run_and_stream(
         start_new_session=True,
     )
 
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (OSError, ProcessLookupError):
+        pgid = None
+
     log_path = log_dir / f"{run_timestamp}-{proc.pid}.jsonl"
     reader_done = threading.Event()
 
@@ -330,10 +410,14 @@ def _run_and_stream(
             assert proc.stdout is not None
             with open(log_path, "wb") as log_file:
                 while True:
-                    chunk = proc.stdout.read(4096)
+                    try:
+                        chunk = proc.stdout.read1(4096)
+                    except (OSError, ValueError):
+                        break
                     if not chunk:
                         break
                     log_file.write(chunk)
+                    log_file.flush()
                     last_byte_mono = time.monotonic()
         finally:
             try:
@@ -363,13 +447,13 @@ def _run_and_stream(
         time.sleep(_MONITOR_POLL_SECONDS)
 
     if error_code is not None:
-        _terminate_process(proc)
+        _terminate_process(proc, pgid)
 
     reader_thread.join(timeout=_TERMINATE_GRACE_SECONDS + 1.0)
     duration = time.monotonic() - start_mono
 
     if reader_thread.is_alive():
-        _terminate_process(proc)
+        _terminate_process(proc, pgid)
         return (
             "incomplete_output",
             str(log_path),
