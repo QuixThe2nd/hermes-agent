@@ -1145,3 +1145,42 @@ time.sleep(30)
             proc.wait(timeout=1)
         except Exception:
             pass
+def test_child_env_guarantees_home_and_local_bin(monkeypatch, tmp_path):
+    import os
+
+    from tools import cursor_agent_tool
+
+    captured = {}
+
+    class _EnvCapturePopen(_FakePopen):
+        def __init__(self, cmd, *, cwd=None, stdout=None, stderr=None, env=None, **kwargs):
+            super().__init__(cmd, cwd=cwd, stdout=stdout, stderr=stderr, **kwargs)
+            captured["env"] = env
+            self.stdout = _FakeStdoutWithEof(b"")
+
+        def poll(self):
+            if self.stdout.eof_reached.is_set():
+                return 0
+            return None
+
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.setattr("tools.cursor_agent_tool.resolve_cursor_agent_binary", lambda: "/usr/bin/agent")
+    monkeypatch.setattr("tools.cursor_agent_tool.subprocess.Popen", _EnvCapturePopen)
+
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+    result = json.loads(
+        cursor_agent_tool.delegate_cursor_agent(
+            task="x",
+            workdir=str(workdir.resolve()),
+        )
+    )
+
+    assert result["success"] is True
+    env = captured["env"]
+    assert env is not None
+    # HOME must be present and non-empty even though the caller env lacked it;
+    # the agent wrapper runs with `set -u` and dies on unbound $HOME.
+    assert env["HOME"] == str(Path.home())
+    # ~/.local/bin is prepended so binary resolution works under minimal PATH.
+    assert env["PATH"].split(os.pathsep)[0] == str(Path.home() / ".local" / "bin")

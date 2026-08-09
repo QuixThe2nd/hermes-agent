@@ -446,6 +446,17 @@ def _run_and_stream(
     start_mono = time.monotonic()
     last_byte_mono = start_mono
 
+    # NOTE(future-me): the agent wrapper script runs with `set -u` and dies on
+    # unbound $HOME in bare environments (transient systemd units, cron). The
+    # gateway unit sets HOME, but guarantee it here so any sparse-env caller
+    # works. Also prepend ~/.local/bin so binary resolution stays consistent
+    # when PATH is minimal.
+    env = os.environ.copy()
+    if not env.get("HOME"):
+        env["HOME"] = str(Path.home())
+    local_bin = str(Path.home() / ".local" / "bin")
+    env["PATH"] = local_bin + os.pathsep + env.get("PATH", "")
+
     proc = subprocess.Popen(
         cmd,
         cwd=workdir,
@@ -453,6 +464,7 @@ def _run_and_stream(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         start_new_session=True,
+        env=env,
     )
 
     try:
