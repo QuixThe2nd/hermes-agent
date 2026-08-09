@@ -3745,6 +3745,99 @@ def _reconnect_backoff(attempt: int) -> int:
     return min(30 * (2 ** (attempt - 1)), _RECONNECT_BACKOFF_CAP)
 
 
+def _split_context_progress_text(text: str, budget: int) -> list[str]:
+    """Split display text into bounded chunks, preferring line boundaries."""
+    if not text:
+        return []
+    budget = max(1, int(budget))
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > budget:
+        cut = remaining.rfind("\n", 0, budget + 1)
+        if cut < max(1, budget // 2):
+            cut = budget
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:]
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def _format_context_injection_progress(
+    *,
+    content: str,
+    injected_chars: int,
+    sources: list[str],
+    message_limit: int,
+    supports_code_blocks: bool,
+) -> list[str]:
+    """Render API-bound ephemeral context as tool-style progress cards.
+
+    ``content`` is the exact suffix appended to the clean user message. The
+    display copy is force-redacted and mention-neutralised before it leaves the
+    gateway; the model still receives the untouched API content. Long blocks
+    are split below the adapter's message cap so Discord/Telegram edits cannot
+    fail merely because Honcho returned a healthy amount of autobiography.
+    """
+    if not isinstance(content, str) or not content:
+        return []
+
+    from agent.redact import redact_sensitive_text
+
+    visible = redact_sensitive_text(
+        content,
+        force=True,
+        file_read=True,
+        redact_url_credentials=True,
+    )
+    # Context can quote old Discord messages containing literal mention tokens.
+    # Neutralise them even inside code blocks: adapter allowed-mention settings
+    # differ, and recalled text must never wake another user by accident.
+    visible = visible.replace("@", "@\u200b")
+
+    source_label = " + ".join(str(s) for s in sources if s) or "turn"
+    header = f"🧠 {source_label} context injected (+{max(0, int(injected_chars)):,} chars)"
+    continuation = f"🧠 {source_label} context injected (continued)"
+
+    try:
+        raw_limit = max(1, int(message_limit))
+    except (TypeError, ValueError):
+        raw_limit = 4000
+    # Mirror send_progress_messages' 64-char formatting margin.
+    limit = max(1, raw_limit - (64 if raw_limit > 128 else 0))
+
+    # Some test/plugin adapters advertise caps smaller than the card header.
+    # Rich framing is mathematically impossible there, so degrade to bounded
+    # plain chunks while preserving every display byte. Real chat adapters have
+    # much larger limits, but the helper's cap contract should still be true.
+    rich_overhead = len("\n```\n\n```") if supports_code_blocks else 1
+    if max(len(header), len(continuation)) + rich_overhead >= limit:
+        return (
+            _split_context_progress_text(header, limit)
+            + _split_context_progress_text(visible, limit)
+        )
+
+    if supports_code_blocks:
+        from gateway.stream_consumer import escape_code_fences_for_display
+
+        visible = escape_code_fences_for_display(visible)
+        overhead = max(len(header), len(continuation)) + len("\n```\n\n```")
+        budget = max(1, limit - overhead)
+        chunks = _split_context_progress_text(visible, budget)
+        return [
+            f"{header if index == 0 else continuation}\n```\n{chunk}\n```"
+            for index, chunk in enumerate(chunks)
+        ]
+
+    overhead = max(len(header), len(continuation)) + 1
+    budget = max(1, limit - overhead)
+    chunks = _split_context_progress_text(visible, budget)
+    return [
+        f"{header if index == 0 else continuation}\n{chunk}"
+        for index, chunk in enumerate(chunks)
+    ]
+
+
 class TurnRunner:
     """Per-turn collaborator carrying the tool-progress callbacks that used to
     be nested closures inside ``GatewayRunner._run_agent_inner``.
@@ -3801,6 +3894,47 @@ class TurnRunner:
             if not ctx.progress_queue:
                 return
         if not ctx.progress_queue or not ctx._run_still_current():
+            return
+
+        # Ephemeral memory/plugin context is composed before the first model
+        # call and is otherwise invisible: it is not a tool call and does not
+        # enter the clean transcript. Render it through the SAME editable
+        # progress queue as tool calls so the user sees exactly what the model
+        # received without needing a separate slash command.
+        if event_type == "context.injected":
+            if not ctx.tool_progress_enabled or not isinstance(args, dict):
+                return
+            content = args.get("content")
+            if not isinstance(content, str) or not content:
+                return
+            try:
+                adapter = self._runner._adapter_for_source(ctx.source)
+            except Exception:
+                adapter = None
+            if adapter is None:
+                return
+            try:
+                message_limit = int(
+                    adapter.max_message_length_for_chat(ctx.source.chat_id)
+                    if isinstance(adapter, BasePlatformAdapter)
+                    else getattr(adapter, "MAX_MESSAGE_LENGTH", 4000)
+                )
+            except Exception:
+                message_limit = 4000
+            messages = _format_context_injection_progress(
+                content=content,
+                injected_chars=args.get("injected_chars", len(content)),
+                sources=args.get("sources") if isinstance(args.get("sources"), list) else [],
+                message_limit=message_limit,
+                supports_code_blocks=bool(getattr(adapter, "supports_code_blocks", False)),
+            )
+            for message in messages:
+                ctx.progress_queue.put(message)
+            # A context card is its own progress beat. Do not let terminal-card
+            # header suppression or ordinary tool dedup bleed across it.
+            ctx.last_was_terminal_block[0] = False
+            ctx.last_progress_msg[0] = messages[-1] if messages else None
+            ctx.repeat_count[0] = 0
             return
 
         # First-touch onboarding: the first time a tool takes longer than

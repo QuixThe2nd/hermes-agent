@@ -1334,6 +1334,106 @@ def build_turn_context(
         if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
             agent._pending_cli_user_message = None
 
+    # ── Injection observability ──
+    # Two injection families can make the API-bound user message diverge from
+    # the clean transcript text:
+    #   suffix — memory prefetch / plugin context appended by
+    #     ``compose_user_api_content`` (stamped as the ``api_content`` sidecar
+    #     above);
+    #   prefix — gateway envelope text (interruption system notes, voice
+    #     prefixes) carried in the live content while the clean text arrives as
+    #     ``persist_user_message``.
+    # Emit one ``context.injected`` event carrying the exact bytes added around
+    # the clean text, so the gateway can render them in the tool-progress feed
+    # instead of the model silently seeing a different message than the user
+    # sent. Runs after the stamp/persist and before the first model call, only
+    # on API paths where the composed content is actually sent (same gate as
+    # the sidecar stamp: MoA and codex_app_server bypass the api_messages
+    # build, so claiming an injection there would be a lie).
+    _progress_callback = getattr(agent, "tool_progress_callback", None)
+    if (
+        not moa_active
+        and getattr(agent, "api_mode", None) != "codex_app_server"
+        and callable(_progress_callback)
+        and 0 <= current_turn_user_idx < len(messages)
+        and isinstance(messages[current_turn_user_idx], dict)
+        and messages[current_turn_user_idx].get("role") == "user"
+    ):
+        try:
+            _turn_msg = messages[current_turn_user_idx]
+            _clean = (
+                persist_user_message
+                if isinstance(persist_user_message, str)
+                else _turn_msg.get("content")
+            )
+            _sidecar = _turn_msg.get("api_content")
+            _api = (
+                _sidecar
+                if isinstance(_sidecar, str)
+                else _turn_msg.get("content")
+            )
+            if (
+                isinstance(_clean, str)
+                and isinstance(_api, str)
+                and _clean
+                and _api != _clean
+            ):
+                # Split into the exact bytes added around the clean text.
+                # Observed constructions only; anything else is skipped rather
+                # than misreported:
+                #   clean + suffix           (memory/plugin compose)
+                #   prefix + clean           (gateway envelope note)
+                #   prefix + clean + suffix  (envelope + compose combined)
+                _prefix = ""
+                _suffix = ""
+                _ok = False
+                if _api.startswith(_clean):
+                    _suffix = _api[len(_clean):]
+                    _ok = True
+                elif _api.endswith(_clean):
+                    _prefix = _api[:-len(_clean)]
+                    _ok = True
+                else:
+                    _content = _turn_msg.get("content")
+                    if (
+                        isinstance(_content, str)
+                        and _content.endswith(_clean)
+                        and _api.startswith(_content)
+                    ):
+                        _prefix = _content[:-len(_clean)]
+                        _suffix = _api[len(_content):]
+                        _ok = True
+                if not _ok or not (_prefix or _suffix):
+                    # Unrecognised divergence shape: show nothing.
+                    pass
+                else:
+                    _sources: list[str] = []
+                    if _prefix:
+                        _sources.append("gateway")
+                    if ext_prefetch_cache:
+                        _sources.append("memory")
+                    if plugin_user_context:
+                        _sources.append("plugin/gateway")
+                    if not _sources:
+                        _sources.append("gateway")
+                    if _prefix and _suffix:
+                        _display = _prefix + "\n[your message]\n" + _suffix
+                    else:
+                        _display = _prefix or _suffix
+                    _progress_callback(
+                        "context.injected",
+                        "context",
+                        None,
+                        {
+                            "content": _display,
+                            "injected_chars": len(_api) - len(_clean),
+                            "sources": _sources,
+                        },
+                    )
+        except Exception:
+            # Display plumbing must never block the model call.
+            logger.debug("context injection progress callback failed", exc_info=True)
+
     # Title the session from this user message, now — the row exists and the
     # turn has not called the model yet. Titling is derived from the user's
     # ask alone, so it runs concurrently with the turn instead of waiting for

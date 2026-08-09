@@ -192,6 +192,10 @@ class _FakeAgent:
         # Captures the user message's api_content at persist time, proving
         # the stamp lands BEFORE the early persist writes the row.
         self.api_content_at_persist = "<unset>"
+        self.tool_progress_events = []
+        self.tool_progress_callback = (
+            lambda *args, **kwargs: self.tool_progress_events.append((args, kwargs))
+        )
 
     def _ensure_db_session(self):
         pass
@@ -261,6 +265,107 @@ class TestPrologueStamping:
         assert msg["api_content"] == "hello\n\nPLUGIN-CTX"
         # The early persist saw the stamped sidecar (written in one insert).
         assert agent.api_content_at_persist == "hello\n\nPLUGIN-CTX"
+        assert len(agent.tool_progress_events) == 1
+        args, kwargs = agent.tool_progress_events[0]
+        assert kwargs == {}
+        assert args[:3] == ("context.injected", "context", None)
+        assert args[3] == {
+            "content": "\n\nPLUGIN-CTX",
+            "injected_chars": len("\n\nPLUGIN-CTX"),
+            "sources": ["plugin/gateway"],
+        }
+
+    def test_emits_combined_memory_and_plugin_suffix_exactly_once(self):
+        class _MemoryManager:
+            def on_turn_start(self, *_args):
+                pass
+
+            def prefetch_all(self, _query):
+                return "RECALLED-MEMORY"
+
+        agent = _FakeAgent()
+        agent._memory_manager = _MemoryManager()
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            return_value=[{"context": "PLUGIN-CTX"}],
+        ):
+            ctx = _build(agent, user_message="explain agent communication")
+
+        msg = ctx.messages[ctx.current_turn_user_idx]
+        assert len(agent.tool_progress_events) == 1
+        args, _kwargs = agent.tool_progress_events[0]
+        payload = args[3]
+        expected_suffix = msg["api_content"][len(msg["content"]):]
+        assert payload["content"] == expected_suffix
+        assert "<memory-context>" in payload["content"]
+        assert "RECALLED-MEMORY" in payload["content"]
+        assert payload["content"].endswith("PLUGIN-CTX")
+        assert payload["sources"] == ["memory", "plugin/gateway"]
+        assert payload["injected_chars"] == len(msg["api_content"]) - len(msg["content"])
+
+    def test_callback_failure_never_blocks_api_content_stamp(self):
+        agent = _FakeAgent()
+
+        def _broken_callback(*_args, **_kwargs):
+            raise RuntimeError("presentation broke")
+
+        agent.tool_progress_callback = _broken_callback
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            return_value=[{"context": "PLUGIN-CTX"}],
+        ):
+            ctx = _build(agent)
+        msg = ctx.messages[ctx.current_turn_user_idx]
+        assert msg["api_content"] == "hello\n\nPLUGIN-CTX"
+        assert agent.api_content_at_persist == "hello\n\nPLUGIN-CTX"
+
+    def test_emits_gateway_envelope_prefix_injection(self):
+        """Interruption system notes are PREPENDED to the user message
+        (gateway envelope), with the clean text carried as
+        persist_user_message. The event must surface the exact prefix."""
+        agent = _FakeAgent()
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            _build(
+                agent,
+                user_message="[System note: restarted]\n\nhello",
+                persist_user_message="hello",
+            )
+        assert len(agent.tool_progress_events) == 1
+        args, _kwargs = agent.tool_progress_events[0]
+        assert args[:3] == ("context.injected", "context", None)
+        assert args[3] == {
+            "content": "[System note: restarted]\n\n",
+            "injected_chars": len("[System note: restarted]\n\n"),
+            "sources": ["gateway"],
+        }
+
+    def test_emits_combined_envelope_prefix_and_memory_suffix(self):
+        class _MemoryManager:
+            def on_turn_start(self, *_args):
+                pass
+
+            def prefetch_all(self, _query):
+                return "RECALLED-MEMORY"
+
+        agent = _FakeAgent()
+        agent._memory_manager = _MemoryManager()
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            ctx = _build(
+                agent,
+                user_message="[System note: restarted]\n\nexplain agent communication",
+                persist_user_message="explain agent communication",
+            )
+        msg = ctx.messages[ctx.current_turn_user_idx]
+        assert len(agent.tool_progress_events) == 1
+        args, _kwargs = agent.tool_progress_events[0]
+        payload = args[3]
+        assert payload["sources"] == ["gateway", "memory"]
+        assert payload["content"].startswith("[System note: restarted]\n\n")
+        assert "\n[your message]\n" in payload["content"]
+        assert payload["content"].endswith("</memory-context>")
+        assert payload["injected_chars"] == (
+            len(msg["api_content"]) - len("explain agent communication")
+        )
 
     def test_no_stamp_without_injections(self):
         agent = _FakeAgent()
@@ -268,6 +373,7 @@ class TestPrologueStamping:
             ctx = _build(agent)
         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
         assert agent.api_content_at_persist is None
+        assert agent.tool_progress_events == []
 
     def test_no_stamp_for_codex_app_server(self):
         """codex_app_server turns bypass the api_messages build, so the
@@ -280,6 +386,7 @@ class TestPrologueStamping:
         ):
             ctx = _build(agent)
         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
+        assert agent.tool_progress_events == []
 
 
 # ---------------------------------------------------------------------------
