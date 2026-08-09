@@ -883,16 +883,111 @@ def test_parse_non_hashable_values_do_not_crash():
         assert len(parsed["delegations"]) == 1
 
 
+def test_parse_distinct_scalar_call_ids():
+    from tools.cursor_agent_tool import parse_cursor_agent_log
+
+    def _event(call_id):
+        return json.dumps(
+            {
+                "type": "tool_call",
+                "call_id": call_id,
+                "tool_call": {
+                    "taskToolCall": {
+                        "args": {
+                            "description": "scalar id",
+                            "subagentType": "explore",
+                            "model": "m",
+                        }
+                    }
+                },
+            }
+        )
+
+    log = "\n".join([_event(True), _event(1), _event(False), _event(0), _event(1.0)])
+    parsed = parse_cursor_agent_log(log)
+    assert len(parsed["delegations"]) == 5
+
+
+def test_parse_distinct_nested_scalar_call_ids():
+    from tools.cursor_agent_tool import parse_cursor_agent_log
+
+    def _event(call_id):
+        return json.dumps(
+            {
+                "type": "tool_call",
+                "call_id": call_id,
+                "tool_call": {
+                    "taskToolCall": {
+                        "args": {
+                            "description": "nested scalar id",
+                            "subagentType": "explore",
+                            "model": "m",
+                        }
+                    }
+                },
+            }
+        )
+
+    log = "\n".join(
+        [
+            _event({"flag": True}),
+            _event({"flag": 1}),
+            _event({"flag": False}),
+            _event({"flag": 0}),
+            _event({"value": 1}),
+            _event({"value": 1.0}),
+        ]
+    )
+    parsed = parse_cursor_agent_log(log)
+    assert len(parsed["delegations"]) == 6
+
+
+def _kill_process_group_or_pid(pgid: int | None, pid: int | None) -> None:
+    import os
+    import signal
+
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+            return
+        except (OSError, ProcessLookupError):
+            pass
+    if pid is not None:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+            return
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+
+
 @pytest.mark.live_system_guard_bypass
 def test_incremental_stdout_updates_log_before_child_exit(monkeypatch, tmp_path):
     import os
-    import signal
+    import subprocess
     import sys
 
     from tools import cursor_agent_tool
 
     monkeypatch.setattr(cursor_agent_tool, "STALL_WATCHDOG_SECONDS", 5)
     monkeypatch.setattr(cursor_agent_tool, "_MONITOR_POLL_SECONDS", 0.05)
+
+    spawn_info: dict[str, int | None] = {"pid": None, "pgid": None}
+    real_popen = subprocess.Popen
+
+    def _capturing_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawn_info["pid"] = proc.pid
+        try:
+            spawn_info["pgid"] = os.getpgid(proc.pid)
+        except (OSError, ProcessLookupError):
+            spawn_info["pgid"] = None
+        return proc
+
+    monkeypatch.setattr(cursor_agent_tool.subprocess, "Popen", _capturing_popen)
 
     child_script = (
         "import sys, time\n"
@@ -958,16 +1053,12 @@ def test_incremental_stdout_updates_log_before_child_exit(monkeypatch, tmp_path)
         assert "chunk2" in log_text
         assert returncode == 0
     finally:
-        if pgid is not None:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                pass
-        elif child_pid is not None:
-            try:
-                os.kill(child_pid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                pass
+        cleanup_pgid = pgid if pgid is not None else spawn_info.get("pgid")
+        cleanup_pid = child_pid if child_pid is not None else spawn_info.get("pid")
+        _kill_process_group_or_pid(
+            cleanup_pgid if isinstance(cleanup_pgid, int) else None,
+            cleanup_pid if isinstance(cleanup_pid, int) else None,
+        )
         thread.join(timeout=10)
 
 
@@ -1036,9 +1127,18 @@ time.sleep(30)
                 os.killpg(pgid, signal.SIGKILL)
             except (OSError, ProcessLookupError):
                 pass
-        elif proc.poll() is None:
+        else:
             try:
-                proc.kill()
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                if proc.poll() is None:
+                    try:
+                        proc.kill()
+                    except (OSError, ProcessLookupError):
+                        pass
+        if desc_pid is not None:
+            try:
+                os.kill(desc_pid, signal.SIGKILL)
             except (OSError, ProcessLookupError):
                 pass
         try:

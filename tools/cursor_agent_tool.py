@@ -169,8 +169,22 @@ def _delegation_key(record: Dict[str, Any]) -> Tuple[Any, Any, Any]:
 
 def _canonicalize_dedupe_token(value: Any) -> Any:
     """Convert a value into a deterministic hashable token for dedupe keys."""
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
+    if value is None:
+        return ("null", None)
+    if isinstance(value, bool):
+        return ("bool", value)
+    if isinstance(value, int):
+        return ("int", value)
+    if isinstance(value, float):
+        if value != value:
+            return ("float", "nan")
+        if value == float("inf"):
+            return ("float", "inf")
+        if value == float("-inf"):
+            return ("float", "-inf")
+        return ("float", value)
+    if isinstance(value, str):
+        return ("str", value)
     if isinstance(value, bytes):
         return ("bytes", value)
     try:
@@ -197,7 +211,11 @@ def _canonicalize_dedupe_token(value: Any) -> Any:
                     )
                 ),
             )
-        return json.dumps(value, sort_keys=True, default=str)
+        return ("json", json.dumps(value, sort_keys=True, default=str))
+    except Exception:
+        pass
+    try:
+        return ("json", json.dumps(value, sort_keys=True, default=str))
     except Exception:
         pass
     try:
