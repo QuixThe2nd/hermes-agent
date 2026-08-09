@@ -2418,6 +2418,7 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    _custom_unit_to_cp,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     build_auto_tts_output_path,
@@ -3745,17 +3746,26 @@ def _reconnect_backoff(attempt: int) -> int:
     return min(30 * (2 ** (attempt - 1)), _RECONNECT_BACKOFF_CAP)
 
 
-def _split_context_progress_text(text: str, budget: int) -> list[str]:
-    """Split display text into bounded chunks, preferring line boundaries."""
+def _split_context_progress_text(
+    text: str,
+    budget: int,
+    message_len_fn: Callable[[str], int] = len,
+) -> list[str]:
+    """Split display text by platform length units, preferring newlines."""
     if not text:
         return []
     budget = max(1, int(budget))
+    measure = message_len_fn if callable(message_len_fn) else len
     chunks: list[str] = []
     remaining = text
-    while len(remaining) > budget:
-        cut = remaining.rfind("\n", 0, budget + 1)
-        if cut < max(1, budget // 2):
-            cut = budget
+    while measure(remaining) > budget:
+        codepoint_budget = _custom_unit_to_cp(remaining, budget, measure)
+        # Real platform limits always fit at least one codepoint. Keep the
+        # loop progressing for pathological test/plugin metrics that do not.
+        codepoint_budget = max(1, codepoint_budget)
+        cut = remaining.rfind("\n", 0, codepoint_budget + 1)
+        if cut < max(1, codepoint_budget // 2):
+            cut = codepoint_budget
         chunks.append(remaining[:cut])
         remaining = remaining[cut:]
     if remaining:
@@ -3770,6 +3780,7 @@ def _format_context_injection_progress(
     sources: list[str],
     message_limit: int,
     supports_code_blocks: bool,
+    message_len_fn: Callable[[str], int] = len,
 ) -> list[str]:
     """Render API-bound ephemeral context as tool-style progress cards.
 
@@ -3799,6 +3810,7 @@ def _format_context_injection_progress(
     source_label = " + ".join(str(s) for s in sources if s) or "turn"
     header = f"🧠 {source_label} context injected (+{max(0, int(injected_chars)):,} chars)"
     continuation = f"🧠 {source_label} context injected (continued)"
+    measure = message_len_fn if callable(message_len_fn) else len
 
     try:
         raw_limit = max(1, int(message_limit))
@@ -3811,28 +3823,28 @@ def _format_context_injection_progress(
     # Rich framing is mathematically impossible there, so degrade to bounded
     # plain chunks while preserving every display byte. Real chat adapters have
     # much larger limits, but the helper's cap contract should still be true.
-    rich_overhead = len("\n```\n\n```") if supports_code_blocks else 1
-    if max(len(header), len(continuation)) + rich_overhead >= limit:
+    rich_overhead = measure("\n```\n\n```") if supports_code_blocks else measure("\n")
+    if max(measure(header), measure(continuation)) + rich_overhead >= limit:
         return (
-            _split_context_progress_text(header, limit)
-            + _split_context_progress_text(visible, limit)
+            _split_context_progress_text(header, limit, measure)
+            + _split_context_progress_text(visible, limit, measure)
         )
 
     if supports_code_blocks:
         from gateway.stream_consumer import escape_code_fences_for_display
 
         visible = escape_code_fences_for_display(visible)
-        overhead = max(len(header), len(continuation)) + len("\n```\n\n```")
+        overhead = max(measure(header), measure(continuation)) + measure("\n```\n\n```")
         budget = max(1, limit - overhead)
-        chunks = _split_context_progress_text(visible, budget)
+        chunks = _split_context_progress_text(visible, budget, measure)
         return [
             f"{header if index == 0 else continuation}\n```\n{chunk}\n```"
             for index, chunk in enumerate(chunks)
         ]
 
-    overhead = max(len(header), len(continuation)) + 1
+    overhead = max(measure(header), measure(continuation)) + measure("\n")
     budget = max(1, limit - overhead)
-    chunks = _split_context_progress_text(visible, budget)
+    chunks = _split_context_progress_text(visible, budget, measure)
     return [
         f"{header if index == 0 else continuation}\n{chunk}"
         for index, chunk in enumerate(chunks)
@@ -3922,12 +3934,21 @@ class TurnRunner:
                 )
             except Exception:
                 message_limit = 4000
+            message_len_fn: Callable[[str], int] = len
+            if isinstance(adapter, BasePlatformAdapter):
+                try:
+                    candidate_len_fn = adapter.message_len_fn_for_chat(ctx.source.chat_id)
+                    if callable(candidate_len_fn):
+                        message_len_fn = candidate_len_fn
+                except Exception:
+                    pass
             messages = _format_context_injection_progress(
                 content=content,
                 injected_chars=args.get("injected_chars", len(content)),
                 sources=args.get("sources") if isinstance(args.get("sources"), list) else [],
                 message_limit=message_limit,
                 supports_code_blocks=bool(getattr(adapter, "supports_code_blocks", False)),
+                message_len_fn=message_len_fn,
             )
             for message in messages:
                 ctx.progress_queue.put(message)

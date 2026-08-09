@@ -132,6 +132,65 @@ class TestTurnRunner:
         )
         assert "".join(displayed_chunks) == expected_display
 
+    def test_context_injection_respects_per_chat_utf16_limit(self):
+        from gateway.platforms.base import BasePlatformAdapter, utf16_len
+
+        class _Utf16Adapter(BasePlatformAdapter):
+            supports_code_blocks = True
+            MAX_MESSAGE_LENGTH = 4096
+
+            def __init__(self):
+                pass
+
+            async def connect(self, *, is_reconnect=False):
+                return True
+
+            async def disconnect(self):
+                return None
+
+            async def send(self, *args, **kwargs):
+                return None
+
+            async def get_chat_info(self, chat_id):
+                return {}
+
+            def max_message_length_for_chat(self, chat_id):
+                return 4096
+
+            def message_len_fn_for_chat(self, chat_id):
+                return utf16_len
+
+        progress_queue = queue_mod.Queue()
+        ctx = TurnContext(
+            source=SimpleNamespace(chat_id="c1"),
+            _run_still_current=lambda: True,
+            progress_mode="all",
+            tool_progress_enabled=True,
+            progress_queue=progress_queue,
+        )
+        runner = _make_runner(ctx, _Utf16Adapter())
+        runner.progress_callback(
+            "context.injected",
+            "context",
+            None,
+            {
+                "content": "😀" * 5000,
+                "injected_chars": 5000,
+                "sources": ["memory"],
+            },
+        )
+
+        messages = []
+        while not progress_queue.empty():
+            messages.append(progress_queue.get_nowait())
+        assert len(messages) > 1
+        assert all(utf16_len(message) <= 4032 for message in messages)
+        displayed_chunks = []
+        for message in messages:
+            body = message.split("\n", 1)[1]
+            displayed_chunks.append(body[4:-4])
+        assert "".join(displayed_chunks) == "😀" * 5000
+
     @pytest.mark.parametrize("message_limit", [1, 8, 40, 64, 128])
     def test_context_injection_respects_even_tiny_adapter_caps(self, message_limit):
         from gateway.run import _format_context_injection_progress
