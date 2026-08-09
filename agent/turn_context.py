@@ -1392,22 +1392,25 @@ def build_turn_context(
                 _prefix = ""
                 _suffix = ""
                 _ok = False
-                if _api.startswith(_clean):
+                _content = _turn_msg.get("content")
+                if (
+                    isinstance(_content, str)
+                    and _content.endswith(_clean)
+                    and _api.startswith(_content)
+                ):
+                    # The live content gives us the unambiguous clean-text
+                    # boundary. Prefer it when available: an injected prefix
+                    # may itself begin with the clean text, in which case the
+                    # generic startswith check below would rotate the bytes.
+                    _prefix = _content[:-len(_clean)] if _clean else _content
+                    _suffix = _api[len(_content):]
+                    _ok = True
+                elif _api.startswith(_clean):
                     _suffix = _api[len(_clean):]
                     _ok = True
                 elif _api.endswith(_clean):
                     _prefix = _api[:-len(_clean)]
                     _ok = True
-                else:
-                    _content = _turn_msg.get("content")
-                    if (
-                        isinstance(_content, str)
-                        and _content.endswith(_clean)
-                        and _api.startswith(_content)
-                    ):
-                        _prefix = _content[:-len(_clean)]
-                        _suffix = _api[len(_content):]
-                        _ok = True
                 if not _ok or not (_prefix or _suffix):
                     # Unrecognised divergence shape: show nothing.
                     pass

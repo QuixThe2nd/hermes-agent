@@ -367,6 +367,34 @@ class TestPrologueStamping:
             len(msg["api_content"]) - len("explain agent communication")
         )
 
+    @pytest.mark.parametrize(
+        ("hook_result", "suffix", "sources"),
+        [
+            ([], "", ["gateway"]),
+            ([{"context": "PLUGIN-CTX"}], "\n\nPLUGIN-CTX", ["gateway", "plugin"]),
+        ],
+    )
+    def test_prefix_starting_with_clean_uses_live_content_boundary(
+        self, hook_result, suffix, sources
+    ):
+        clean = "abc"
+        prefix = "abc-INJECTED-"
+        agent = _FakeAgent()
+        with patch("hermes_cli.plugins.invoke_hook", return_value=hook_result):
+            _build(
+                agent,
+                user_message=prefix + clean,
+                persist_user_message=clean,
+            )
+
+        assert len(agent.tool_progress_events) == 1
+        args, _kwargs = agent.tool_progress_events[0]
+        assert args[3] == {
+            "content": prefix + suffix,
+            "injected_chars": len(prefix + suffix),
+            "sources": sources,
+        }
+
     def test_emits_plugin_suffix_when_clean_text_is_empty(self):
         agent = _FakeAgent()
         with patch(
