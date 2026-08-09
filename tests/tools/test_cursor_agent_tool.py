@@ -749,9 +749,144 @@ def test_action_required_malformed_lines_do_not_crash():
     assert parsed["action_required"] is None
 
 
+def _task_call_event(**extra_fields) -> str:
+    base = {
+        "type": "tool_call",
+        "tool_call": {
+            "taskToolCall": {
+                "args": {
+                    "description": "Same task",
+                    "subagentType": "explore",
+                    "model": "kimi-k3-high",
+                }
+            }
+        },
+    }
+    base.update(extra_fields)
+    return json.dumps(base)
+
+
+def test_parse_dedupes_dict_valued_call_id():
+    from tools.cursor_agent_tool import parse_cursor_agent_log
+
+    event = _task_call_event(call_id={"a": 1, "b": 2})
+    parsed = parse_cursor_agent_log("\n".join([event, event]))
+    assert len(parsed["delegations"]) == 1
+
+
+def test_parse_dedupes_list_valued_call_id():
+    from tools.cursor_agent_tool import parse_cursor_agent_log
+
+    event = _task_call_event(call_id=["x", 1])
+    parsed = parse_cursor_agent_log("\n".join([event, event]))
+    assert len(parsed["delegations"]) == 1
+
+
+def test_parse_dedupes_dict_valued_call_id_key_order_stable():
+    from tools.cursor_agent_tool import parse_cursor_agent_log
+
+    first = _task_call_event(call_id={"b": 2, "a": 1})
+    second = _task_call_event(call_id={"a": 1, "b": 2})
+    parsed = parse_cursor_agent_log("\n".join([first, second]))
+    assert len(parsed["delegations"]) == 1
+
+
+def test_parse_dedupes_nested_dict_list_identity_keys():
+    from tools.cursor_agent_tool import parse_cursor_agent_log
+
+    tool_call_id = json.dumps(
+        {
+            "type": "tool_call",
+            "toolCallId": {"id": "nested", "seq": [1, 2]},
+            "tool_call": {
+                "taskToolCall": {
+                    "args": {
+                        "description": "Nested id",
+                        "subagentType": "explore",
+                        "model": "m1",
+                    }
+                }
+            },
+        }
+    )
+    agent_id = json.dumps(
+        {
+            "type": "tool_call",
+            "agentId": ["agent", 42],
+            "tool_call": {
+                "taskToolCall": {
+                    "args": {
+                        "description": "Agent id list",
+                        "subagentType": "explore",
+                        "model": "m2",
+                    }
+                }
+            },
+        }
+    )
+    parsed = parse_cursor_agent_log("\n".join([tool_call_id, tool_call_id, agent_id, agent_id]))
+    assert len(parsed["delegations"]) == 2
+
+
+def test_parse_dedupes_dict_list_content_fallback():
+    from tools.cursor_agent_tool import parse_cursor_agent_log
+
+    duplicate = json.dumps(
+        {
+            "type": "tool_call",
+            "tool_call": {
+                "taskToolCall": {
+                    "args": {
+                        "description": {"goal": "review", "scope": ["auth"]},
+                        "subagentType": "explore",
+                        "model": ["kimi-k3-high"],
+                    }
+                }
+            },
+        }
+    )
+    parsed = parse_cursor_agent_log("\n".join([duplicate, duplicate]))
+    assert len(parsed["delegations"]) == 1
+
+
+def test_parse_non_hashable_values_do_not_crash():
+    from tools.cursor_agent_tool import parse_cursor_agent_log
+
+    samples = [
+        {
+            "type": "tool_call",
+            "call_id": {"b": 2, "a": 1},
+            "tool_call": {
+                "taskToolCall": {
+                    "args": {
+                        "description": "x",
+                        "model": "m",
+                    }
+                }
+            },
+        },
+        {
+            "type": "tool_call",
+            "call_id": ["x", 1],
+            "tool_call": {
+                "taskToolCall": {
+                    "args": {
+                        "description": {"x": 1},
+                        "model": ["m"],
+                    }
+                }
+            },
+        },
+    ]
+    for event in samples:
+        parsed = parse_cursor_agent_log(json.dumps(event))
+        assert len(parsed["delegations"]) == 1
+
+
 @pytest.mark.live_system_guard_bypass
 def test_incremental_stdout_updates_log_before_child_exit(monkeypatch, tmp_path):
     import os
+    import signal
     import sys
 
     from tools import cursor_agent_tool
@@ -786,34 +921,54 @@ def test_incremental_stdout_updates_log_before_child_exit(monkeypatch, tmp_path)
     thread = threading.Thread(target=run)
     thread.start()
 
-    found_chunk = False
     child_pid: int | None = None
-    deadline = time.monotonic() + 3.0
-    while time.monotonic() < deadline:
-        logs = list(log_dir.glob("*.jsonl"))
-        if logs and "chunk1" in logs[0].read_text(encoding="utf-8", errors="replace"):
-            found_chunk = True
-            assert thread.is_alive(), "run finished before chunk1 reached the log"
-            assert "result" not in result_holder, "run finished before chunk1 reached the log"
-            name_parts = logs[0].stem.rsplit("-", 1)
-            if len(name_parts) == 2 and name_parts[1].isdigit():
-                child_pid = int(name_parts[1])
+    pgid: int | None = None
+    try:
+        found_chunk = False
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            logs = list(log_dir.glob("*.jsonl"))
+            if logs:
+                name_parts = logs[0].stem.rsplit("-", 1)
+                if child_pid is None and len(name_parts) == 2 and name_parts[1].isdigit():
+                    child_pid = int(name_parts[1])
+                    try:
+                        pgid = os.getpgid(child_pid)
+                    except (OSError, ProcessLookupError):
+                        pgid = None
+                if "chunk1" in logs[0].read_text(encoding="utf-8", errors="replace"):
+                    found_chunk = True
+                    assert thread.is_alive(), "run finished before chunk1 reached the log"
+                    assert "result" not in result_holder, "run finished before chunk1 reached the log"
+                    if child_pid is not None:
+                        os.kill(child_pid, 0)
+                    break
+            time.sleep(0.05)
+
+        thread.join(timeout=10)
+        assert "result" in result_holder
+        error_code, _log_path, log_text, _duration, returncode = result_holder["result"]
+
+        assert found_chunk
+        if child_pid is not None:
+            with pytest.raises(ProcessLookupError):
                 os.kill(child_pid, 0)
-            break
-        time.sleep(0.05)
-
-    thread.join(timeout=10)
-    assert "result" in result_holder
-    error_code, _log_path, log_text, _duration, returncode = result_holder["result"]
-
-    assert found_chunk
-    if child_pid is not None:
-        with pytest.raises(ProcessLookupError):
-            os.kill(child_pid, 0)
-    assert error_code != "stalled"
-    assert "chunk1" in log_text
-    assert "chunk2" in log_text
-    assert returncode == 0
+        assert error_code != "stalled"
+        assert "chunk1" in log_text
+        assert "chunk2" in log_text
+        assert returncode == 0
+    finally:
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+        elif child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+        thread.join(timeout=10)
 
 
 @pytest.mark.live_system_guard_bypass
@@ -854,7 +1009,11 @@ time.sleep(30)
         stderr=subprocess.DEVNULL,
     )
 
-    pgid: int | None = None
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (OSError, ProcessLookupError):
+        pgid = None
+
     desc_pid: int | None = None
     try:
         for _ in range(100):
@@ -863,11 +1022,6 @@ time.sleep(30)
                 break
             time.sleep(0.05)
         assert desc_pid is not None
-
-        try:
-            pgid = os.getpgid(proc.pid)
-        except (OSError, ProcessLookupError):
-            pgid = None
 
         _terminate_process(proc, pgid)
 

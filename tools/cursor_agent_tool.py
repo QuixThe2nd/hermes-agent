@@ -167,6 +167,45 @@ def _delegation_key(record: Dict[str, Any]) -> Tuple[Any, Any, Any]:
     )
 
 
+def _canonicalize_dedupe_token(value: Any) -> Any:
+    """Convert a value into a deterministic hashable token for dedupe keys."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, bytes):
+        return ("bytes", value)
+    try:
+        if isinstance(value, dict):
+            return (
+                "dict",
+                tuple(
+                    (_canonicalize_dedupe_token(k), _canonicalize_dedupe_token(v))
+                    for k, v in sorted(
+                        value.items(),
+                        key=lambda item: json.dumps(item[0], sort_keys=True, default=str),
+                    )
+                ),
+            )
+        if isinstance(value, (list, tuple)):
+            return ("list", tuple(_canonicalize_dedupe_token(item) for item in value))
+        if isinstance(value, set):
+            return (
+                "set",
+                tuple(
+                    sorted(
+                        json.dumps(_canonicalize_dedupe_token(item), sort_keys=True, default=str)
+                        for item in value
+                    )
+                ),
+            )
+        return json.dumps(value, sort_keys=True, default=str)
+    except Exception:
+        pass
+    try:
+        return ("repr", repr(value))
+    except Exception:
+        return ("type", type(value).__name__)
+
+
 def _delegation_dedupe_key(
     event: Dict[str, Any],
     task_call: Dict[str, Any],
@@ -174,7 +213,7 @@ def _delegation_dedupe_key(
 ) -> Tuple[Any, ...]:
     call_id = event.get("call_id")
     if call_id is not None:
-        return ("call_id", call_id)
+        return ("call_id", _canonicalize_dedupe_token(call_id))
 
     for source in (event, task_call):
         if not isinstance(source, dict):
@@ -182,9 +221,11 @@ def _delegation_dedupe_key(
         for key in ("toolCallId", "agentId"):
             value = source.get(key)
             if value is not None:
-                return (key, value)
+                return (key, _canonicalize_dedupe_token(value))
 
-    return ("content",) + _delegation_key(record)
+    return ("content",) + tuple(
+        _canonicalize_dedupe_token(part) for part in _delegation_key(record)
+    )
 
 
 def parse_cursor_agent_log(log_text: str) -> Dict[str, Any]:
