@@ -191,6 +191,51 @@ class TestTurnRunner:
             displayed_chunks.append(body[4:-4])
         assert "".join(displayed_chunks) == "😀" * 5000
 
+    def test_context_injection_respects_duck_typed_per_chat_utf16_limit(self):
+        from gateway.platforms.base import utf16_len
+
+        class _DuckUtf16Adapter:
+            supports_code_blocks = True
+            MAX_MESSAGE_LENGTH = 100
+
+            def max_message_length_for_chat(self, chat_id):
+                return 100
+
+            def message_len_fn_for_chat(self, chat_id):
+                return utf16_len
+
+        progress_queue = queue_mod.Queue()
+        ctx = TurnContext(
+            source=SimpleNamespace(chat_id="c1"),
+            _run_still_current=lambda: True,
+            progress_mode="all",
+            tool_progress_enabled=True,
+            progress_queue=progress_queue,
+        )
+        runner = _make_runner(ctx, _DuckUtf16Adapter())
+        runner.progress_callback(
+            "context.injected",
+            "context",
+            "",
+            {
+                "content": "😀" * 200,
+                "injected_chars": 200,
+                "sources": ["memory"],
+            },
+        )
+
+        messages = []
+        while not progress_queue.empty():
+            messages.append(progress_queue.get_nowait())
+        assert len(messages) > 1
+        assert all(utf16_len(message) <= 100 for message in messages)
+
+    def test_context_injection_suppresses_unrepresentable_unit_budget(self):
+        from gateway.platforms.base import utf16_len
+        from gateway.run import _split_context_progress_text
+
+        assert _split_context_progress_text("😀", 1, utf16_len) == []
+
     @pytest.mark.parametrize("message_limit", [1, 8, 40, 64, 128])
     def test_context_injection_respects_even_tiny_adapter_caps(self, message_limit):
         from gateway.run import _format_context_injection_progress

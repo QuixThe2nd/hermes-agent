@@ -3760,9 +3760,10 @@ def _split_context_progress_text(
     remaining = text
     while measure(remaining) > budget:
         codepoint_budget = _custom_unit_to_cp(remaining, budget, measure)
-        # Real platform limits always fit at least one codepoint. Keep the
-        # loop progressing for pathological test/plugin metrics that do not.
-        codepoint_budget = max(1, codepoint_budget)
+        if codepoint_budget <= 0:
+            # The adapter's unit budget cannot represent even one codepoint.
+            # Fail closed instead of queuing a card the platform will reject.
+            return []
         cut = remaining.rfind("\n", 0, codepoint_budget + 1)
         if cut < max(1, codepoint_budget // 2):
             cut = codepoint_budget
@@ -3926,18 +3927,30 @@ class TurnRunner:
                 adapter = None
             if adapter is None:
                 return
+
+            def _declared_adapter_callable(name: str):
+                """Resolve real adapter capabilities without MagicMock attrs."""
+                try:
+                    inspect.getattr_static(adapter, name)
+                    candidate = getattr(adapter, name)
+                except Exception:
+                    return None
+                return candidate if callable(candidate) else None
+
+            chat_limit_fn = _declared_adapter_callable("max_message_length_for_chat")
             try:
                 message_limit = int(
-                    adapter.max_message_length_for_chat(ctx.source.chat_id)
-                    if isinstance(adapter, BasePlatformAdapter)
+                    chat_limit_fn(ctx.source.chat_id)
+                    if chat_limit_fn is not None
                     else getattr(adapter, "MAX_MESSAGE_LENGTH", 4000)
                 )
             except Exception:
                 message_limit = 4000
             message_len_fn: Callable[[str], int] = len
-            if isinstance(adapter, BasePlatformAdapter):
+            chat_len_fn = _declared_adapter_callable("message_len_fn_for_chat")
+            if chat_len_fn is not None:
                 try:
-                    candidate_len_fn = adapter.message_len_fn_for_chat(ctx.source.chat_id)
+                    candidate_len_fn = chat_len_fn(ctx.source.chat_id)
                     if callable(candidate_len_fn):
                         message_len_fn = candidate_len_fn
                 except Exception:
