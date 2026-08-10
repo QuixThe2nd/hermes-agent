@@ -1,0 +1,510 @@
+"""Behavior-contract tests for delegate_claude_agent."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+# Reusable marker for tests that spawn a real (fake-binary) subprocess and
+# signal it. The conftest live-system guard allows signals inside the test's
+# own process subtree, so these do not need to bypass it — but we keep the
+# marker for clarity and in case a stricter guard is added later.
+_REAL_SUBPROC = pytest.mark.live_system_guard_bypass
+
+
+def _write_fake_binary(tmp_path: Path) -> Path:
+    """Write a fake claude-glm binary driven by FAKE_CLAUDE_* env vars."""
+    script = f"""#!{sys.executable}
+import json
+import os
+import sys
+import time
+
+mode = os.environ.get("FAKE_CLAUDE_MODE", "success")
+
+argv_out = os.environ.get("FAKE_CLAUDE_ARGV_OUT")
+if argv_out:
+    with open(argv_out, "w", encoding="utf-8") as fh:
+        json.dump(sys.argv, fh)
+
+env_out = os.environ.get("FAKE_CLAUDE_ENV_OUT")
+if env_out:
+    with open(env_out, "w", encoding="utf-8") as fh:
+        json.dump({{"HOME": os.environ.get("HOME"), "PATH": os.environ.get("PATH", "")}}, fh)
+
+if mode == "sleep":
+    try:
+        time.sleep(float(os.environ.get("FAKE_CLAUDE_SLEEP", "30")))
+    except Exception:
+        pass
+    sys.exit(0)
+
+if mode == "garbage":
+    sys.stdout.write("not json line 1\\nnot json line 2\\n")
+    sys.stdout.flush()
+    sys.exit(0)
+
+if mode == "empty":
+    sys.exit(0)
+
+if mode == "exitnonzero":
+    sys.stdout.write('{{"type":"result","subtype":"success","is_error":false,"result":"x"}}\\n')
+    sys.stdout.flush()
+    sys.exit(2)
+
+models_str = os.environ.get("FAKE_CLAUDE_MODELS", "glm-5.2")
+model_usage = {{}}
+for _name in models_str.split(","):
+    _name = _name.strip()
+    if _name:
+        model_usage[_name] = {{"input_tokens": 100, "output_tokens": 50}}
+
+result = {{
+    "type": "result",
+    "subtype": os.environ.get("FAKE_CLAUDE_SUBTYPE", "success"),
+    "is_error": os.environ.get("FAKE_CLAUDE_IS_ERROR", "false").lower() == "true",
+    "result": os.environ.get("FAKE_CLAUDE_RESULT_TEXT", "Done."),
+    "session_id": os.environ.get("FAKE_CLAUDE_SESSION_ID", "sess-claude-1"),
+    "num_turns": int(os.environ.get("FAKE_CLAUDE_NUM_TURNS", "3")),
+    "duration_ms": int(os.environ.get("FAKE_CLAUDE_DURATION_MS", "12345")),
+    "total_cost_usd": float(os.environ.get("FAKE_CLAUDE_COST", "0.0123")),
+    "modelUsage": model_usage,
+    "permission_denials": json.loads(os.environ.get("FAKE_CLAUDE_DENIALS", "[]")),
+}}
+sys.stdout.write(json.dumps(result) + "\\n")
+sys.stdout.flush()
+"""
+    binary = tmp_path / "claude-glm"
+    binary.write_text(script, encoding="utf-8")
+    binary.chmod(0o755)
+    return binary
+
+
+@pytest.fixture
+def fake_binary(tmp_path: Path) -> Path:
+    return _write_fake_binary(tmp_path)
+
+
+@pytest.fixture
+def repo(tmp_path: Path) -> Path:
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+    return workdir
+
+
+def _patch_binary(monkeypatch, binary: Path) -> None:
+    monkeypatch.setattr(
+        "tools.claude_agent_tool.resolve_claude_binary",
+        lambda: str(binary),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Schema + registration
+# ---------------------------------------------------------------------------
+
+def test_schema_registration():
+    import tools.claude_agent_tool  # noqa: F401
+    from tools.registry import registry
+
+    entry = registry.get_entry("delegate_claude_agent")
+    assert entry is not None
+    assert entry.toolset == "delegation"
+    assert entry.max_result_size_chars == 100_000
+
+    schema = entry.schema
+    required = set(schema["parameters"]["required"])
+    assert required == {"task", "workdir"}
+
+    props = schema["parameters"]["properties"]
+    assert props["model"]["default"] == "glm-5.2"
+    assert props["timeout_seconds"]["default"] == 1800
+    assert props["allowed_tools"]["default"] == "Read,Write,Edit,Glob,Grep,Bash"
+    assert props["permission_mode"]["default"] == "acceptEdits"
+    assert set(props["permission_mode"]["enum"]) == {"acceptEdits", "plan"}
+
+
+# ---------------------------------------------------------------------------
+# Binary resolution + gating
+# ---------------------------------------------------------------------------
+
+def test_check_fn_binary_found(monkeypatch, fake_binary):
+    from tools.claude_agent_tool import check_claude_agent_requirements
+
+    monkeypatch.setattr(
+        "tools.claude_agent_tool.resolve_claude_binary", lambda: str(fake_binary)
+    )
+    assert check_claude_agent_requirements() is True
+
+
+def test_check_fn_binary_missing(monkeypatch):
+    from tools.claude_agent_tool import check_claude_agent_requirements
+
+    monkeypatch.setattr("tools.claude_agent_tool.resolve_claude_binary", lambda: None)
+    assert check_claude_agent_requirements() is False
+
+
+def test_resolve_env_override(monkeypatch, fake_binary, tmp_path):
+    from tools.claude_agent_tool import resolve_claude_binary
+
+    monkeypatch.setenv("CLAUDE_GLM_BIN", str(fake_binary))
+    assert resolve_claude_binary() == str(fake_binary)
+
+
+def test_resolve_env_override_must_be_executable_file(monkeypatch, tmp_path):
+    from tools.claude_agent_tool import resolve_claude_binary
+
+    bogus = tmp_path / "nope"
+    monkeypatch.setenv("CLAUDE_GLM_BIN", str(bogus))
+    # Override points at a non-existent file → fall through to the rest.
+    monkeypatch.setattr("tools.claude_agent_tool.shutil.which", lambda name: None)
+    # A plain non-existent Path: is_file() is naturally False, exercising the
+    # real branch without the _flavour breakage a Path subclass would cause.
+    monkeypatch.setattr(
+        "tools.claude_agent_tool._local_bin_claude_glm_path",
+        lambda: Path("/nope/claude-glm"),
+    )
+    assert resolve_claude_binary() is None
+
+
+def test_resolve_local_bin(monkeypatch, fake_binary):
+    from tools.claude_agent_tool import resolve_claude_binary
+
+    monkeypatch.delenv("CLAUDE_GLM_BIN", raising=False)
+    monkeypatch.setattr("tools.claude_agent_tool.shutil.which", lambda name: None)
+    monkeypatch.setattr(
+        "tools.claude_agent_tool._local_bin_claude_glm_path", lambda: fake_binary
+    )
+    assert resolve_claude_binary() == str(fake_binary)
+
+
+def test_resolve_path_fallbacks(monkeypatch, tmp_path):
+    from tools.claude_agent_tool import resolve_claude_binary
+
+    monkeypatch.delenv("CLAUDE_GLM_BIN", raising=False)
+    monkeypatch.setattr(
+        "tools.claude_agent_tool._local_bin_claude_glm_path",
+        lambda: Path("/nope/claude-glm"),
+    )
+    # claude-glm on PATH wins over bare claude.
+    monkeypatch.setattr(
+        "tools.claude_agent_tool.shutil.which",
+        lambda name: "/usr/bin/claude-glm" if name == "claude-glm" else "/usr/bin/claude",
+    )
+    assert resolve_claude_binary() == "/usr/bin/claude-glm"
+
+    # Falls back to bare claude when claude-glm is absent.
+    monkeypatch.setattr(
+        "tools.claude_agent_tool.shutil.which",
+        lambda name: "/usr/bin/claude" if name == "claude" else None,
+    )
+    assert resolve_claude_binary() == "/usr/bin/claude"
+
+    # Nothing resolvable → None.
+    monkeypatch.setattr("tools.claude_agent_tool.shutil.which", lambda name: None)
+    assert resolve_claude_binary() is None
+
+
+# ---------------------------------------------------------------------------
+# Timeout clamping
+# ---------------------------------------------------------------------------
+
+def test_clamp_timeout_seconds():
+    from tools.claude_agent_tool import (
+        DEFAULT_TIMEOUT_SECONDS,
+        MAX_TIMEOUT_SECONDS,
+        MIN_TIMEOUT_SECONDS,
+        _clamp_timeout_seconds,
+    )
+
+    assert _clamp_timeout_seconds(59) == MIN_TIMEOUT_SECONDS
+    assert _clamp_timeout_seconds(3601) == MAX_TIMEOUT_SECONDS
+    assert _clamp_timeout_seconds("garbage") == DEFAULT_TIMEOUT_SECONDS
+    assert _clamp_timeout_seconds(None) == DEFAULT_TIMEOUT_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# Log parsing
+# ---------------------------------------------------------------------------
+
+def test_parse_result_extracts_fields():
+    from tools.claude_agent_tool import parse_claude_agent_log
+
+    line = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "All done.",
+            "session_id": "sess-1",
+            "num_turns": 4,
+            "duration_ms": 999,
+            "total_cost_usd": 0.05,
+            "modelUsage": {
+                "glm-5.2": {"input_tokens": 10},
+                "claude-haiku-4-5": {"input_tokens": 5},
+            },
+            "permission_denials": [{"tool": "Bash"}],
+        }
+    )
+    parsed = parse_claude_agent_log(line + "\n")
+    assert parsed["subtype"] == "success"
+    assert parsed["is_error"] is False
+    assert parsed["result"] == "All done."
+    assert parsed["session_id"] == "sess-1"
+    assert parsed["num_turns"] == 4
+    assert parsed["duration_ms"] == 999
+    assert parsed["total_cost_usd"] == 0.05
+    assert parsed["models_used"] == ["claude-haiku-4-5", "glm-5.2"]
+    assert parsed["permission_denials"] == [{"tool": "Bash"}]
+
+
+def test_parse_last_result_line_wins():
+    from tools.claude_agent_tool import parse_claude_agent_log
+
+    first = json.dumps({"type": "result", "subtype": "success", "result": "old"})
+    second = json.dumps({"type": "result", "subtype": "error", "is_error": True, "result": "new"})
+    parsed = parse_claude_agent_log("\n".join([first, second]))
+    assert parsed["result"] == "new"
+    assert parsed["subtype"] == "error"
+
+
+def test_parse_no_result_event_returns_empty():
+    from tools.claude_agent_tool import parse_claude_agent_log
+
+    assert parse_claude_agent_log("not json\n") == {}
+    assert parse_claude_agent_log("") == {}
+    assert parse_claude_agent_log('{"type":"assistant","message":{}}') == {}
+
+
+# ---------------------------------------------------------------------------
+# Validation paths (no subprocess spawned)
+# ---------------------------------------------------------------------------
+
+def test_validation_errors_use_full_result_shape(monkeypatch, tmp_path, fake_binary):
+    from tools import claude_agent_tool
+
+    _patch_binary(monkeypatch, fake_binary)
+
+    empty = json.loads(claude_agent_tool.delegate_claude_agent(task="", workdir=str(tmp_path)))
+    assert empty["success"] is False
+    assert empty["error"]
+    assert empty["log_path"] is None
+    assert "final_report" in empty
+    assert "models_used" in empty
+    assert "permission_denials" in empty
+
+    relative = json.loads(
+        claude_agent_tool.delegate_claude_agent(task="x", workdir="relative/path")
+    )
+    assert relative["success"] is False
+    assert "absolute path" in relative["error"]
+
+    missing = json.loads(
+        claude_agent_tool.delegate_claude_agent(
+            task="x",
+            workdir=str((tmp_path / "missing").resolve()),
+        )
+    )
+    assert missing["success"] is False
+    assert "does not exist" in missing["error"]
+
+
+def test_permission_mode_validation_rejects_unknown(monkeypatch, repo, fake_binary):
+    from tools import claude_agent_tool
+
+    _patch_binary(monkeypatch, fake_binary)
+    result = json.loads(
+        claude_agent_tool.delegate_claude_agent(
+            task="x",
+            workdir=str(repo),
+            permission_mode="yolo",
+        )
+    )
+    assert result["success"] is False
+    assert "permission_mode" in result["error"]
+    assert "acceptEdits" in result["error"]
+
+
+def test_binary_missing_returns_error(monkeypatch, repo):
+    from tools import claude_agent_tool
+
+    monkeypatch.setattr("tools.claude_agent_tool.resolve_claude_binary", lambda: None)
+    result = json.loads(
+        claude_agent_tool.delegate_claude_agent(task="x", workdir=str(repo))
+    )
+    assert result["success"] is False
+    assert "not found" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# Happy path + result parsing (real fake-binary subprocess)
+# ---------------------------------------------------------------------------
+
+@_REAL_SUBPROC
+def test_happy_path_e2e(monkeypatch, repo, fake_binary, tmp_path):
+    from tools import claude_agent_tool
+
+    _patch_binary(monkeypatch, fake_binary)
+    monkeypatch.setenv("FAKE_CLAUDE_RESULT_TEXT", "Implemented feature.")
+    monkeypatch.setenv("FAKE_CLAUDE_SESSION_ID", "sess-claude-xyz")
+    monkeypatch.setenv("FAKE_CLAUDE_NUM_TURNS", "5")
+    monkeypatch.setenv("FAKE_CLAUDE_COST", "0.0775")
+    monkeypatch.setenv("FAKE_CLAUDE_MODELS", "glm-5.2,claude-haiku-4-5")
+    monkeypatch.setenv("FAKE_CLAUDE_DENIALS", '[{"tool":"Bash","reason":"nope"}]')
+    argv_out = tmp_path / "argv.json"
+    monkeypatch.setenv("FAKE_CLAUDE_ARGV_OUT", str(argv_out))
+
+    result = json.loads(
+        claude_agent_tool.delegate_claude_agent(
+            task="implement feature",
+            workdir=str(repo),
+        )
+    )
+
+    assert result["success"] is True
+    assert result["error"] is None
+    assert result["final_report"] == "Implemented feature."
+    assert result["session_id"] == "sess-claude-xyz"
+    assert result["num_turns"] == 5
+    assert result["cost_usd"] == 0.0775
+    assert result["models_used"] == ["claude-haiku-4-5", "glm-5.2"]
+    assert result["permission_denials"] == [{"tool": "Bash", "reason": "nope"}]
+    assert "claude-runs" in result["log_path"]
+    assert Path(result["log_path"]).is_file()
+
+    argv = json.loads(argv_out.read_text(encoding="utf-8"))
+    assert argv[0] == str(fake_binary)
+    assert "-p" in argv
+    assert "--model" in argv
+    assert argv[argv.index("--model") + 1] == "glm-5.2"
+    assert "--permission-mode" in argv
+    assert argv[argv.index("--permission-mode") + 1] == "acceptEdits"
+    assert "--allowedTools" in argv
+    assert argv[argv.index("--allowedTools") + 1] == "Read,Write,Edit,Glob,Grep,Bash"
+    assert "--output-format" in argv
+    assert argv[argv.index("--output-format") + 1] == "json"
+    assert argv[-1] == "implement feature"
+    # --dangerously-skip-permissions must never be passed (refused under root).
+    assert "--dangerously-skip-permissions" not in argv
+
+
+@_REAL_SUBPROC
+def test_plan_permission_mode_passed_through(monkeypatch, repo, fake_binary, tmp_path):
+    from tools import claude_agent_tool
+
+    _patch_binary(monkeypatch, fake_binary)
+    argv_out = tmp_path / "argv.json"
+    monkeypatch.setenv("FAKE_CLAUDE_ARGV_OUT", str(argv_out))
+
+    claude_agent_tool.delegate_claude_agent(
+        task="plan something",
+        workdir=str(repo),
+        permission_mode="plan",
+    )
+    argv = json.loads(argv_out.read_text(encoding="utf-8"))
+    assert argv[argv.index("--permission-mode") + 1] == "plan"
+
+
+@_REAL_SUBPROC
+def test_is_error_path(monkeypatch, repo, fake_binary):
+    from tools import claude_agent_tool
+
+    _patch_binary(monkeypatch, fake_binary)
+    monkeypatch.setenv("FAKE_CLAUDE_SUBTYPE", "error")
+    monkeypatch.setenv("FAKE_CLAUDE_IS_ERROR", "true")
+    monkeypatch.setenv("FAKE_CLAUDE_RESULT_TEXT", "Boom.")
+
+    result = json.loads(
+        claude_agent_tool.delegate_claude_agent(task="x", workdir=str(repo))
+    )
+    assert result["success"] is False
+    assert result["final_report"] == "Boom."
+    assert "error" in result["error"] or "is_error" in result["error"]
+
+
+@_REAL_SUBPROC
+def test_malformed_output_no_result_event(monkeypatch, repo, fake_binary):
+    from tools import claude_agent_tool
+
+    _patch_binary(monkeypatch, fake_binary)
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "garbage")
+
+    result = json.loads(
+        claude_agent_tool.delegate_claude_agent(task="x", workdir=str(repo))
+    )
+    assert result["success"] is False
+    assert "no result event" in result["error"]
+    assert Path(result["log_path"]).is_file()
+
+
+@_REAL_SUBPROC
+def test_nonzero_exit_reports_failure(monkeypatch, repo, fake_binary):
+    from tools import claude_agent_tool
+
+    _patch_binary(monkeypatch, fake_binary)
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "exitnonzero")
+
+    result = json.loads(
+        claude_agent_tool.delegate_claude_agent(task="x", workdir=str(repo))
+    )
+    assert result["success"] is False
+    assert "exited with code 2" in result["error"]
+
+
+@_REAL_SUBPROC
+def test_timeout_kills_process_group(monkeypatch, repo, fake_binary):
+    from tools import claude_agent_tool
+
+    _patch_binary(monkeypatch, fake_binary)
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "sleep")
+    monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "30")
+
+    # Fake a fast wall-clock so timeout_seconds=60 trips within milliseconds.
+    start = time.monotonic()
+    calls = {"n": 0}
+
+    def _fake_monotonic():
+        calls["n"] += 1
+        return start + calls["n"] * 40
+
+    monkeypatch.setattr("tools.claude_agent_tool.time.monotonic", _fake_monotonic)
+    monkeypatch.setattr(claude_agent_tool, "STALL_WATCHDOG_SECONDS", 9999)
+    monkeypatch.setattr(claude_agent_tool, "_MONITOR_POLL_SECONDS", 0.001)
+
+    result = json.loads(
+        claude_agent_tool.delegate_claude_agent(
+            task="timeout test",
+            workdir=str(repo),
+            timeout_seconds=60,
+        )
+    )
+    assert result["success"] is False
+    assert result["error"] == "timeout"
+
+
+@_REAL_SUBPROC
+def test_child_env_guarantees_home_and_local_bin(monkeypatch, repo, fake_binary, tmp_path):
+    from tools import claude_agent_tool
+
+    _patch_binary(monkeypatch, fake_binary)
+    monkeypatch.delenv("HOME", raising=False)
+    env_out = tmp_path / "env.json"
+    monkeypatch.setenv("FAKE_CLAUDE_ENV_OUT", str(env_out))
+
+    result = json.loads(
+        claude_agent_tool.delegate_claude_agent(task="x", workdir=str(repo))
+    )
+    assert result["success"] is True
+
+    captured = json.loads(env_out.read_text(encoding="utf-8"))
+    # HOME must be present and non-empty even though the caller env lacked it;
+    # the wrapper runs with `set -u` and dies on an unbound $HOME.
+    assert captured["HOME"] == str(Path.home())
+    # ~/.local/bin is prepended so binary resolution works under minimal PATH.
+    assert captured["PATH"].split(os.pathsep)[0] == str(Path.home() / ".local" / "bin")
