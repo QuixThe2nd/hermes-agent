@@ -18205,6 +18205,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
             )
+            _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # Stop persistent typing indicator now that the agent is done.
             # Slack AI status is scoped to a thread/workspace, so preserve the
@@ -18420,6 +18421,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
+                    turn_seconds=_turn_seconds,
                     turn_time=_response_time,
                     api_time=agent_result.get("api_time"),
                     tool_time=agent_result.get("tool_time"),

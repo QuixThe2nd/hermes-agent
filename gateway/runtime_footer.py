@@ -131,6 +131,7 @@ def format_runtime_footer(
     context_tokens: int,
     context_length: Optional[int],
     cwd: Optional[str] = None,
+    turn_seconds: Optional[float] = None,
     turn_time: Optional[float] = None,
     api_time: Optional[float] = None,
     tool_time: Optional[float] = None,
@@ -203,6 +204,7 @@ def build_footer_line(
     context_tokens: int,
     context_length: Optional[int],
     cwd: Optional[str] = None,
+    turn_seconds: Optional[float] = None,
     turn_time: Optional[float] = None,
     api_time: Optional[float] = None,
     tool_time: Optional[float] = None,
@@ -215,8 +217,11 @@ def build_footer_line(
     line of separation.
 
     ``turn_seconds`` is the wall-clock duration of the agent run, measured by
-    the caller with ``time.monotonic()``.  Callers that don't measure it leave
-    it ``None`` and the ``latency`` field is skipped.
+    the caller with ``time.monotonic()``. Callers that don't measure it leave
+    it ``None`` and the ``latency`` field is skipped. ``turn_time`` /
+    ``api_time`` / ``tool_time`` carry the per-turn breakdown accumulated by
+    the conversation loop and feed the ``turn_time``/``api_time``/
+    ``tool_time``/``overhead_time`` fields.
     """
     cfg = resolve_footer_config(user_config, platform_key)
     if not cfg.get("enabled"):
@@ -226,6 +231,7 @@ def build_footer_line(
         context_tokens=context_tokens,
         context_length=context_length,
         cwd=cwd,
+        turn_seconds=turn_seconds,
         turn_time=turn_time,
         api_time=api_time,
         tool_time=tool_time,
