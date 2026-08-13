@@ -1,0 +1,10 @@
+name: delegate-cursor-agent
+version: 1.0.0
+description: "Delegate software development tasks to the Cursor Agent CLI as a local subprocess."
+author: QuixThe2nd
+kind: standalone
+platforms:
+  - linux
+  - macos
+provides_tools:
+  - delegate_cursor_agent

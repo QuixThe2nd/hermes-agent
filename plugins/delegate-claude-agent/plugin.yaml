@@ -1,0 +1,10 @@
+name: delegate-claude-agent
+version: 1.0.0
+description: "Delegate software development tasks to Claude Code via the claude-glm wrapper."
+author: QuixThe2nd
+kind: standalone
+platforms:
+  - linux
+  - macos
+provides_tools:
+  - delegate_claude_agent
