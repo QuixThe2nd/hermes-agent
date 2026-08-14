@@ -2,6 +2,7 @@
 """File Tools Module - LLM agent file manipulation tools."""
 
 import base64
+import contextvars
 import errno
 import json
 import logging
@@ -9,6 +10,7 @@ import os
 import posixpath
 import sys
 import threading
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 from agent.file_safety import get_read_block_error
@@ -1079,6 +1081,24 @@ _file_ops_cache: dict = {}
 _read_tracker_lock = threading.Lock()
 _read_tracker: dict = {}
 
+# A top-level read_file result enters the model's conversation context, while a
+# read performed inside execute_code exists only inside that one child process.
+# Keep dedup local to the context that actually received the content. The empty
+# default preserves conversation-level dedup for ordinary tool calls.
+_read_dedup_scope: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "file_read_dedup_scope", default=""
+)
+
+
+@contextmanager
+def read_dedup_scope(scope: str):
+    """Temporarily isolate read-file dedup to one nested execution context."""
+    token = _read_dedup_scope.set(scope)
+    try:
+        yield
+    finally:
+        _read_dedup_scope.reset(token)
+
 # Track consecutive patch failures per (task_id, resolved_path).  Used to
 # escalate the hint when the model repeatedly fails to patch the same file
 # (typical cause: stale view of file contents, ambiguous old_string, or
@@ -1664,7 +1684,12 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         # file hasn't been modified since, return a lightweight stub
         # instead of re-sending the same content.  Saves context tokens.
         resolved_str = str(_resolved)
-        dedup_key = (resolved_str, offset, limit)
+        dedup_scope = _read_dedup_scope.get()
+        dedup_key = (
+            (dedup_scope, resolved_str, offset, limit)
+            if dedup_scope
+            else (resolved_str, offset, limit)
+        )
         with _read_tracker_lock:
             task_data = _read_tracker.setdefault(task_id, {
                 "last_key": None, "consecutive": 0,

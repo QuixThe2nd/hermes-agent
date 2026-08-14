@@ -249,6 +249,50 @@ print(result.get("output", ""))
         self.assertIn("mock output for: echo hello", result["output"])
         self.assertEqual(result["tool_calls_made"], 1)
 
+    def test_read_dedup_is_scoped_to_one_execute_code_process(self):
+        """A fresh child receives content even when the conversation task is reused."""
+        import tempfile
+        from tools.file_tools import _read_tracker
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "scope.txt")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("alpha\nbeta\n")
+
+            code = f'''\
+import json
+from hermes_tools import read_file
+first = read_file({path!r}, limit=2)
+second = read_file({path!r}, limit=2)
+print(json.dumps({{
+    "first_has_content": "content" in first,
+    "first_is_dedup": bool(first.get("dedup")),
+    "second_is_dedup": bool(second.get("dedup")),
+}}))
+'''
+            task_id = "test-execute-code-read-dedup-scope"
+            _read_tracker.clear()
+            try:
+                outputs = []
+                for _ in range(2):
+                    raw = execute_code(
+                        code=code,
+                        task_id=task_id,
+                        enabled_tools=["read_file"],
+                    )
+                    result = json.loads(raw)
+                    self.assertEqual(result["status"], "success", msg=result)
+                    outputs.append(json.loads(result["output"]))
+            finally:
+                _read_tracker.clear()
+
+        expected = {
+            "first_has_content": True,
+            "first_is_dedup": False,
+            "second_is_dedup": True,
+        }
+        self.assertEqual(outputs, [expected, expected])
+
 
     def test_concurrent_tool_calls_match_responses(self):
         """Regression for the UDS RPC race: multiple threads inside the

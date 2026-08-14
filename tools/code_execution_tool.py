@@ -1131,9 +1131,14 @@ def _execute_remote(
 
         # Wrapped so the thread inherits the turn's approval context + callbacks
         # (see tools.thread_context) — else sandbox RPC tool calls lose approval
-        # routing (#33057).
+        # routing (#33057). A fresh read-dedup scope is copied with that context:
+        # nested read_file results exist only inside this child process, so a
+        # later execute_code invocation must receive the content again.
+        from tools.file_tools import read_dedup_scope
+        with read_dedup_scope(f"execute_code:{sandbox_id}"):
+            rpc_target = propagate_context_to_thread(_rpc_poll_loop)
         rpc_thread = threading.Thread(
-            target=propagate_context_to_thread(_rpc_poll_loop),
+            target=rpc_target,
             args=(
                 env, f"{sandbox_dir}/rpc", effective_task_id,
                 tool_call_log, tool_call_counter, max_tool_calls,
@@ -1407,9 +1412,14 @@ def execute_code(
 
         # Wrapped so the thread inherits the turn's approval context + callbacks
         # (see tools.thread_context) — else gateway sandbox tool calls silently
-        # auto-approve dangerous commands (#33057, #30882).
+        # auto-approve dangerous commands (#33057, #30882). The copied context
+        # also scopes read-file dedup to this child process: its tool results do
+        # not enter the parent conversation and cannot satisfy a later child.
+        from tools.file_tools import read_dedup_scope
+        with read_dedup_scope(f"execute_code:{uuid.uuid4().hex}"):
+            rpc_target = propagate_context_to_thread(_rpc_server_loop)
         rpc_thread = threading.Thread(
-            target=propagate_context_to_thread(_rpc_server_loop),
+            target=rpc_target,
             args=(
                 server_sock, task_id, tool_call_log,
                 tool_call_counter, max_tool_calls, sandbox_tools, stop_event, rpc_token,
