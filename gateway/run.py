@@ -20590,14 +20590,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         timeout = _float_env("HERMES_AGENT_TIMEOUT", 1800) or 1800
         if prospective:
             prospective = str(prospective)
-            info_fn = getattr(adapter, "auto_thread_info_for_chat", None)
-            if callable(info_fn):
-                try:
-                    info = _as_thread_info(info_fn(str(source.chat_id)))
-                except Exception:
-                    info = None
-                if info is not None and info[0] == prospective:
-                    return info
             wait_send = getattr(adapter, "wait_for_next_send", None)
             if not callable(wait_send):
                 return None
@@ -20611,14 +20603,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 return None
             return None
-        known = self._relay_auto_thread_info(source)
-        if known is not None:
-            return known
         wait_fn = getattr(adapter, "wait_for_auto_thread_info", None)
         if not callable(wait_fn):
             return None
+        expected_reply_to = getattr(source, "message_id", None)
         try:
-            return _as_thread_info(await wait_fn(str(source.chat_id), timeout))
+            return _as_thread_info(
+                await wait_fn(
+                    str(source.chat_id),
+                    timeout,
+                    expected_reply_to=(
+                        str(expected_reply_to) if expected_reply_to else None
+                    ),
+                )
+            )
+        except TypeError:
+            # Compatibility with older relay adapters that predate correlation.
+            try:
+                return _as_thread_info(await wait_fn(str(source.chat_id), timeout))
+            except Exception:
+                return None
         except Exception:
             return None
 

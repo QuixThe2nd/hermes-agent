@@ -473,8 +473,8 @@ async def test_prospective_thread_rename_waits_for_successful_reply():
 
 
 @pytest.mark.asyncio
-async def test_prospective_thread_rename_skips_failed_reply():
-    """A connector-stamped future id does not prove the reply landed."""
+async def test_prospective_thread_rename_waits_through_failed_send_retry():
+    """A failed attempt does not consume a later successful reply."""
     import asyncio
     from types import SimpleNamespace
 
@@ -485,8 +485,14 @@ async def test_prospective_thread_rename_skips_failed_reply():
         renames.append((thread_id, name))
         return True
 
+    attempts = 0
+
     async def send_outbound(action, *, platform=None):
-        return {"success": False, "error": "boom"}
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return {"success": False, "error": "boom"}
+        return {"success": True, "message_id": "m2"}
 
     adapter.rename_thread = rename_thread  # type: ignore[method-assign]
     stub_conn.send_outbound = send_outbound  # type: ignore[method-assign]
@@ -502,8 +508,13 @@ async def test_prospective_thread_rename_skips_failed_reply():
     )
     await asyncio.sleep(0.05)
     await adapter.send("chan-parent", "the failed reply", reply_to="th-B")
-    await task
+    await asyncio.sleep(0.05)
+    assert not task.done()
     assert renames == []
+
+    await adapter.send("chan-parent", "the successful retry", reply_to="th-B")
+    await task
+    assert renames == [("th-B", "Exotic Short Story")]
 
 
 @pytest.mark.asyncio
@@ -538,6 +549,63 @@ async def test_scheduler_waits_for_prospective_reply_before_rename():
     await adapter.send("chan-parent", "the reply", reply_to="th-B")
     await asyncio.sleep(0.05)
     assert renames == [("th-B", "Exotic Short Story")]
+
+
+@pytest.mark.asyncio
+async def test_legacy_feedback_ignores_stale_cache_until_current_reply():
+    """An old connector without prospective ids must wait for this turn's send."""
+    import asyncio
+    from types import SimpleNamespace
+
+    adapter, stub_conn = _adapter()
+    stale_info = ("th-STALE", "old words")
+    adapter._auto_thread_by_chat["chan-parent"] = stale_info
+    adapter._last_send_by_chat["chan-parent"] = {
+        "success": True,
+        "reply_to": "msg-old",
+        "thread_id": stale_info[0],
+        "auto_thread_info": stale_info,
+    }
+    renames: list = []
+
+    async def rename_thread(thread_id, name, **kw):
+        renames.append((thread_id, name))
+        return True
+
+    async def send_outbound(action, *, platform=None):
+        return {
+            "success": True,
+            "message_id": "m-current",
+            "thread_id": "th-current",
+            "auto_thread_name": "current opening words",
+        }
+
+    adapter.rename_thread = rename_thread  # type: ignore[method-assign]
+    stub_conn.send_outbound = send_outbound  # type: ignore[method-assign]
+    runner = _mk_runner_stub()(adapter)
+    src = SimpleNamespace(
+        **{
+            **_relay_channel_source().__dict__,
+            "message_id": "msg-current",
+            "prospective_thread_id": None,
+        }
+    )
+
+    task = asyncio.create_task(
+        runner._rename_discord_auto_thread_for_session_title(
+            src, "sess-current", "Current Session Title"
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert renames == []
+
+    await adapter.send(
+        "chan-parent",
+        "the current reply",
+        reply_to="msg-current",
+    )
+    await task
+    assert renames == [("th-current", "Current Session Title")]
 
 
 @pytest.mark.asyncio
