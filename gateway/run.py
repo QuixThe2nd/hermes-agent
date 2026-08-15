@@ -20577,23 +20577,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> Optional[Tuple[str, str]]:
         """``_relay_auto_thread_info``, waited out until this turn delivers.
 
-        The legacy send-result path can only answer once the reply is sent, and
-        the caller asks at title time — one turn early. The adapter answers on
-        the send either way, so the timeout is only a backstop for a turn that
-        never sends at all; the turn's own inactivity limit is exactly how long
-        that turn could still be alive.
+        A connector-stamped prospective id identifies the exact future thread,
+        but it is known before the reply exists. That path still waits for the
+        send result: a failed send must not rename a thread that was never
+        created, and a stale per-chat send cache must not target a sibling.
         """
-        # The connector-stamped prospective id is known at ingest, so most
-        # sessions answer here and never wait at all.
+        if not source.chat_id:
+            return None
+        adapter = self._adapter_for_source(source)
+        prospective = getattr(source, "prospective_thread_id", None)
+        # 0 means the operator disabled the turn limit; the backstop still needs one.
+        timeout = _float_env("HERMES_AGENT_TIMEOUT", 1800) or 1800
+        if prospective:
+            prospective = str(prospective)
+            info_fn = getattr(adapter, "auto_thread_info_for_chat", None)
+            if callable(info_fn):
+                try:
+                    info = _as_thread_info(info_fn(str(source.chat_id)))
+                except Exception:
+                    info = None
+                if info is not None and info[0] == prospective:
+                    return info
+            wait_send = getattr(adapter, "wait_for_next_send", None)
+            if not callable(wait_send):
+                return None
+            try:
+                if await wait_send(str(source.chat_id), timeout):
+                    return (prospective, "")
+            except Exception:
+                return None
+            return None
         known = self._relay_auto_thread_info(source)
         if known is not None:
             return known
-        adapter = self._adapter_for_source(source)
         wait_fn = getattr(adapter, "wait_for_auto_thread_info", None)
-        if not callable(wait_fn) or not source.chat_id:
+        if not callable(wait_fn):
             return None
-        # 0 means the operator disabled the turn limit; the backstop still needs one.
-        timeout = _float_env("HERMES_AGENT_TIMEOUT", 1800) or 1800
         try:
             return _as_thread_info(await wait_fn(str(source.chat_id), timeout))
         except Exception:

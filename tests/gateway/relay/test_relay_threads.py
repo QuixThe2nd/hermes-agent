@@ -428,11 +428,88 @@ async def test_relay_auto_thread_info_prefers_prospective_thread_id():
 
 
 @pytest.mark.asyncio
+async def test_prospective_thread_rename_waits_for_successful_reply():
+    """A prospective thread id selects the target, not the timing.
+
+    The connector knows the future thread id at ingest, but the semantic rename
+    still has to wait for this turn's reply to send successfully. The stale
+    per-chat cache below would target a sibling if it were trusted instead.
+    """
+    import asyncio
+    from types import SimpleNamespace
+
+    adapter, stub_conn = _adapter()
+    adapter._auto_thread_by_chat["chan-parent"] = ("th-STALE", "old words")
+    renames: list = []
+
+    async def rename_thread(thread_id, name, **kw):
+        renames.append((thread_id, name))
+        return True
+
+    async def send_outbound(action, *, platform=None):
+        return {"success": True, "message_id": "m1"}
+
+    adapter.rename_thread = rename_thread  # type: ignore[method-assign]
+    stub_conn.send_outbound = send_outbound  # type: ignore[method-assign]
+    runner = _mk_runner_stub()(adapter)
+    src = SimpleNamespace(
+        **{**_relay_channel_source().__dict__, "prospective_thread_id": "th-B"}
+    )
+
+    task = asyncio.create_task(
+        runner._rename_discord_auto_thread_for_session_title(
+            src, "sessB", "Exotic Short Story"
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert renames == []
+
+    await adapter.send("chan-parent", "the reply")
+    await task
+    assert renames == [("th-B", "Exotic Short Story")]
+
+
+@pytest.mark.asyncio
+async def test_prospective_thread_rename_skips_failed_reply():
+    """A connector-stamped future id does not prove the reply landed."""
+    import asyncio
+    from types import SimpleNamespace
+
+    adapter, stub_conn = _adapter()
+    renames: list = []
+
+    async def rename_thread(thread_id, name, **kw):
+        renames.append((thread_id, name))
+        return True
+
+    async def send_outbound(action, *, platform=None):
+        return {"success": False, "error": "boom"}
+
+    adapter.rename_thread = rename_thread  # type: ignore[method-assign]
+    stub_conn.send_outbound = send_outbound  # type: ignore[method-assign]
+    runner = _mk_runner_stub()(adapter)
+    src = SimpleNamespace(
+        **{**_relay_channel_source().__dict__, "prospective_thread_id": "th-B"}
+    )
+
+    task = asyncio.create_task(
+        runner._rename_discord_auto_thread_for_session_title(
+            src, "sessB", "Exotic Short Story"
+        )
+    )
+    await asyncio.sleep(0.05)
+    await adapter.send("chan-parent", "the failed reply")
+    await task
+    assert renames == []
+
+
+@pytest.mark.asyncio
 async def test_sibling_threads_in_one_channel_each_rename_to_own_thread():
     """Two auto-threads spawned from the SAME parent channel must each rename
     to their OWN thread id. Before the prospective_thread_id fix the per-chat
     cache held one slot, so only the first thread renamed (staging repro
     2026-08-02: thread A renamed, sibling thread B stuck at raw text)."""
+    import asyncio
     from types import SimpleNamespace
 
     adapter, _ = _adapter()
@@ -449,19 +526,37 @@ async def test_sibling_threads_in_one_channel_each_rename_to_own_thread():
         renames.append((thread_id, name, prefer_connector_created, parent_chat_id))
         return True
 
+    async def send_outbound(action, *, platform=None):
+        return {"success": True, "message_id": action["chat_id"]}
+
     adapter.rename_thread = rename_thread  # type: ignore[method-assign]
+    adapter._transport.send_outbound = send_outbound  # type: ignore[union-attr]
     runner = _mk_runner_stub()(adapter)
     base = _relay_channel_source().__dict__
 
     # A and B share the parent channel but carry distinct prospective thread ids.
     src_a = SimpleNamespace(**{**base, "prospective_thread_id": "th-A"})
     src_b = SimpleNamespace(**{**base, "prospective_thread_id": "th-B"})
-    await runner._rename_discord_auto_thread_for_session_title(
-        src_a, "sessA", "Sea Shanty Draft"
+    task_a = asyncio.create_task(
+        runner._rename_discord_auto_thread_for_session_title(
+            src_a, "sessA", "Sea Shanty Draft"
+        )
     )
-    await runner._rename_discord_auto_thread_for_session_title(
-        src_b, "sessB", "Exotic Short Story"
+    await asyncio.sleep(0.05)
+    assert renames == []
+    await adapter.send("chan-parent", "reply A")
+    await task_a
+
+    task_b = asyncio.create_task(
+        runner._rename_discord_auto_thread_for_session_title(
+            src_b, "sessB", "Exotic Short Story"
+        )
     )
+    await asyncio.sleep(0.05)
+    assert renames == [("th-A", "Sea Shanty Draft", True, "chan-parent")]
+    await adapter.send("chan-parent", "reply B")
+    await task_b
+
     # Each renamed ITS OWN thread, via the connector-owned guard, passing the
     # parent channel id for tenant discriminator resolution.
     assert renames == [
