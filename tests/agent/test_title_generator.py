@@ -143,7 +143,7 @@ class TestAutoTitleSession:
                 db,
                 "sess-1",
                 "hi",
-                title_callback=seen.append,
+                title_callback=lambda title, source: seen.append((title, source)),
             )
 
         assert db.get_session_title("sess-1") == "Manual Title"
@@ -159,12 +159,12 @@ class TestAutoTitleSession:
                 db,
                 "sess-1",
                 "hello",
-                title_callback=seen.append,
+                title_callback=lambda title, source: seen.append((title, source)),
             )
         db.set_auto_title.assert_called_once_with(
             "sess-1", "Readable Session", source="llm"
         )
-        assert seen == ["Readable Session"]
+        assert seen == [("Readable Session", "llm")]
 
     def test_upgrades_a_derived_title_but_not_an_llm_one(self, tmp_path):
         """The instant title is provisional; a model title is final.
@@ -295,14 +295,19 @@ class TestAutoTitleDuplicateHandling:
             return_value="Debugging Import Error",
         ):
             seen = []
-            auto_title_session(db, "sess-1", "hi", title_callback=seen.append)
+            auto_title_session(
+                db,
+                "sess-1",
+                "hi",
+                title_callback=lambda title, source: seen.append((title, source)),
+            )
         db.get_next_title_in_lineage.assert_called_once_with("Debugging Import Error")
         assert db.set_auto_title.call_args_list[-1][0] == (
             "sess-1",
             "Debugging Import Error #2",
         )
         # callback fires with the actually-persisted (deduped) title
-        assert seen == ["Debugging Import Error #2"]
+        assert seen == [("Debugging Import Error #2", "llm")]
 
 
 
