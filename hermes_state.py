@@ -7795,36 +7795,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             "injected_chars": max(0, api_chars - content_chars),
         }
 
-    def get_latest_user_injection_block(self, session_id: str) -> Optional[str]:
-        """Return the actual ephemeral text stapled onto the newest ACTIVE user row.
-
-        Companion to :meth:`get_latest_user_injection_stats` — that one sizes
-        the injection for the runtime footer, this one returns the content
-        itself for user-facing display (the gateway ``/injected`` command).
-        The block is ``api_content`` minus the original-message prefix; falls
-        back to the full sidecar when the clean prefix doesn't match
-        (sanitize-divergence sidecars, multimodal JSON content).
-        """
-        with self._read_ctx() as conn:
-            row = conn.execute(
-                "SELECT content, api_content FROM messages "
-                "WHERE session_id = ? AND role = 'user' AND active = 1 "
-                "AND api_content IS NOT NULL "
-                "ORDER BY id DESC LIMIT 1",
-                (session_id,),
-            ).fetchone()
-        if not row:
-            return None
-        content = row["content"] if isinstance(row["content"], str) else ""
-        api_content = row["api_content"]
-        if not isinstance(api_content, str) or not api_content:
-            return None
-        if content and api_content.startswith(content):
-            block = api_content[len(content):].lstrip("\n")
-        else:
-            block = api_content
-        return block or None
-
     def get_messages(
         self,
         session_id: str,

@@ -3872,41 +3872,6 @@ class GatewaySlashCommandsMixin:
             logger.warning("Failed to save tool_progress mode: %s", e)
             return f"{descriptions[new_mode]}\n" + t("gateway.verbose.save_failed", error=e)
 
-    async def _handle_injected_command(self, event: MessageEvent) -> str:
-        """Handle /injected — show the ephemeral context stapled onto the
-        user's most recent message (memory prefetch + plugin/gateway notes).
-
-        Reads the session DB ``api_content`` sidecar — the exact bytes sent
-        to the model — rather than asking the agent to report its own
-        context, so the answer is ground truth rather than self-report.
-        """
-        source = event.source
-        session_entry = await self.async_session_store.get_or_create_session(source)
-        if not self._session_db:
-            return "Session DB unavailable — can't read the injection sidecar."
-        try:
-            stats = await self._session_db.get_latest_user_injection_stats(
-                session_entry.session_id
-            )
-            block = await self._session_db.get_latest_user_injection_block(
-                session_entry.session_id
-            )
-        except Exception as exc:
-            return f"Failed to read injection sidecar: {exc}"
-        if not stats or not block:
-            return "Nothing was injected into your last message. Clean turn."
-        header = (
-            f"🧠 Last turn: +{stats['injected_chars']:,} chars injected "
-            "(memory prefetch / plugin context):"
-        )
-        body = block
-        if len(body) > 3400:
-            body = (
-                body[:3400]
-                + "\n… (truncated — full text: `memory-injections --show -n 1` on the host)"
-            )
-        return f"{header}\n{body}"
-
     async def _handle_footer_command(self, event: MessageEvent) -> str:
         """Handle /footer command — toggle the runtime-metadata footer.
 
