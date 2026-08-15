@@ -153,5 +153,5 @@ def test_consult_moa_is_registered_as_a_core_tool():
     assert entry is not None
     assert entry.toolset == "moa"
     assert "consult_moa" in _HERMES_CORE_TOOLS
-    assert TOOLSETS["moa"]["tools"] == ["consult_moa"]
+    assert "consult_moa" in TOOLSETS["moa"]["tools"]
     assert entry.schema["parameters"]["required"] == ["question"]

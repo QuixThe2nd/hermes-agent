@@ -76,7 +76,7 @@ _HERMES_CORE_TOOLS = [
     # check_fn on the wrapper binary)
     "delegate_claude_agent",
     # MoA consultation (gated via check_fn on the default MoA preset)
-    "consult_moa",
+    "consult_moa", "moa_debate",
     # Cronjob management
     "cronjob",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
@@ -306,7 +306,7 @@ TOOLSETS = {
 
     "moa": {
         "description": "Consult configured Mixture-of-Agents advisors while the acting model retains control",
-        "tools": ["consult_moa"],
+        "tools": ["consult_moa", "moa_debate"],
         "includes": []
     },
 
