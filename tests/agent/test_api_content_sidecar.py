@@ -1236,3 +1236,72 @@ class TestStaleConfirmationRedactionDropsSidecar:
         )
         assert cleaned[0]["content"] != "confirm forced restart"
         assert "api_content" not in cleaned[0]
+
+
+# ---------------------------------------------------------------------------
+# Injection observability getters (runtime footer + /injected command)
+# ---------------------------------------------------------------------------
+
+class TestInjectionObservabilityGetters:
+    """get_latest_user_injection_stats / _block read the api_content sidecar
+    so the gateway can show the user what ephemeral context was stapled onto
+    their message — the injection is otherwise invisible (no tool call, no
+    transcript mutation)."""
+
+    def _open(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("s1", source="cli")
+        return db
+
+    def test_stats_none_without_sidecar(self, tmp_path):
+        db = self._open(tmp_path)
+        try:
+            db.append_message("s1", "user", content="hello")
+            assert db.get_latest_user_injection_stats("s1") is None
+            assert db.get_latest_user_injection_block("s1") is None
+        finally:
+            db.close()
+
+    def test_stats_and_block_from_sidecar(self, tmp_path):
+        db = self._open(tmp_path)
+        try:
+            sent = "hello\n\n<memory-context>\nrecalled\n</memory-context>"
+            db.append_message("s1", "user", content="hello", api_content=sent)
+            stats = db.get_latest_user_injection_stats("s1")
+            assert stats == {
+                "content_chars": 5,
+                "api_chars": len(sent),
+                "injected_chars": len(sent) - 5,
+            }
+            assert db.get_latest_user_injection_block("s1") == (
+                "<memory-context>\nrecalled\n</memory-context>"
+            )
+        finally:
+            db.close()
+
+    def test_latest_row_wins(self, tmp_path):
+        db = self._open(tmp_path)
+        try:
+            db.append_message("s1", "user", content="one", api_content="one\n\nCTX-OLD")
+            db.append_message("s1", "user", content="two", api_content="two\n\nCTX-NEW")
+            assert db.get_latest_user_injection_block("s1") == "CTX-NEW"
+        finally:
+            db.close()
+
+    def test_block_falls_back_to_full_sidecar_on_prefix_mismatch(self, tmp_path):
+        """Sanitize-divergence sidecars don't start with clean content — the
+        getter must still surface something rather than nothing."""
+        db = self._open(tmp_path)
+        try:
+            db.append_message("s1", "user", content="clean", api_content="DIVERGED-BYTES")
+            assert db.get_latest_user_injection_block("s1") == "DIVERGED-BYTES"
+        finally:
+            db.close()
+
+    def test_unknown_session_returns_none(self, tmp_path):
+        db = self._open(tmp_path)
+        try:
+            assert db.get_latest_user_injection_stats("nope") is None
+            assert db.get_latest_user_injection_block("nope") is None
+        finally:
+            db.close()

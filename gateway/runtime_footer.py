@@ -16,9 +16,13 @@ Available fields:
     context_pct  — last-call context occupancy as a percent (``5%``)
     latency      — wall-clock duration of the turn (``22s``, ``1m05s``)
     cwd          — home-relative working dir (``~``)
+    injected     — ephemeral context stapled onto the user message this turn
+                   (memory prefetch + plugin/gateway notes), e.g. ``+5.0k injected``.
+                   Rendered only when the turn actually carried an injection,
+                   so footer presence/absence answers "was anything injected?".
 
-``latency`` is opt-in: it is NOT in the default field set, so a footer whose
-``fields`` are unset renders exactly as before.
+``latency`` and ``injected`` are opt-in: neither is in the default field set,
+so a footer whose ``fields`` are unset renders exactly as before.
 
 Per-platform overrides live under ``display.platforms.<platform>.runtime_footer``.
 Users can toggle the global setting with ``/footer on|off`` from both the CLI
@@ -108,6 +112,13 @@ def _format_latency(seconds: float) -> str:
     return f"{m}m{sec:02d}s"
 
 
+def _format_injected(chars: int) -> str:
+    """Compact injection size: ``+482 injected``, ``+5.0k injected``."""
+    if chars < 1000:
+        return f"+{chars} injected"
+    return f"+{chars / 1000:.1f}k injected"
+
+
 def format_runtime_footer(
     *,
     model: Optional[str],
@@ -115,6 +126,7 @@ def format_runtime_footer(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
+    injected_chars: Optional[int] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
@@ -141,6 +153,11 @@ def format_runtime_footer(
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
                 parts.append(rel)
+        elif field == "injected":
+            # Only rendered when the turn actually carried an injection —
+            # absent footer = clean turn, by design.
+            if injected_chars:
+                parts.append(_format_injected(injected_chars))
         # Unknown field names are silently ignored.
 
     if not parts:
@@ -157,6 +174,7 @@ def build_footer_line(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
+    injected_chars: Optional[int] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -167,6 +185,10 @@ def build_footer_line(
     ``turn_seconds`` is the wall-clock duration of the agent run, measured by
     the caller with ``time.monotonic()``.  Callers that don't measure it leave
     it ``None`` and the ``latency`` field is skipped.
+
+    ``injected_chars`` is the size of ephemeral context stapled onto this
+    turn's user message (from the session DB ``api_content`` sidecar).  ``None``
+    or 0 skips the ``injected`` field.
     """
     cfg = resolve_footer_config(user_config, platform_key)
     if not cfg.get("enabled"):
@@ -177,5 +199,6 @@ def build_footer_line(
         context_length=context_length,
         cwd=cwd,
         turn_seconds=turn_seconds,
+        injected_chars=injected_chars,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )
