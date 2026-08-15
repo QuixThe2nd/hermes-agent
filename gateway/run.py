@@ -18414,19 +18414,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _footer_line = ""
             try:
                 from gateway.runtime_footer import build_footer_line as _bfl
-                # Injection observability: read this turn's api_content sidecar
-                # so the footer can show how much ephemeral context (memory
-                # prefetch/plugin notes) was stapled onto the user message.
-                _injected_chars = None
-                try:
-                    if self._session_db is not None and agent_result.get("session_id"):
-                        _inj_stats = await self._session_db.get_latest_user_injection_stats(
-                            agent_result["session_id"]
-                        )
-                        if _inj_stats:
-                            _injected_chars = _inj_stats["injected_chars"]
-                except Exception:
-                    _injected_chars = None
                 _footer_line = _bfl(
                     user_config=_load_gateway_config(),
                     platform_key=_platform_config_key(source.platform),
@@ -18435,7 +18422,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                     turn_seconds=_turn_seconds,
-                    injected_chars=_injected_chars,
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)

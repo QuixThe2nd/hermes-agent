@@ -7759,42 +7759,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return self._execute_write(_do)
 
-    def get_latest_user_injection_stats(
-        self, session_id: str
-    ) -> Optional[Dict[str, int]]:
-        """Return ephemeral-injection sizes for the newest ACTIVE user row.
-
-        Each turn's prologue staples transient context (memory prefetch,
-        plugin ``pre_llm_call`` context, gateway notes) onto the user message
-        sent to the API; the exact wire bytes live in the ``api_content``
-        sidecar while ``content`` stays clean.  The difference in lengths is
-        what was injected — the data behind the runtime footer's ``injected``
-        field, which exists because the injection is otherwise invisible to
-        the user (no tool call, no transcript mutation).
-
-        Returns ``{"content_chars", "api_chars", "injected_chars"}`` or None
-        when the session has no sidecar-stamped user row (pre-sidecar builds,
-        or a turn whose message carried no ephemeral context).
-        """
-        with self._read_ctx() as conn:
-            row = conn.execute(
-                "SELECT length(content) AS c, length(api_content) AS a "
-                "FROM messages "
-                "WHERE session_id = ? AND role = 'user' AND active = 1 "
-                "AND api_content IS NOT NULL "
-                "ORDER BY id DESC LIMIT 1",
-                (session_id,),
-            ).fetchone()
-        if not row or row["a"] is None:
-            return None
-        content_chars = int(row["c"] or 0)
-        api_chars = int(row["a"])
-        return {
-            "content_chars": content_chars,
-            "api_chars": api_chars,
-            "injected_chars": max(0, api_chars - content_chars),
-        }
-
     def get_messages(
         self,
         session_id: str,
