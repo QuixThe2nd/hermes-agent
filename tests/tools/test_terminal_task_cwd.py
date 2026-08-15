@@ -181,3 +181,60 @@ def test_safe_getcwd_falls_back_to_home_when_no_terminal_cwd(monkeypatch):
     monkeypatch.delenv("TERMINAL_CWD", raising=False)
     monkeypatch.setattr(terminal_tool.os.path, "expanduser", lambda p: "/home/me")
     assert terminal_tool._safe_getcwd() == "/home/me"
+
+
+def test_record_session_cwd_updates_when_stale_cwd_falls_back(monkeypatch, tmp_path):
+    """When the recorded local cwd was deleted between commands, the local
+    backend's ``_run_bash`` falls back to an ancestor (or tempdir) via
+    ``_resolve_safe_cwd`` — but the stale recorded session cwd persists
+    unchanged. After the command runs in the fallback directory, the
+    dual-write in terminal_tool updates the session record to the env's
+    new cwd, so subsequent commands don't keep targeting the deleted path
+    (#12a3869776d4).
+    """
+    fallback = tmp_path / "fallback"
+    fallback.mkdir()
+    missing = str(tmp_path / "removed")
+
+    class FakeEnv:
+        env = {}
+        cwd = missing
+
+        def execute(self, command, **kwargs):
+            # Simulate _resolve_safe_cwd: env.cwd gets set to a real dir
+            self.cwd = str(fallback)
+            return {"output": "ok", "returncode": 0}
+
+    recorded = []
+    task_id = "session-deleted-cwd"
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(
+        terminal_tool,
+        "_get_env_config",
+        lambda: _minimal_terminal_config(cwd=str(fallback)),
+    )
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda command, env_type, **kwargs: {"approved": True},
+    )
+    monkeypatch.setattr(
+        terminal_tool,
+        "record_session_cwd",
+        lambda session_key, cwd: recorded.append((session_key, cwd)),
+    )
+
+    terminal_tool.record_session_cwd(task_id, missing)
+
+    result = json.loads(terminal_tool.terminal_tool(command="pwd", task_id=task_id))
+
+    assert result["exit_code"] == 0
+    # The dual-write must have updated the session cwd to the fallback.
+    # The last record_session_cwd call should be the env's post-command cwd
+    # (fallback), not the stale missing path.
+    assert recorded[-1] == (task_id, str(fallback)), recorded
+
