@@ -79,3 +79,19 @@ class TestBackgroundGuidanceRecipes:
 
     def test_quoted_ampersand_not_flagged(self):
         assert _foreground_background_guidance('git commit -m "a & b"') is None
+
+    def test_shell_quote_spliced_python_bitwise_ampersand_not_flagged(self):
+        command = (
+            "qm guest exec 100 -- /bin/bash -lc 'set -eu; "
+            "/usr/bin/python3 -c '\"'\"'import json,os\n"
+            "from pathlib import Path\n"
+            'for p in sorted(Path("/tmp").glob("*.json")):\n'
+            ' raw=p.read_bytes(); print(f"{p.name}|mode={p.stat().st_mode & 0o777:o}")\n'
+            " try:\n"
+            "  obj=json.loads(raw)\n"
+            '  print(f"json=valid|type={type(obj).__name__}")\n'
+            " except Exception as e: print(e)\n"
+            "'\"'\"''"
+        )
+
+        assert _foreground_background_guidance(command) is None

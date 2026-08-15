@@ -2234,8 +2234,16 @@ def _strip_quotes(command: str) -> str:
     in commit messages, Python -c code, echo arguments, or PR body text.
     Also strips backtick-quoted content and heredoc-style inline text.
     """
+    # Collapse the shell quote-splicing idiom '"'"' (close single, add literal
+    # single-quote via double-quoting, reopen single) to a plain ' so the
+    # single-quote regex below sees the correct segment boundaries. Without
+    # this, the regex matches across the splice boundary and incorrectly
+    # exposes the inner content (e.g. Python -c code containing a bitwise &
+    # operator) as unquoted text, triggering false-positive backgrounding
+    # guidance (#f5efbaa08a03).
+    result = command.replace("'\"'\"'", "'")
     # Remove single-quoted strings (no escaping inside single quotes in shell)
-    result = re.sub(r"'[^']*'", "''", command)
+    result = re.sub(r"'[^']*'", "''", result)
     # Remove double-quoted strings (handle escaped quotes)
     result = re.sub(r'"(?:[^"\\]|\\.)*"', '""', result)
     # Remove backtick-quoted strings
