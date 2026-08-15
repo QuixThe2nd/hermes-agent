@@ -356,6 +356,9 @@ def _mk_runner_stub():
         _rename_discord_auto_thread_for_session_title = (
             GatewayRunner._rename_discord_auto_thread_for_session_title
         )
+        _schedule_discord_semantic_thread_rename = (
+            GatewayRunner._schedule_discord_semantic_thread_rename
+        )
 
         def __init__(self, adapter):
             self.adapters = {Platform.RELAY: adapter}
@@ -501,6 +504,40 @@ async def test_prospective_thread_rename_skips_failed_reply():
     await adapter.send("chan-parent", "the failed reply", reply_to="th-B")
     await task
     assert renames == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_waits_for_prospective_reply_before_rename():
+    """The production callback path must not bypass the delivery wait."""
+    import asyncio
+    from types import SimpleNamespace
+
+    adapter, stub_conn = _adapter()
+    renames: list = []
+
+    async def rename_thread(thread_id, name, **kw):
+        renames.append((thread_id, name))
+        return True
+
+    async def send_outbound(action, *, platform=None):
+        return {"success": True, "message_id": "m1"}
+
+    adapter.rename_thread = rename_thread  # type: ignore[method-assign]
+    stub_conn.send_outbound = send_outbound  # type: ignore[method-assign]
+    runner = _mk_runner_stub()(adapter)
+    src = SimpleNamespace(
+        **{**_relay_channel_source().__dict__, "prospective_thread_id": "th-B"}
+    )
+
+    runner._schedule_discord_semantic_thread_rename(
+        src, "sessB", "Exotic Short Story"
+    )
+    await asyncio.sleep(0.05)
+    assert renames == []
+
+    await adapter.send("chan-parent", "the reply", reply_to="th-B")
+    await asyncio.sleep(0.05)
+    assert renames == [("th-B", "Exotic Short Story")]
 
 
 @pytest.mark.asyncio

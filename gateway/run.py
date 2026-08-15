@@ -20735,16 +20735,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         if not self._is_discord_auto_thread_lane(source):
             # Relay title turn: the source is the PARENT channel event (the
-            # thread didn't exist at ingest, so no auto-thread markers). The
-            # connector's send-result feedback tells us where the reply
-            # landed — but the auto-title thread races the delivery that
-            # produces it, so a cache miss HERE is not a verdict. Schedule
-            # whenever the SHAPE matches; the async rename lane polls the
-            # cache (with a bounded wait) and no-ops on a true miss.
-            relay_info = self._relay_auto_thread_info(source)
-            if relay_info is None and not self._is_relay_discord_channel_lane(
-                source
-            ):
+            # thread didn't exist at ingest, so no auto-thread markers). Do not
+            # convert a connector-stamped prospective id into relay_info here:
+            # it identifies the future thread, but does not prove the reply was
+            # delivered. Schedule on the shape and let the async lane wait for
+            # the correlated send result before renaming.
+            if not self._is_relay_discord_channel_lane(source):
                 return
         try:
             loop = asyncio.get_running_loop()
