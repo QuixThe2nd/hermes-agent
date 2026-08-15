@@ -89,10 +89,14 @@ class RelayAdapter(BasePlatformAdapter):
         # arrives before the send can wait for it instead of polling. See
         # wait_for_auto_thread_info.
         self._auto_thread_waiters: Dict[str, asyncio.Event] = {}
-        # chat_id -> success of the send that fired the waiter. The prospective
-        # thread-id lane still has to wait for delivery; a failed send must not
-        # become a rename of a thread the connector never created.
-        self._last_send_success_by_chat: Dict[str, bool] = {}
+        # chat_id -> correlated waiters for the prospective-thread rename lane.
+        # Sibling auto-threads share one parent chat, so an unqualified send event
+        # is not enough: the waiter must match the reply anchor / thread id.
+        self._send_waiters: Dict[str, list] = {}
+        # chat_id -> outcome and routing identity of the latest send. The
+        # prospective thread id is the initiating message id, so reply_to is a
+        # stable match even when the connector omits send-result thread feedback.
+        self._last_send_by_chat: Dict[str, Dict[str, Optional[str]]] = {}
         # chat_id -> chat_type (e.g. "dm", "channel", "group") learned from the
         # inbound event. Used to reproduce native Slack's synthetic-DM-thread
         # suppression on the relay lane: a DM streaming reply carries
@@ -1001,11 +1005,24 @@ class RelayAdapter(BasePlatformAdapter):
                     )
         except Exception:  # noqa: BLE001 - feedback capture must never break send
             pass
-        self._last_send_success_by_chat[str(chat_id)] = bool(result.get("success"))
-        if len(self._last_send_success_by_chat) > 256:
-            self._last_send_success_by_chat.pop(
-                next(iter(self._last_send_success_by_chat)), None
-            )
+        key = str(chat_id)
+        last_send = {
+            "success": bool(result.get("success")),
+            "reply_to": str(effective_reply_to) if effective_reply_to else None,
+            "thread_id": str(result.get("thread_id")) if result.get("thread_id") else None,
+        }
+        self._last_send_by_chat[key] = last_send
+        if len(self._last_send_by_chat) > 256:
+            self._last_send_by_chat.pop(next(iter(self._last_send_by_chat)), None)
+        for send_waiter in list(self._send_waiters.get(key, ())):
+            expected = send_waiter.get("expected")
+            if expected and expected not in {
+                last_send.get("reply_to"),
+                last_send.get("thread_id"),
+            }:
+                continue
+            send_waiter["success"] = bool(last_send["success"])
+            send_waiter["event"].set()
         # Wake the rename lane on EVERY send into this chat, not only the ones
         # that auto-threaded. It is waiting to learn where this turn's reply
         # landed, and "nowhere new" is an answer — one it should get now rather
@@ -1027,27 +1044,44 @@ class RelayAdapter(BasePlatformAdapter):
         gateway's semantic thread-rename lane (auto session title)."""
         return self._auto_thread_by_chat.get(str(chat_id))
 
-    async def wait_for_next_send(self, chat_id: str, timeout: float) -> bool:
-        """Wait for the next send attempt into *chat_id* and return its success.
+    async def wait_for_next_send(
+        self,
+        chat_id: str,
+        timeout: float,
+        *,
+        expected_thread_id: Optional[str] = None,
+    ) -> bool:
+        """Wait for the next matching send into *chat_id* and return success.
 
         The prospective-thread lane knows which thread the connector intends to
         create at ingest, but "intends" is not "the reply landed". It uses this
         wait to delay the semantic rename until send completion without giving
-        up the deterministic per-message thread id.
+        up the deterministic per-message thread id. Matching by reply anchor or
+        send-result thread id prevents a sibling thread's reply from releasing
+        this waiter.
         """
         key = str(chat_id)
-        waiter = self._auto_thread_waiters.get(key)
-        if waiter is None:
-            waiter = asyncio.Event()
-            self._auto_thread_waiters[key] = waiter
+        expected = str(expected_thread_id) if expected_thread_id else None
+        if expected:
+            last_send = self._last_send_by_chat.get(key)
+            if last_send and expected in {
+                last_send.get("reply_to"),
+                last_send.get("thread_id"),
+            }:
+                return bool(last_send["success"])
+        waiter = {"expected": expected, "event": asyncio.Event(), "success": False}
+        self._send_waiters.setdefault(key, []).append(waiter)
         try:
-            await asyncio.wait_for(waiter.wait(), timeout)
+            await asyncio.wait_for(waiter["event"].wait(), timeout)
         except asyncio.TimeoutError:
             return False
         finally:
-            if self._auto_thread_waiters.get(key) is waiter:
-                self._auto_thread_waiters.pop(key, None)
-        return bool(self._last_send_success_by_chat.get(key))
+            waiters = self._send_waiters.get(key)
+            if waiters is not None and waiter in waiters:
+                waiters.remove(waiter)
+                if not waiters:
+                    self._send_waiters.pop(key, None)
+        return bool(waiter["success"])
 
     async def wait_for_auto_thread_info(
         self, chat_id: str, timeout: float

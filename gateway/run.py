@@ -20602,7 +20602,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not callable(wait_send):
                 return None
             try:
-                if await wait_send(str(source.chat_id), timeout):
+                if await wait_send(
+                    str(source.chat_id),
+                    timeout,
+                    expected_thread_id=prospective,
+                ):
                     return (prospective, "")
             except Exception:
                 return None

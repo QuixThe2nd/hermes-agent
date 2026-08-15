@@ -464,7 +464,7 @@ async def test_prospective_thread_rename_waits_for_successful_reply():
     await asyncio.sleep(0.05)
     assert renames == []
 
-    await adapter.send("chan-parent", "the reply")
+    await adapter.send("chan-parent", "the reply", reply_to="th-B")
     await task
     assert renames == [("th-B", "Exotic Short Story")]
 
@@ -498,7 +498,7 @@ async def test_prospective_thread_rename_skips_failed_reply():
         )
     )
     await asyncio.sleep(0.05)
-    await adapter.send("chan-parent", "the failed reply")
+    await adapter.send("chan-parent", "the failed reply", reply_to="th-B")
     await task
     assert renames == []
 
@@ -542,19 +542,20 @@ async def test_sibling_threads_in_one_channel_each_rename_to_own_thread():
             src_a, "sessA", "Sea Shanty Draft"
         )
     )
-    await asyncio.sleep(0.05)
-    assert renames == []
-    await adapter.send("chan-parent", "reply A")
-    await task_a
-
     task_b = asyncio.create_task(
         runner._rename_discord_auto_thread_for_session_title(
             src_b, "sessB", "Exotic Short Story"
         )
     )
     await asyncio.sleep(0.05)
+    assert renames == []
+
+    await adapter.send("chan-parent", "reply A", reply_to="th-A")
+    await task_a
+    assert not task_b.done()
     assert renames == [("th-A", "Sea Shanty Draft", True, "chan-parent")]
-    await adapter.send("chan-parent", "reply B")
+
+    await adapter.send("chan-parent", "reply B", reply_to="th-B")
     await task_b
 
     # Each renamed ITS OWN thread, via the connector-owned guard, passing the
