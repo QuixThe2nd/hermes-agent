@@ -21,9 +21,11 @@ import json
 import logging
 import re
 import threading
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from agent.auxiliary_client import call_llm
+from agent.context_compressor import LEGACY_SUMMARY_PREFIX
+from agent.message_content import flatten_message_text
 
 logger = logging.getLogger(__name__)
 
@@ -122,11 +124,24 @@ _CONTROL_WRAPPERS = (
 )
 
 # Hermes' own machine-authored openers. A compaction handoff or a resumed
-# session must not be titled after the scaffolding that carried it.
+# session must not be titled after the scaffolding that carried it. The legacy
+# summary prefix comes from the compressor rather than a fourth local copy —
+# compaction still emits it, and a session named after it is named after us.
 _MACHINE_PREFIXES = (
     "[CONTEXT COMPACTION",
+    LEGACY_SUMMARY_PREFIX,
     "[Runtime note:",
+    "[System note:",
     "[SYSTEM]",
+    # Model-switch marker from tui_gateway.server._append_model_switch_marker.
+    # It is persisted with role="user" (strict OpenAI-compatible providers
+    # reject a system message that is not first — #48338), so without this
+    # entry it looks like a real opening turn: switching models before the
+    # first real message titled the session
+    # "[System: The active model for this chat has…" instead of the user's
+    # actual question. Keep in sync with
+    # tui_gateway.server._MODEL_SWITCH_MARKER_PREFIX.
+    "[System: The active model for this chat has changed to ",
 )
 
 
@@ -618,6 +633,27 @@ def _auto_title_session(
         logger.debug("Failed to set auto-generated title: %s", e)
 
 
+def _is_real_user_turn(message: Any) -> bool:
+    """Whether a history entry is a question a person actually asked.
+
+    Hermes persists a lot of machinery under ``role="user"`` — compaction
+    handoffs, model-switch markers, background-process notices — because strict
+    OpenAI-compatible providers reject a system message that isn't first.
+    Counting those as turns is what made a session that merely *opened* with one
+    look like it was already past the point where titling applies.
+
+    A multimodal turn is judged on its text, so "here's a screenshot, fix the
+    login" counts as the real question it is.
+    """
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    content = message.get("content")
+
+    return is_titleable_user_message(
+        content if isinstance(content, str) else flatten_message_text(content)
+    )
+
+
 def _session_is_untitled(session_db, session_id: str) -> bool:
     """Whether the session still carries no title of any provenance.
 
@@ -663,16 +699,17 @@ def maybe_auto_title(
     if not session_db or not session_id or not user_message:
         return
 
-    # Count user messages to detect the opening turn. ``conversation_history``
-    # is the state BEFORE this turn's message is appended when called from the
-    # turn prologue, and after it when called post-response, so accept both.
-    # Entries are dicts; anything else means a caller passed the wrong
-    # positional and titling must degrade quietly rather than raise.
-    user_msg_count = sum(
-        1
-        for m in (conversation_history or [])
-        if isinstance(m, dict) and m.get("role") == "user"
-    )
+    # Count the real questions behind us to detect the opening turn.
+    # ``conversation_history`` is the state BEFORE this turn's message is
+    # appended when called from the turn prologue, and after it when called
+    # post-response, so accept both.
+    #
+    # Two things have to be true to skip: we are past the opening turn AND the
+    # session already has a name. Either alone gets it wrong. The count alone
+    # left a session that opened with machinery permanently nameless, because
+    # nothing reconsidered it. The title alone would never title at all on a
+    # store too old to report one.
+    user_msg_count = sum(1 for m in (conversation_history or []) if _is_real_user_turn(m))
     if user_msg_count > 1 and not _session_is_untitled(session_db, session_id):
         return
 
