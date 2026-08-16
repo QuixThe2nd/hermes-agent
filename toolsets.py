@@ -310,6 +310,15 @@ TOOLSETS = {
         "includes": []
     },
 
+    "dev-pipeline": {
+        "description": (
+            "Durable automated development jobs — the dev-pipeline lane that "
+            "plans, implements, verifies, reviews, and opens draft PRs"
+        ),
+        "tools": ["delegate_development"],
+        "includes": [],
+    },
+
     # "honcho" toolset removed — Honcho is now a memory provider plugin.
     # Tools are injected via MemoryManager, not the toolset system.
 

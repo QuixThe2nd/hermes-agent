@@ -1,0 +1,19 @@
+[Unit]
+Description=Hermes dev-pipeline executor (durable Cursor lane)
+After=network.target
+
+[Service]
+Type=simple
+Restart=always
+# Resolve the venv python at install time (example path — adjust for your host).
+ExecStart=/root/hermes-agent/.venv/bin/python -m plugins.dev_pipeline.executor run
+Environment=HOME=/root
+Environment=PYTHONPATH=/root/hermes-agent
+WorkingDirectory=/root/hermes-agent
+TimeoutStopSec=30
+# KillMode=mixed is acceptable HERE only: attempt units run as separate
+# transient systemd units outside this service cgroup (hermes-dev-<task>-<run>).
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

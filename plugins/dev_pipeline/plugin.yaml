@@ -1,0 +1,7 @@
+name: dev_pipeline
+version: 1.0.0
+description: "Durable automated development pipeline — delegate_development(repo, task) plans via the MoA council, executes through the Cursor CLI in sandboxed systemd attempts, verifies mechanically, reviews with Kimi K3 + Grok 4.5, and opens a draft PR on pass. Jobs survive restarts via the Kanban DB. Executor service install: see systemd/README.md."
+author: QuixThe2nd
+kind: backend
+provides_tools:
+  - delegate_development
