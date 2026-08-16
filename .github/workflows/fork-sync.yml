@@ -1,0 +1,36 @@
+# Fork-only workflow: keeps QuixThe2nd/hermes-agent main in sync with
+# NousResearch/hermes-agent main. Do not upstream this file.
+#
+# Merges upstream/main every 6 hours and pushes. On merge conflict the job
+# fails without pushing — the fork falls behind until someone resolves by
+# hand (merge upstream locally, resolve, push).
+name: Sync fork with upstream
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date."
+            exit 0
+          fi
+          git merge upstream/main --no-edit
+          git push origin main
