@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 import type { NavigateFunction } from 'react-router'
 
+import { graftRefreshedTailOntoBackfill } from '@/app/chat/transcript-backfill'
 import { revealTreePane } from '@/components/pane-shell/tree/store'
 import { deleteSession, getAllSessionMessages, getLatestSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
@@ -704,6 +705,10 @@ export function useSessionActions({
       if (!takeWarmCache()) {
         setActiveSessionId(null)
         activeSessionIdRef.current = null
+        // History load is not turn-busy. Drop the previous session's leftover
+        // lock so focusing this session cannot inherit another chat's run.
+        busyRef.current = false
+        setBusy(false)
 
         if (!resumedSameSelectedSession) {
           setMessages([])
@@ -889,7 +894,14 @@ export function useSessionActions({
                   persistedMatchesActivatedSession &&
                   (persisted.messages.length || !activatedMessages.length)
                 ) {
-                  const persistedMessages = toChatMessages(persisted.messages)
+                  // The REST hydration is a newest-tail page; graft it onto any
+                  // older pages the previous view already backfilled so
+                  // re-activating a scrolled-back session keeps its history.
+                  const persistedMessages = graftRefreshedTailOntoBackfill(
+                    toChatMessages(persisted.messages),
+                    cachedViewState.messages
+                  )
+
                   const runtimeMessages = toChatMessages(activated.messages)
                   const previousMessages = removeRepresentedLocalLiveProjection(cachedViewState.messages, activated)
 
@@ -982,9 +994,10 @@ export function useSessionActions({
         setMessages([])
       }
 
-      // A history load is not a live turn. Toggling busy here and again in the
-      // finally block re-renders the thread viewport after it has loaded.
-      busyRef.current = true
+      // A history load is not a live turn. Do not mark the incoming session
+      // busy — running ≠ loading, and a leftover true locked the composer.
+      busyRef.current = false
+      setBusy(false)
       setAwaitingResponse(false)
       clearNotifications()
       setSelectedStoredSessionId(storedSessionId)
@@ -1075,8 +1088,14 @@ export function useSessionActions({
             ? preserveLocalPendingTurnMessages($messages.get(), resumeStartMessages)
             : $messages.get()
 
-          prefetchedTranscriptMessages = toChatMessages(prefetchedResult.messages)
-          localSnapshot = reconcileAuthoritativeChatMessages(prefetchedTranscriptMessages, previousMessages)
+          // Tail page + previously backfilled prefix (same-session re-resume).
+          const graftedPrefetch = graftRefreshedTailOntoBackfill(
+            toChatMessages(prefetchedResult.messages),
+            previousMessages
+          )
+
+          prefetchedTranscriptMessages = graftedPrefetch
+          localSnapshot = reconcileAuthoritativeChatMessages(graftedPrefetch, previousMessages)
           prefetchApplied = true
           prefetchedStoredSessionId = prefetchedResult.session_id || storedSessionId
         }
