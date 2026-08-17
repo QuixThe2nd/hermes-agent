@@ -1302,7 +1302,7 @@ class TestGetSessionContextFallback:
         mgr = self._make_manager_with_session()
         fetch_calls = []
 
-        def _fake_fetch(peer_id, search_query=None, *, target=None):
+        def _fake_fetch(peer_id, search_query=None, *, target=None, raise_errors=False):
             fetch_calls.append((peer_id, target))
             return {"representation": "user rep", "card": []}
 
