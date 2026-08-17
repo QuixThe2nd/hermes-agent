@@ -31,6 +31,10 @@ declare global {
       }) => Promise<GatewayWsUrlResult>
       // Union agent roster across every registered connection.
       getAgentRoster?: () => Promise<DesktopAgentRoster>
+      // Credential-free routes across the union connection registry. The
+      // optional profile list is used only by the single-local v1 fallback;
+      // endpoint and auth material never crosses the IPC boundary.
+      getProfileRoutes: (profiles: string[]) => Promise<DesktopPluginProfileRoute[]>
       // Reconnect-after-wake recovery: liveness-probe the cached PRIMARY backend
       // and drop it if a remote one has gone unreachable, so the next
       // getConnection() rebuilds a reachable descriptor instead of the renderer
@@ -578,6 +582,15 @@ export interface DesktopUpdateProgress {
   at: number
 }
 
+export interface DesktopPluginProfileRoute {
+  // Registry source identity. Pair with profile; profile names are not unique
+  // across sources.
+  connectionId: string
+  mode: 'local' | 'remote'
+  profile: string
+  targetProfile: string
+}
+
 export interface HermesConnection {
   baseUrl: string
   darwinMajor?: number
@@ -991,6 +1004,12 @@ export interface HermesApiRequest {
   // (window) backend. Read-only cross-profile data is served by the primary, so
   // this is only needed for profile-scoped live/settings calls.
   profile?: string | null
+  // Route this REST call to a specific REGISTERED gateway connection (v2
+  // registry). Data owned by a remote gateway — cron jobs and their run
+  // sessions — lives in that host's state.db, so requests for it must resolve
+  // through the owning connection, not the local profile pool. Omit / '' /
+  // 'local' keep the legacy profile-routed path.
+  connectionId?: string | null
 }
 
 export interface HermesNotification {

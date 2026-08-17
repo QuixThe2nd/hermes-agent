@@ -28524,6 +28524,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _content_delivered = bool(
                 _sc and getattr(_sc, "final_content_delivered", False)
             )
+            # #71643/#78541: a successful finalize can carry only the last
+            # preview snapshot, and a payload-less multi-message split records
+            # no complete turn-final payload at all. When the consumer's
+            # recorded payload demonstrably mismatches the completed response,
+            # final_content_delivered must not claim delivery — leave
+            # already_sent unset so the normal final send delivers the
+            # complete text (mirrors the in-try suppression block).
+            if _content_delivered and not _is_empty_sentinel:
+                _matcher = getattr(_sc, "delivered_final_matches", None)
+                if callable(_matcher):
+                    try:
+                        if _matcher(_final) is False:
+                            _content_delivered = False
+                    except Exception:
+                        pass
             _transformed = bool(candidate.get("response_transformed"))
             _streamed = _stream_confirmed_final_delivery(
                 _sc,
