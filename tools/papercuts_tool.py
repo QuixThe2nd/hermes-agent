@@ -1,7 +1,7 @@
 """Private, structured papercut capture for Hermes Agent.
 
-The plugin registers one agent-facing tool, ``papercuts``, with actions for
-logging, listing, resolving, ignoring, and summarising workflow friction. The
+Registers one agent-facing tool, ``papercuts``, with actions for logging,
+listing, resolving, ignoring, and summarising workflow friction. The
 canonical store is an append-only JSONL journal under ``$HERMES_HOME/papercuts``.
 """
 
@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home
+from tools.registry import registry
 
 try:  # POSIX
     import fcntl  # type: ignore
@@ -541,20 +542,10 @@ def handle_papercuts(args: Dict[str, Any], **kwargs: Any) -> str:
         return _error("io_error", f"papercuts store failure: {exc}")
 
 
-def check_requirements() -> bool:
-    try:
-        _ensure_store()
-        return True
-    except OSError:
-        return False
-
-
-def register(ctx) -> None:
-    ctx.register_tool(
-        name="papercuts",
-        toolset="papercuts",
-        schema=PAPERCUTS_SCHEMA,
-        handler=handle_papercuts,
-        check_fn=check_requirements,
-        emoji="🩹",
-    )
+registry.register(
+    name="papercuts",
+    toolset="papercuts",
+    schema=PAPERCUTS_SCHEMA,
+    handler=handle_papercuts,
+    emoji="🩹",
+)
