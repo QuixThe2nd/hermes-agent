@@ -12,6 +12,7 @@ An edition of [Hermes Agent](https://github.com/NousResearch/hermes-agent) with 
   - dev-pipeline — hand a repo + task to an automated pipeline: MoA planning, Cursor execution, mechanical verification, dual-model review, draft PR
   - Discord History — read-only search over an owner-authorized PostgreSQL archive of Discord messages
   - Papercuts — structured journal of workflow friction, plus an opt-in daily autofix cron (`hermes papercuts autofix install`) that turns small mechanical fixes into PRs
+  - Patch — fuzzy replace refuses to rewrite a lookalike block when old_string names identifiers the matched region doesn't contain (wrong-block guard for concurrent edits)
 - **Other**
   - Gateway — replies can end with a timing breakdown: total, API, tools, other (off by default upstream)
   - Discord — sessions keyed to your stable username, not your per-server nickname

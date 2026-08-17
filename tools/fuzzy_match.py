@@ -63,6 +63,23 @@ IDENTICAL_STRINGS_ERROR = (
     "replacement text in new_string."
 )
 
+# Tokens ignored by the wrong-block guard: language keywords and other words
+# that appear in almost any block shape, so their presence/absence says
+# nothing about whether the matched region is the intended one.
+_WRONG_BLOCK_STOPWORDS = frozenset({
+    # Python keywords (kept inline so this module stays stdlib-keyword
+    # independent of `keyword.kwlist` ordering surprises)
+    "False", "None", "True", "and", "as", "assert", "async", "await",
+    "break", "class", "continue", "def", "del", "elif", "else", "except",
+    "finally", "for", "from", "global", "if", "import", "in", "is",
+    "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try",
+    "while", "with", "yield", "match", "case",
+    # Common cross-language keywords
+    "function", "const", "var", "let", "this", "self", "null", "nil",
+    "true", "false", "endif", "done", "then", "echo", "print", "printf",
+    "public", "private", "static", "void", "int", "string", "bool",
+})
+
 
 def _unicode_normalize(text: str) -> str:
     """Normalizes Unicode characters to their standard ASCII equivalents."""
@@ -197,6 +214,21 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
                     f"exact/line-trimmed match can be made."
                 )
 
+            # Wrong-block guard: a similarity strategy matched a region that
+            # only *resembles* old_string. If old_string names identifiers or
+            # string literals that appear NOWHERE in the matched region, the
+            # strategy latched onto an adjacent lookalike block (the classic
+            # concurrent-edit failure: the real target drifted, and the
+            # sibling block with the same shape got silently rewritten).
+            # Refuse and make the caller re-read instead of corrupting the
+            # wrong region.
+            if strategy_name in _SIMILARITY_STRATEGIES:
+                subject_err = _detect_wrong_block_match(
+                    content, matches, old_string, strategy_name,
+                )
+                if subject_err:
+                    return content, 0, None, subject_err
+
             # Escape-drift guard: when the matched strategy is NOT `exact`,
             # we matched via some form of normalization. If new_string
             # contains shell/JSON-style escape sequences (\' or \") that
@@ -258,6 +290,58 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
 
     # No strategy found a match
     return content, 0, None, "Could not find a match for old_string in the file"
+
+
+def _detect_wrong_block_match(content: str, matches: List[Tuple[int, int]],
+                              old_string: str, strategy_name: str) -> Optional[str]:
+    """Detect a similarity-strategy match against the wrong block.
+
+    ``block_anchor`` and ``context_aware`` accept regions that only
+    *approximately* resemble old_string. Under a concurrent edit the real
+    target drifts and the chain can latch onto an adjacent block with the
+    same shape but a different subject (e.g. a ``wheat_sold`` check when
+    old_string named ``bread_sold``), silently rewriting code the caller
+    never asked to touch.
+
+    Heuristic: extract the significant identifiers old_string names and
+    require each to appear in the matched region. An identifier that
+    appears NOWHERE in the region means the block is about something else.
+    Legitimate similarity matches (whitespace drift, small value edits,
+    added/removed lines around stable identifiers) keep all their subject
+    identifiers, so they pass.
+
+    Identifiers only, not quoted literals: literal text interacts with the
+    escape-drift guards (a model-sent ``\\\\`` doubling makes the literal
+    differ from the file byte-for-byte even when the block is correct),
+    and literal subjects are almost always identifier-shaped anyway
+    (``inventory["bread"]`` names both ``inventory`` and ``bread``).
+
+    Returns an error string when the match looks like the wrong block,
+    None otherwise.
+    """
+    matched_region = "".join(content[start:end] for start, end in matches)
+
+    # Long identifiers (short ones like `x` or `i` collide everywhere).
+    tokens = [
+        t for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]{4,}", old_string)
+        if t not in _WRONG_BLOCK_STOPWORDS
+    ]
+
+    missing = [t for t in dict.fromkeys(tokens) if t not in matched_region]
+    if not missing:
+        return None
+
+    shown = ", ".join(repr(t) for t in missing[:3])
+    extra = f" and {len(missing) - 3} more" if len(missing) > 3 else ""
+    return (
+        f"The '{strategy_name}' strategy matched a region that does not "
+        f"contain {shown}{extra} — identifier(s) named in "
+        f"old_string. This almost always means a concurrent edit moved or "
+        f"changed the intended target and the fuzzy match latched onto an "
+        f"adjacent lookalike block. No edit was applied. Re-read the file "
+        f"with read_file, then retry with old_string copied from the current "
+        f"content of the block you actually want to change."
+    )
 
 
 def _detect_escape_drift(content: str, matches: List[Tuple[int, int]],

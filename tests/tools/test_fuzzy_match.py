@@ -631,6 +631,83 @@ class TestContextAwareCorrectness:
         assert elapsed < 2.0, f"context_aware no-match took {elapsed:.2f}s"
 
 
+class TestWrongBlockGuard:
+    """Similarity strategies must refuse blocks missing old_string's subject.
+
+    Live incident (pc_1cca4526722b): after a concurrent edit drifted the
+    intended ``bread_sold`` block, context_aware latched onto the adjacent
+    structurally identical ``wheat_sold`` block and silently rewrote it.
+    """
+
+    BREAD_BLOCK = (
+        "if bread_sold > 0:\n"
+        "    revenue += bread_sold * bread_price\n"
+        "    inventory[\"bread\"] -= bread_sold\n"
+    )
+    WHEAT_BLOCK = (
+        "if wheat_sold > 0:\n"
+        "    revenue += wheat_sold * wheat_price\n"
+        "    inventory[\"wheat\"] -= wheat_sold\n"
+    )
+    OLD = BREAD_BLOCK
+    NEW = (
+        "if bread_sold > 0:\n"
+        "    revenue += bread_sold * bread_price * 1.1\n"
+        "    inventory[\"bread\"] -= bread_sold\n"
+    )
+
+    def test_cross_identifier_match_is_refused(self):
+        """The drifted-target case: refuse instead of rewriting the sibling."""
+        content = (
+            "if bread_sold > 0:\n"
+            "    revenue += bread_sold * bread_price\n"
+            "    logger.info(\"sold %d loaves\", bread_sold)  # added concurrently\n"
+            "    inventory[\"bread\"] -= bread_sold\n"
+            "\n"
+            + self.WHEAT_BLOCK
+        )
+        result, count, strategy, err = fuzzy_find_and_replace(
+            content, self.OLD, self.NEW,
+        )
+        assert count == 0, f"wrong block was rewritten via strategy={strategy}"
+        assert err is not None
+        assert "bread_sold" in err  # names the missing subject token
+        assert "read_file" in err   # points at the recovery path
+        assert result == content    # file untouched
+
+    def test_intact_subject_tokens_still_apply(self):
+        """Value/whitespace drift with stable identifiers must still match."""
+        content = (
+            "if bread_sold > 0:\n"
+            "        revenue += bread_sold * bread_price\n"  # indent drift
+            "    inventory[\"bread\"] -= bread_sold\n"
+        )
+        result, count, strategy, err = fuzzy_find_and_replace(
+            content, self.OLD, self.NEW,
+        )
+        assert count == 1, f"legit similarity match refused: {err}"
+        assert "bread_price * 1.1" in result
+
+    def test_missing_literal_only_is_refused(self):
+        """A block whose quoted literal subject differs is the wrong block."""
+        content = (
+            'cache_key = "wheat_inventory"\n'
+            "cache_ttl = 3600\n"
+        )
+        old = (
+            'cache_key = "bread_inventory"\n'
+            "cache_ttl = 300\n"
+        )
+        new = (
+            'cache_key = "bread_inventory"\n'
+            "cache_ttl = 600\n"
+        )
+        result, count, strategy, err = fuzzy_find_and_replace(content, old, new)
+        assert count == 0, f"wrong block rewritten via strategy={strategy}"
+        assert err is not None and "bread_inventory" in err
+        assert result == content
+
+
 
 class TestBackslashDoublingDrift:
     """Regression tests for the backslash-run doubling guard.
