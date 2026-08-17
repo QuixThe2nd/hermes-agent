@@ -110,6 +110,15 @@ In that context, prefer:
 codex exec --sandbox danger-full-access "<task>"
 ```
 
+For resumed sessions, put sandbox flags **before** the `resume` subcommand. The
+effective sandbox is chosen by the resumed invocation, not inherited from the
+original session — omitting the flag on resume silently falls back to a
+restrictive sandbox, and flags placed after `resume` are not applied as expected.
+
+```
+codex exec --sandbox danger-full-access resume --model <model> <session-id> "<follow-up>"
+```
+
 Use process boundaries as the safety layer instead: explicit `workdir`, clean git
 status before launch, narrow task prompts, `git diff` review, targeted tests, and
 human/agent confirmation before committing broad changes.
