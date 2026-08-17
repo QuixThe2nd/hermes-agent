@@ -7,6 +7,8 @@ An edition of [Hermes Agent](https://github.com/NousResearch/hermes-agent) with 
   - Send coding tasks to the Cursor Agent CLI, straight from chat
   - Send coding tasks to the Claude Code CLI, straight from chat
 - **MoA tools** — `consult_moa` and `moa_debate`, restored from the archive
+- **Memory (Honcho)**
+  - Memory tools surface backend failures (dead API keys, auth 401s, timeouts) as explicit errors instead of silently looking like "nothing stored"
 - **Gateway**
   - Replies can end with a timing breakdown: total, API, tools, other (off by default upstream)
 - **Discord**
