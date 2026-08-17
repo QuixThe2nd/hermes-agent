@@ -154,7 +154,10 @@ def gui_toolset_label(label: str) -> str:
 # `hermes tools` → X (Twitter) Search setup walks users through credential
 # setup. The tool's check_fn means the schema still won't appear to the
 # model if the credential later goes missing or expires.
-_DEFAULT_OFF_TOOLSETS = {"moa", "dev-pipeline", "homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a"}
+# NOTE(fork): "dev-pipeline" removed from the default-off set — the fork ships
+# the dev_pipeline plugin and wants delegate_development available by default
+# on every instance running the fork. Upstream keeps it opt-in.
+_DEFAULT_OFF_TOOLSETS = {"moa", "homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a"}
 
 
 # Config-only capabilities: they appear in `hermes tools` for provider/API-key
