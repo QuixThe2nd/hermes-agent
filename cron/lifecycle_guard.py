@@ -151,32 +151,94 @@ _BINARY_SNIFF_BYTES = 4096
 _ReadRemoteScriptFn = Callable[[str], Optional[str]]
 
 
+def _split_shell_logical_lines(text: str) -> list[str]:
+    """Split on newlines that sit OUTSIDE shell quotes.
+
+    A quoted payload may itself contain newlines
+    (``python3 -c "line1\\nline2"`` is a single argv word to the shell).
+    Splitting such text on raw newlines exposes the payload's inner lines
+    as phantom commands whose path-looking tokens were then walked as
+    referenced scripts and could fail closed on unrelated filesystem
+    entries — e.g. a ``/proc`` literal inside a Python process scan
+    blocked the whole read-only command. Quote-aware splitting keeps each
+    quoted payload on one logical line, matching what the shell parses.
+    """
+    lines: list[str] = []
+    buf: list[str] = []
+    quote: Optional[str] = None
+    escaped = False
+    for ch in text:
+        if escaped:
+            buf.append(ch)
+            escaped = False
+            continue
+        if ch == "\\" and quote != "'":
+            buf.append(ch)
+            escaped = True
+            continue
+        if quote is not None:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            continue
+        if ch == "\n":
+            lines.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    if buf:
+        lines.append("".join(buf))
+    return lines
+
+
+def _tokenize_segment_line(line: str) -> Optional[list[str]]:
+    try:
+        lexer = shlex.shlex(
+            line,
+            posix=True,
+            punctuation_chars=";&|()",
+        )
+        lexer.whitespace_split = True
+        lexer.commenters = "#"
+        return list(lexer)
+    except ValueError:
+        return None
+
+
 def _iter_command_segments(command: str) -> Iterator[list[str]]:
     """Yield shell-tokenized command segments, honoring quotes and comments."""
     normalized = command.replace("\\\n", "")
-    for line in normalized.splitlines() or [normalized]:
-        try:
-            lexer = shlex.shlex(
-                line,
-                posix=True,
-                punctuation_chars=";&|()",
-            )
-            lexer.whitespace_split = True
-            lexer.commenters = "#"
-            tokens = list(lexer)
-        except ValueError:
+    for line in _split_shell_logical_lines(normalized):
+        tokens = _tokenize_segment_line(line)
+        if tokens is None and "\n" in line:
+            # Unbalanced quote spanning lines: fall back to scanning each
+            # raw physical line (the pre-quote-aware behavior) so malformed
+            # input keeps a best-effort walk instead of none at all.
+            for fragment in line.splitlines():
+                fragment_tokens = _tokenize_segment_line(fragment)
+                if fragment_tokens is not None:
+                    yield from _segments_from_tokens(fragment_tokens)
             continue
+        if tokens is None:
+            continue
+        yield from _segments_from_tokens(tokens)
 
-        segment: list[str] = []
-        for token in tokens:
-            if token and set(token) <= _CONTROL_CHARS:
-                if segment:
-                    yield segment
-                    segment = []
-                continue
-            segment.append(token)
-        if segment:
-            yield segment
+
+def _segments_from_tokens(tokens: list[str]) -> Iterator[list[str]]:
+    segment: list[str] = []
+    for token in tokens:
+        if token and set(token) <= _CONTROL_CHARS:
+            if segment:
+                yield segment
+                segment = []
+            continue
+        segment.append(token)
+    if segment:
+        yield segment
 
 
 def _command_token_index(segment: list[str]) -> Optional[int]:
@@ -414,6 +476,93 @@ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
                 break
 
 
+# Heredoc opener: `<<DELIM`, `<<-DELIM`, `<<'DELIM'`, `<<"DELIM"` (quotes
+# already stripped by shlex). `<<<` (herestring) carries its data inline on
+# the same line and has no body, so it must not match.
+_HEREDOC_OPEN = re.compile(r"<<-?([A-Za-z_][A-Za-z0-9_]*)$")
+
+
+def _mask_non_shell_heredoc_bodies(text: str) -> str:
+    """Drop heredoc bodies whose receiving command is not a POSIX shell.
+
+    A heredoc body is stdin data for the receiving command. It is parsed as
+    shell commands only when the receiver itself is a shell
+    (``bash <<EOF``). For any other receiver (``python3 - <<'PY'``, node,
+    or an unknown executable) the body is opaque payload text: walking its
+    path-looking tokens as referenced shell scripts false-positive-blocked
+    read-only commands whose Python payload merely mentioned paths such as
+    ``/proc``. The lifecycle REGEX still scans the full unmasked text, so a
+    literal ``systemctl restart hermes-gateway`` inside any heredoc stays
+    blocked; only the filesystem walk is masked.
+
+    Quoted ``<<EOF`` text on a line (e.g. ``echo "<<EOF"``) is
+    indistinguishable from a real opener after shlex quote removal; such a
+    line masks subsequent lines from the WALK only, never from the regex —
+    a deliberate fail-open direction for the walk, which is the
+    defense-in-depth layer.
+    """
+    if "<<" not in text:
+        return text
+    lines = text.split("\n")
+    out: list[str] = []
+    # Queue of (delimiter, mask?) pending heredoc bodies, in opener order.
+    pending: list[tuple[str, bool]] = []
+    for line in lines:
+        if pending:
+            delim, mask = pending[0]
+            if line.strip("\t") == delim:
+                pending.pop(0)
+            if not mask:
+                out.append(line)
+            continue
+        out.append(line)
+        for segment in _iter_command_segments(line):
+            index = _command_token_index(segment)
+            receiver = (
+                Path(segment[index]).name if index is not None else ""
+            )
+            is_shell_receiver = receiver in _SHELL_EXECUTABLES
+            tokens = segment if index is None else segment[index:]
+            for pos, token in enumerate(tokens):
+                match = _HEREDOC_OPEN.match(token)
+                if match:
+                    pending.append((match.group(1), not is_shell_receiver))
+                elif token in {"<<", "<<-"} and pos + 1 < len(tokens):
+                    pending.append((tokens[pos + 1], not is_shell_receiver))
+    return "\n".join(out)
+
+
+def _is_shell_parsed_script(text: str) -> bool:
+    """True when executing this file parses its content as POSIX shell.
+
+    A shebang naming a non-shell interpreter (python/node/ruby/...) means
+    the kernel hands the file to that interpreter and the content is never
+    shell-parsed, so walking its tokens as shell script references is a
+    false-positive generator — a directly executed npm/node shim had its
+    require() graph walked as shell until the recursion failed closed.
+    #77131 established the same rule for cron ``.py`` scripts: regex-scan
+    the content, skip the walk. No shebang (or an unparseable one) keeps
+    full shell treatment because shells re-parse such files after
+    execve(ENOEXEC).
+    """
+    if not text.startswith("#!"):
+        return True
+    first = text.split("\n", 1)[0]
+    words = first[2:].strip().split()
+    if not words:
+        return True
+    interpreter = Path(words[0]).name
+    if interpreter == "env":
+        for word in words[1:]:
+            if word.startswith("-"):
+                continue  # -S and other env flags precede the interpreter
+            interpreter = Path(word).name
+            break
+        else:
+            return True
+    return interpreter in _SHELL_EXECUTABLES
+
+
 def _resolve_script_directory(script_path: str) -> Optional[str]:
     """Return the directory *script_path* resolves to, handling relative names."""
     try:
@@ -521,7 +670,14 @@ def _contains_unsafe_gateway_action(
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return True
 
-    for payload in _iter_shell_command_payloads(command):
+    # The walk below treats text as shell. Heredoc bodies feeding a
+    # non-shell command are opaque payload data, not shell — mask them so
+    # their path-looking tokens are never walked as referenced scripts.
+    # The direct scan above already ran on the FULL text, so masking here
+    # cannot hide a literal lifecycle command.
+    walk_text = _mask_non_shell_heredoc_bodies(command)
+
+    for payload in _iter_shell_command_payloads(walk_text):
         if _contains_unsafe_gateway_action(
             payload,
             cwd=cwd,
@@ -531,7 +687,7 @@ def _contains_unsafe_gateway_action(
         ):
             return True
 
-    for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
+    for script_path in _iter_referenced_shell_scripts(walk_text, cwd=cwd):
         try:
             resolved = script_path.resolve(strict=False)
         except (OSError, ValueError):
@@ -556,6 +712,13 @@ def _contains_unsafe_gateway_action(
             if unsafe:
                 return True
         if not script_text:
+            continue
+        if not _is_shell_parsed_script(script_text):
+            # Content interpreted by python/node/etc. is never shell-parsed;
+            # regex-scan it (catches an embedded literal lifecycle command)
+            # but never walk its tokens as shell script references.
+            if _direct_lifecycle_scan(script_text):
+                return True
             continue
         # Relative references inside a script resolve against that script's
         # directory, not the original command's cwd.
