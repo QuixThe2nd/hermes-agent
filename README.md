@@ -17,9 +17,9 @@ An edition of [Hermes Agent](https://github.com/NousResearch/hermes-agent) with 
   - API retry backoff timing
   - Web search and extract fallback chains
 - **Plugins**
-  - dev-pipeline
-  - Discord History
-  - Papercuts
+  - dev-pipeline — hand a repo + task to an automated pipeline: MoA planning, Cursor execution, mechanical verification, dual-model review, draft PR
+  - Discord History — read-only search over an owner-authorized PostgreSQL archive of Discord messages
+  - Papercuts — structured journal of workflow friction (log/list/resolve/stats), feeds the daily triage cron
 
 For the upstream project, see [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent). Everything below this header is upstream's README.
 
