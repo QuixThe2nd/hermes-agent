@@ -200,7 +200,11 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
     runner._post_turn_goal_continuation = AsyncMock()
 
     try:
-        response = await asyncio.wait_for(runner._handle_message(_event()), timeout=1)
+        # Outer watchdog only — the prompt-rejection contract lives in the
+        # 20ms lease budget above. 1s was flaky on cold CI runners where the
+        # first _handle_message call pays heavy lazy-import costs before the
+        # lease path even runs.
+        response = await asyncio.wait_for(runner._handle_message(_event()), timeout=10)
     finally:
         assert runner._turn_leases.release(holder) is True
 
