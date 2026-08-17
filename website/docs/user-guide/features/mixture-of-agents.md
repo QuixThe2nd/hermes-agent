@@ -264,7 +264,8 @@ So MoA does not sacrifice prompt caching on either call type. Its only real cost
 
 ## Notes
 
-- MoA is no longer listed under `hermes tools`; there is no `moa` toolset to enable.
+- The opt-in `moa` toolset is separate from the MoA model provider on this page: it exposes `consult_moa` and `moa_debate` so the acting model can consult MoA advisors mid-task. Enable per platform with `hermes tools enable moa --platform <platform>` (default `cli`) or in the `hermes tools` UI ("Mixture of Agents").
+- Those tools only appear when the default MoA preset is enabled and has `reference_models` configured.
 - Setting `enabled: false` on a preset disables the reference fan-out for that preset: the aggregator acts alone, exactly as if you selected it as a plain model. This is the per-preset off switch surfaced in the dashboard and desktop settings.
 - A preset's aggregator cannot be another MoA preset. Recursive MoA trees are intentionally blocked.
 - Credential failures on one reference model do not abort the turn. Hermes includes the failure in the reference context and continues with whatever models returned.
