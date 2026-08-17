@@ -2189,6 +2189,21 @@ function PetTab({ image, onImage }) {
  *  Gates every SOUL.md protocol append below. */
 let serverInjectsProtocol = false
 
+/** Pins to resolve precisely on the next roster poll: {profile: chatId}.
+ *  The backend answers "what about THIS conversation" per entry
+ *  (preferred_session), so a row's preview can describe the same session its
+ *  click opens (hermes-agent#88200). Unknown params are ignored by older
+ *  gateways, which simply omit the field. */
+function preferredSessionIds(allMeta) {
+  const pins = {}
+  for (const [name, meta] of Object.entries(allMeta || {})) {
+    if (meta?.chat) {
+      pins[name] = meta.chat
+    }
+  }
+  return pins
+}
+
 function useRoster() {
   const activeConnectionId = useValue(host.state.connectionId)
 
@@ -2197,7 +2212,11 @@ function useRoster() {
     queryFn: async () => {
       // Rich rows (last_session, ui_meta, has_avatar) come from the ACTIVE
       // gateway's profiles.list — unchanged single-source behavior.
-      const local = await host.request('profiles.list', {})
+      const pins = preferredSessionIds($botMeta.get())
+      const local = await host.request(
+        'profiles.list',
+        Object.keys(pins).length ? { preferred_session_ids: pins } : {}
+      )
       // Newer backends inject the teammate-messaging protocol into every
       // session's system prompt (agent.bot_mode_protocol) — SOUL.md must not
       // carry a second copy. Older gateways lack the flag: keep appending.
@@ -2466,12 +2485,108 @@ function resolveRosterMentions(text, roster, active = {}) {
   return mentioned
 }
 
-async function deliverRemoteRosterMentions(bots, userText) {
+const REMOTE_DM_TIMEOUT_MS = 180000
+const REMOTE_DM_POLL_MS = 2000
+
+/** The remote bot's canonical Bot Chat: pinned stored-id from its profile's
+ *  ui_meta first, then resume-by-title, then create. Mirrors
+ *  ensureGroupChatSession so DMs land in the ONE forever-chat instead of
+ *  minting a fresh "Bot Chat" per mention. */
+async function ensureRemoteCanonicalChat(route, profile) {
+  let pinned = null
+
+  try {
+    const listed = await host.requestProfile(route, 'profiles.list', {})
+    const owner = listed?.profiles?.find(p => p.name === profile)
+    pinned = owner?.ui_meta?.['hermes-bots']?.chat || null
+  } catch {
+    /* older remote gateway — title lookup below still works */
+  }
+
+  for (const target of [pinned, 'Bot Chat']) {
+    if (!target) {
+      continue
+    }
+
+    try {
+      const res = await host.requestProfile(route, 'session.resume', {
+        session_id: target,
+        profile,
+        omit_messages: true
+      })
+
+      if (res?.session_id) {
+        return { runtime: res.session_id, stored: res.session_key || pinned }
+      }
+    } catch {
+      /* fall through */
+    }
+  }
+
+  const created = await host.requestProfile(route, 'session.create', {
+    profile,
+    title: 'Bot Chat',
+    ...($hideBotChats.get() ? { hidden: true } : {})
+  })
+
+  return { runtime: created?.session_id || null, stored: created?.stored_session_id || null }
+}
+
+/** Bounded reply poll on the recipient's session — same shape as a group
+ *  member turn: wait for a NEW assistant message after `before`, or time out. */
+async function pollRemoteDmReply(route, profile, sessionRef, before) {
+  const deadline = Date.now() + REMOTE_DM_TIMEOUT_MS
+
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, REMOTE_DM_POLL_MS))
+
+    let state = null
+
+    try {
+      state = await host.requestProfile(route, 'session.resume', { session_id: sessionRef, profile })
+    } catch {
+      continue
+    }
+
+    const messages = Array.isArray(state?.messages) ? state.messages : []
+    const done = !state?.inflight && !state?.running
+
+    if (messages.length > before && done) {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i]
+
+        if (msg?.role === 'assistant') {
+          const text = typeof msg.content === 'string'
+            ? msg.content
+            : Array.isArray(msg.content)
+              ? msg.content.map(p => (typeof p === 'string' ? p : p?.text || '')).join('')
+              : msg?.text || ''
+
+          return String(text).trim() || null
+        }
+      }
+
+      return null
+    }
+  }
+
+  return null
+}
+
+/** Deliver a user mention to bots on OTHER connections: into each bot's
+ *  canonical Bot Chat, with the standard sender-attribution prefix (so the
+ *  recipient's messaging protocol recognizes an agent-to-agent message), then
+ *  relay the reply back as a notification. Sequential and fire-and-forget
+ *  from the composer's perspective. */
+async function deliverRemoteRosterMentions(bots, userText, sender) {
   const text = String(userText || '').trim()
 
   if (!text || typeof host.requestProfile !== 'function') {
     return
   }
+
+  const senderName = String(sender?.name || 'the user').trim()
+  const senderHandle = String(sender?.handle || senderName).trim()
 
   for (const bot of bots) {
     const connectionId = String(bot?.connectionId || '').trim()
@@ -2481,30 +2596,55 @@ async function deliverRemoteRosterMentions(bots, userText) {
       continue
     }
 
-    try {
-      const created = await host.requestProfile(
-        { connectionId, profile, mode: 'remote', targetProfile: profile },
-        'session.create',
-        { profile, title: 'Bot Chat', hidden: true }
-      )
-      const sessionId = created?.session_id
+    const route = { connectionId, mode: 'remote', profile, targetProfile: profile }
+    const label = bot.connectionLabel || connectionId
 
-      if (!sessionId) {
+    try {
+      const { runtime, stored } = await ensureRemoteCanonicalChat(route, profile)
+
+      if (!runtime) {
         throw new Error('No remote session')
       }
 
-      await host.requestProfile(
-        { connectionId, profile, mode: 'remote', targetProfile: profile },
-        'prompt.submit',
-        { session_id: sessionId, text }
-      )
+      // Baseline before our submit, so the poll can spot the NEW reply.
+      let before = 0
+
+      try {
+        const pre = await host.requestProfile(route, 'session.resume', { session_id: stored || runtime, profile })
+        before = Array.isArray(pre?.messages) ? pre.messages.length : pre?.message_count || 0
+      } catch {
+        /* lazy session — zero messages */
+      }
+
+      // The delivery prefix is the recipient's cue that an agent (not its
+      // human) is talking — same contract as the local CLI handoff.
+      await host.requestProfile(route, 'prompt.submit', {
+        session_id: runtime,
+        text: `Message from \u{1F916} ${senderName} (@${senderHandle}): ${text}`
+      })
       host.notify?.({
         kind: 'info',
         title: displayName(bot),
-        message: `Messaged @${botHandle(profile, bot)} on ${bot.connectionLabel || connectionId} from this chat.`
+        message: `Messaged @${botHandle(profile, bot)} on ${label} — will relay the reply here.`
       })
+
+      const reply = await pollRemoteDmReply(route, profile, stored || runtime, before)
+
+      if (reply) {
+        host.notify?.({
+          kind: 'info',
+          title: `\u{1F916} ${displayName(bot)} (${label})`,
+          message: reply.slice(0, 500)
+        })
+      } else {
+        host.notify?.({
+          kind: 'info',
+          title: displayName(bot),
+          message: `No reply from @${botHandle(profile, bot)} yet — check its Bot Chat on ${label}.`
+        })
+      }
     } catch (error) {
-      host.notifyError?.(error, `Could not reach ${bot.connectionLabel || profile}`)
+      host.notifyError?.(error, `Could not reach ${label}`)
     }
   }
 }
@@ -2639,12 +2779,9 @@ function createCanonicalChat(name) {
         if (!opened && sid && typeof host.openSession === 'function') {
           await host.openSession(sid, { profile: name })
         }
-      } catch (err) {
-        if (sid) {
-          saveBotMeta(name, { chat: null })
-        }
-
-        throw err
+      } catch {
+        // The chat already exists. Keep the pin so the next click
+        // opens it instead of making a second Bot Chat.
       }
     }
 
@@ -2656,49 +2793,94 @@ function createCanonicalChat(name) {
   return run
 }
 
-async function openBotCanonicalChat(name, pinned) {
-  let id = pinned
-
-  try {
-    const res = await host.request('session.list', { profile: name, limit: 100 })
-    const rows = res?.sessions ?? []
-
-    if (!id && rows.length) {
-      // A CLI/A2A exchange may have created the canonical Bot Chat before the
-      // desktop saved ui_meta.chat. Reuse its explicit title first; for older
-      // bot installs retain the documented grandfathering behavior and adopt
-      // the most recent existing session rather than minting another one.
-      id = rows.find(session => session.title === 'Bot Chat')?.id || rows[0].id
-      saveBotMeta(name, { chat: id })
+/** Open the bot's ONE forever chat and return the opened id (or the pin).
+ *
+ *  Identity rules (hermes-agent#88200 — the row must open the session its
+ *  preview describes):
+ *  - grandfather: no pin + existing history adopts the previewed session
+ *    (`history`, the roster's last_session for this bot) instead of minting
+ *    a new empty chat;
+ *  - a live pin is verified through the backend's precise preferred_session
+ *    resolver (hidden rows still resolve; compression lineages resolve to
+ *    the live tip) — never inferred from a paginated, hidden-excluding
+ *    session.list window, which misjudged real hidden pins as gone;
+ *  - transient lookup failures keep the pin: try the stored id as-is, and
+ *    only a rejected open enters recovery. */
+async function openBotCanonicalChat(name, pinned, history) {
+  if (!pinned) {
+    // Grandfather: adopt the conversation the row already previews.
+    const adoptId = history?.id
+    if (adoptId && typeof host.openSession === 'function') {
+      try {
+        await host.openSession(adoptId, { profile: name })
+        saveBotMeta(name, { chat: adoptId })
+        return adoptId
+      } catch {
+        // Adoption raced a vanishing session — fall through to creation.
+      }
     }
+    return createCanonicalChat(name)
+  }
 
-    if (!rows.length) {
+  // Precise verification. An older gateway ignores the unknown param and
+  // omits the key — that reads as a lookup failure below, NOT as a missing
+  // session, so legacy backends keep the try-as-is escape hatch.
+  let preferred
+  let lookupFailed = false
+  try {
+    const res = await host.request('profiles.list', {
+      include_sessions: true,
+      preferred_session_ids: { [name]: pinned }
+    })
+    const row = (res?.profiles ?? []).find(p => p.name === name)
+    preferred = row?.preferred_session
+    if (preferred === undefined) {
+      lookupFailed = true
+    }
+  } catch {
+    lookupFailed = true
+  }
+
+  if (lookupFailed) {
+    // Transient gateway state (or an older backend): the pin is innocent
+    // until proven guilty — try it as-is, and only a rejected open clears.
+    try {
+      await host.openSession(pinned, { profile: name })
+      return pinned
+    } catch {
       saveBotMeta(name, { chat: null })
       return createCanonicalChat(name)
     }
+  }
 
-    if (!rows.some(session => session.id === id)) {
-      id = rows[0].id
-      saveBotMeta(name, { chat: id })
-    }
-  } catch {
-    // Gateway hiccup — try the stored pin as-is. Without a pin we cannot
-    // safely discover a pre-existing canonical chat, so create one as the
-    // fallback rather than leaving the click inert.
-    if (!id) {
-      return createCanonicalChat(name)
+  if (preferred) {
+    try {
+      await host.openSession(preferred.resolved_id || preferred.id, { profile: name })
+      return pinned
+    } catch (error) {
+      // The precise lookup JUST confirmed this session exists, so a failed
+      // open is transient (reconnect, backend restart). Clearing the pin or
+      // minting a replacement here would fork the bot's forever-chat on
+      // every hiccup — report and keep everything as it is.
+      host.notifyError?.(error, `Could not open ${name}'s chat — try again`)
+      return pinned
     }
   }
 
-  try {
-    await host.openSession(id, { profile: name })
-    return id
-  } catch {
-    // A rejected resume means the pin is unusable even if list recovery was
-    // inconclusive. Clear it first so a failed replacement can be retried.
-    saveBotMeta(name, { chat: null })
-    return createCanonicalChat(name)
+  // Definitively gone (db reset, or the lineage was rewritten past
+  // recovery): re-anchor on the previewed session when there is one.
+  const recoveryId = history?.id
+  if (recoveryId && typeof host.openSession === 'function') {
+    try {
+      await host.openSession(recoveryId, { profile: name })
+      saveBotMeta(name, { chat: recoveryId })
+      return recoveryId
+    } catch {
+      // Fall through to a fresh chat.
+    }
   }
+  saveBotMeta(name, { chat: null })
+  return createCanonicalChat(name)
 }
 
 async function prepareBotSource(bot, pinnedChat) {
@@ -3622,11 +3804,16 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
   const unread = !bot.remoteSource && Boolean(unreadByName[bot.name])
   // WHO sent the last message (bot-to-bot DM vs human) — the full stored
   // history lives in the Sessions workspace (context menu), not inline.
-  const { fromBot } = previewKind(last?.preview)
+  // Preview identity must match click identity (#88200): when the backend
+  // resolved the pinned canonical chat, preview THAT session — not the
+  // profile's most recent (but unrelated) activity. Liveness checks above
+  // keep last_session semantics: any recent activity means the bot is alive.
+  const previewSession = bot.preferred_session || last
+  const { fromBot } = previewKind(previewSession?.preview)
   // DM previews read like DMs: strip the delivery prefix, keep the message.
   const displayPreview = fromBot
-    ? (last?.preview || '').replace(A2A_PREFIX_RE, '').trim() || '…'
-    : last?.preview || bot.description || 'No conversations yet — say hi'
+    ? (previewSession?.preview || '').replace(A2A_PREFIX_RE, '').trim() || '…'
+    : previewSession?.preview || bot.description || 'No conversations yet — say hi'
 
   const warm = () => {
     // Multi-source row: pre-dial the agent's OWN source (feature-detected).
@@ -3684,7 +3871,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
     }
 
     try {
-      const id = await openBotCanonicalChat(bot.name, pinnedChat)
+      const id = await openBotCanonicalChat(bot.name, pinnedChat, bot.last_session)
 
       if (id) {
         return
@@ -7319,7 +7506,7 @@ function BotsPane() {
             }
 
             try {
-              const id = await openBotCanonicalChat(bot.name, pinnedChat)
+              const id = await openBotCanonicalChat(bot.name, pinnedChat, bot.last_session)
 
               if (id) {
                 return
@@ -7796,12 +7983,15 @@ export default {
           const localMentions = mentionedBots.filter(bot => !bot.remoteSource)
           const remoteMentions = mentionedBots.filter(bot => bot.remoteSource)
 
-          if (remoteMentions.length && typeof host.requestProfile === 'function') {
-            void deliverRemoteRosterMentions(remoteMentions, text)
-          }
-
           const activeMeta = $botMeta.get()[live.name]
           const senderName = displayName({ name: live.name, title: activeMeta?.title }, activeMeta)
+
+          if (remoteMentions.length && typeof host.requestProfile === 'function') {
+            void deliverRemoteRosterMentions(remoteMentions, text, {
+              name: senderName,
+              handle: botHandle(live.name)
+            })
+          }
           let note = ''
 
           if (localMentions.length) {
