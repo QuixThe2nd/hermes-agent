@@ -1,3 +1,30 @@
+# Hermes — Quix Edition ☤
+
+An edition of [Hermes Agent](https://github.com/NousResearch/hermes-agent) with extra tooling and gateway behavior, kept current with upstream (auto-synced hourly). Everything lands via PR with full CI.
+
+**What's different here:**
+- **Delegation tools**
+  - Send coding tasks to the Cursor Agent CLI, straight from chat
+  - Send coding tasks to the Claude Code CLI, straight from chat
+- **MoA tools** — `consult_moa` and `moa_debate`, restored from the archive
+- **Gateway**
+  - Replies can end with a timing breakdown: total, API, tools, other (off by default upstream)
+- **Discord**
+  - Sessions keyed to your stable username, not your per-server nickname
+  - Threads renamed once, after the first reply lands, never mid-turn
+  - Progress updates respect each platform's real message limits
+- **More config knobs**
+  - API retry backoff timing
+  - Web search and extract fallback chains
+- **Plugins**
+  - dev-pipeline — hand a repo + task to an automated pipeline: MoA planning, Cursor execution, mechanical verification, dual-model review, draft PR
+  - Discord History — read-only search over an owner-authorized PostgreSQL archive of Discord messages
+  - Papercuts — structured journal of workflow friction (log/list/resolve/stats), feeds the daily triage cron
+
+For the upstream project, see [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent). Everything below this header is upstream's README.
+
+---
+
 <p align="center">
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>
