@@ -42,7 +42,6 @@ _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CURSOR_AGENT_MODEL = "kimi-k3-high"
 DEFAULT_TIMEOUT_SECONDS = 900
 MIN_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 1800
@@ -568,7 +567,7 @@ def _run_and_stream(
 def delegate_cursor_agent(
     task: str,
     workdir: str,
-    model: str = DEFAULT_CURSOR_AGENT_MODEL,
+    model: str | None = None,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     force: bool = True,
     task_id: str | None = None,
@@ -604,7 +603,7 @@ def delegate_cursor_agent(
         )
 
     clamped_timeout = _clamp_timeout_seconds(timeout_seconds)
-    model_name = str(model or "").strip() or DEFAULT_CURSOR_AGENT_MODEL
+    model_name = str(model or "").strip()
     force_enabled = is_truthy_value(force, default=True)
 
     log_dir = get_hermes_home() / "cursor-runs"
@@ -618,10 +617,10 @@ def delegate_cursor_agent(
     ]
     if force_enabled:
         cmd.append("--force")
+    if model_name:
+        cmd.extend(["--model", model_name])
     cmd.extend(
         [
-            "--model",
-            model_name,
             "--output-format",
             "stream-json",
             str(task).strip(),
@@ -707,8 +706,11 @@ CURSOR_AGENT_SCHEMA = {
             },
             "model": {
                 "type": "string",
-                "description": "Cursor Agent model to use for the run.",
-                "default": DEFAULT_CURSOR_AGENT_MODEL,
+                "description": (
+                    "Cursor Agent model to use for the run. Omit to use "
+                    "whatever model is selected in the Cursor CLI's own "
+                    "config (~/.cursor/cli-config.json)."
+                ),
             },
             "timeout_seconds": {
                 "type": "integer",
@@ -736,7 +738,7 @@ def _handle_delegate_cursor_agent(args, **kw):
     return delegate_cursor_agent(
         task=args.get("task", ""),
         workdir=args.get("workdir", ""),
-        model=args.get("model", DEFAULT_CURSOR_AGENT_MODEL),
+        model=args.get("model"),
         timeout_seconds=args.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
         force=is_truthy_value(args.get("force", True), default=True),
         task_id=kw.get("task_id"),
