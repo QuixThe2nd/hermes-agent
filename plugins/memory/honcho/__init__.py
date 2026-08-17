@@ -1553,11 +1553,37 @@ class HonchoMemoryProvider(MemoryProvider):
                 peer = args.get("peer", "user")
                 card_update = args.get("card")
                 if card_update:
-                    result = self._manager.set_peer_card(self._session_key, card_update, peer=peer)
+                    try:
+                        result = self._manager.set_peer_card(
+                            self._session_key, card_update, peer=peer, raise_errors=True
+                        )
+                    except HonchoAuthError:
+                        # Let the outer dispatch's auth-specific handler render this.
+                        raise
+                    except Exception as e:
+                        logger.warning("honcho_profile card update failed: %s", e)
+                        return tool_error(
+                            f"Honcho peer card update failed ({e}). This is a "
+                            "backend error — the update was not confirmed written; "
+                            "retry before assuming the card changed."
+                        )
                     if result is None:
                         return tool_error("Failed to update peer card.")
                     return json.dumps({"result": f"Peer card updated ({len(result)} facts).", "card": result})
-                card = self._manager.get_peer_card(self._session_key, peer=peer)
+                try:
+                    card = self._manager.get_peer_card(
+                        self._session_key, peer=peer, raise_errors=True
+                    )
+                except HonchoAuthError:
+                    # Let the outer dispatch's auth-specific handler render this.
+                    raise
+                except Exception as e:
+                    logger.warning("honcho_profile failed: %s", e)
+                    return tool_error(
+                        f"Honcho profile fetch failed ({e}). This is a backend "
+                        "error, not an empty result — the peer may still have "
+                        "profile facts stored in Honcho."
+                    )
                 if not card:
                     return json.dumps(self._empty_profile_hint(peer))
                 return json.dumps({"result": card})
@@ -1568,9 +1594,21 @@ class HonchoMemoryProvider(MemoryProvider):
                     return tool_error("Missing required parameter: query")
                 max_tokens = min(int(args.get("max_tokens", 800)), 2000)
                 peer = args.get("peer", "user")
-                result = self._manager.search_context(
-                    self._session_key, query, max_tokens=max_tokens, peer=peer
-                )
+                try:
+                    result = self._manager.search_context(
+                        self._session_key, query, max_tokens=max_tokens, peer=peer,
+                        raise_errors=True,
+                    )
+                except HonchoAuthError:
+                    # Let the outer dispatch's auth-specific handler render this.
+                    raise
+                except Exception as e:
+                    logger.warning("honcho_search failed: %s", e)
+                    return tool_error(
+                        f"Honcho search failed ({e}). This is a backend error, "
+                        "not an empty result — relevant messages may still exist "
+                        "in Honcho."
+                    )
                 if not result:
                     return json.dumps({"result": "No relevant context found."})
                 return json.dumps({"result": result})
@@ -1612,7 +1650,20 @@ class HonchoMemoryProvider(MemoryProvider):
 
             elif tool_name == "honcho_context":
                 peer = args.get("peer", "user")
-                ctx = self._manager.get_session_context(self._session_key, peer=peer)
+                try:
+                    ctx = self._manager.get_session_context(
+                        self._session_key, peer=peer, raise_errors=True
+                    )
+                except HonchoAuthError:
+                    # Let the outer dispatch's auth-specific handler render this.
+                    raise
+                except Exception as e:
+                    logger.warning("honcho_context failed: %s", e)
+                    return tool_error(
+                        f"Honcho context fetch failed ({e}). This is a backend "
+                        "error, not an empty result — the peer may still have "
+                        "context stored in Honcho."
+                    )
                 if not ctx:
                     return json.dumps({"result": "No context available yet."})
                 parts = []
