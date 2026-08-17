@@ -5,14 +5,17 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-import psycopg
+# psycopg is imported lazily inside connect() so the plugin package stays
+# importable on hosts without the driver installed.
 
 MIGRATIONS = Path(__file__).resolve().parent.parent / "migrations"
 
 
-def connect(dsn: str, **kwargs: Any) -> psycopg.Connection[Any]:
+def connect(dsn: str, **kwargs: Any) -> "psycopg.Connection[Any]":
     if not dsn or not dsn.strip():
         raise ValueError("database DSN is required")
+    import psycopg
+
     return psycopg.connect(dsn, autocommit=False, **kwargs)
 
 

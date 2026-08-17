@@ -9,7 +9,9 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from psycopg.conninfo import conninfo_to_dict
+# psycopg is imported lazily inside load_secrets() so the plugin package
+# (and its tool schema) stays importable on hosts without the driver
+# installed — the check_fn gate hides the tool there anyway.
 
 from .paths import secrets_path
 _SECRET_KEYS = frozenset({"DISCORD_HISTORY_DATABASE_URL", "DISCORD_HISTORY_AUDIT_HMAC_KEY"})
@@ -86,7 +88,11 @@ def load_secrets(path: str | os.PathLike[str] | None = None) -> Secrets:
 
     dsn = values["DISCORD_HISTORY_DATABASE_URL"]
     try:
+        from psycopg.conninfo import conninfo_to_dict
+
         parsed = conninfo_to_dict(dsn)
+    except ImportError:
+        raise ConfigError("psycopg_not_installed")
     except Exception as exc:
         raise ConfigError("invalid_database_url") from exc
     if not parsed.get("dbname"):
