@@ -1,14 +1,14 @@
 # Hermes — Quix Edition ☤
 
-An edition of [Hermes Agent](https://github.com/NousResearch/hermes-agent) with extra tooling and gateway behavior, kept current with upstream (auto-synced every 6 hours). Everything lands via PR with full CI.
+An edition of [Hermes Agent](https://github.com/NousResearch/hermes-agent) with extra tooling and gateway behavior, kept current with upstream (auto-synced hourly). Everything lands via PR with full CI.
 
 **What's different here:**
-- **Delegation tools** — `delegate_cursor_agent` (Cursor Agent CLI lane) and `delegate_claude_agent` (Claude Code + GLM-5.2 lane) as native model tools, with cross-platform process-group handling and the sanctioned subprocess-env factory
-- **MoA tools restored** — `consult_moa` (Mixture-of-Agents consultation) and `moa_debate` (adversarial debate), recovered from the archive
-- **Gateway observability** — runtime footer timing breakdown (total/API/tool/other), injected-context surfacing in the footer and tool-progress feed
-- **Discord behavior** — sessions attributed to stable username (not guild nickname), threads renamed exactly once after the first reply lands, platform-correct progress limits/units
-- **Configurability** — API retry backoff timing, web search/extract fallback chains
-- **Plugins** — dev-pipeline converted to a plugin, plus Discord History and Papercuts plugins
+- **Delegation tools** — Cursor Agent CLI + Claude Code/GLM-5.2 as native tools
+- **MoA tools** — `consult_moa` + `moa_debate` restored from the archive
+- **Gateway footer** — timing breakdown, injected-context in footer/progress feed
+- **Discord** — stable-username sessions, thread-rename-once, platform progress limits
+- **Config** — retry backoff timing, search/extract fallback chains
+- **Plugins** — dev-pipeline, Discord History, Papercuts
 
 For the upstream project, see [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent). Everything below this header is upstream's README.
 
