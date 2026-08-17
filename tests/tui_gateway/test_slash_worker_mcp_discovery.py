@@ -10,6 +10,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 
 import pytest
 import yaml
@@ -51,13 +52,18 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
     (profile_home / "config.yaml").write_text(
         yaml.safe_dump(
             {
+                # Force the startup wait bound to expire before the probe
+                # server connects so the test always exercises the documented
+                # late-binding path (tools appearing after the first tool
+                # snapshot) instead of depending on CI/machine timing.
+                "mcp_discovery_timeout": 0.001,
                 "mcp_servers": {
                     "profileprobe": {
                         "enabled": True,
                         "command": sys.executable,
                         "args": [str(server)],
                     }
-                }
+                },
             }
         ),
         encoding="utf-8",
@@ -92,19 +98,39 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         assert proc.stdin is not None
         assert proc.stdout is not None
         stdout = proc.stdout
-        threading.Thread(
-            target=lambda: output.put(stdout.readline()),
-            daemon=True,
-        ).start()
-        proc.stdin.write(json.dumps({"id": 1, "command": "/tools"}) + "\n")
-        proc.stdin.flush()
-        try:
-            line = output.get(timeout=10)
-        except queue.Empty:
-            pytest.fail("slash worker produced no /tools response within 10 seconds")
-        response = json.loads(line)
-        assert response["ok"] is True
-        assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]
+
+        def _reader() -> None:
+            while True:
+                line = stdout.readline()
+                if not line:
+                    return
+                output.put(line)
+
+        threading.Thread(target=_reader, daemon=True).start()
+
+        # MCP discovery is asynchronous by contract: the startup wait bound
+        # (mcp_discovery_timeout) only caps the wait, and servers that miss it
+        # are registered by the late-binding refresh. Assert visibility with a
+        # bounded poll instead of assuming discovery won the startup race.
+        deadline = time.monotonic() + 30
+        attempt = 0
+        while True:
+            attempt += 1
+            proc.stdin.write(json.dumps({"id": attempt, "command": "/tools"}) + "\n")
+            proc.stdin.flush()
+            try:
+                line = output.get(timeout=10)
+            except queue.Empty:
+                pytest.fail("slash worker produced no /tools response within 10 seconds")
+            response = json.loads(line)
+            assert response["ok"] is True
+            if "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]:
+                break
+            if time.monotonic() > deadline:
+                pytest.fail(
+                    "MCP tool never appeared in /tools output within 30s"
+                )
+            time.sleep(1)
     finally:
         proc.terminate()
         try:

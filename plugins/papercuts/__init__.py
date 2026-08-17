@@ -550,6 +550,9 @@ def check_requirements() -> bool:
 
 
 def register(ctx) -> None:
+    from plugins.papercuts.cli import papercuts_command as _papercuts_command
+    from plugins.papercuts.cli import register_cli as _register_papercuts_cli
+
     ctx.register_tool(
         name="papercuts",
         toolset="papercuts",
@@ -557,4 +560,12 @@ def register(ctx) -> None:
         handler=handle_papercuts,
         check_fn=check_requirements,
         emoji="🩹",
+    )
+
+    ctx.register_cli_command(
+        name="papercuts",
+        help="Papercuts journal and daily autofix installer",
+        setup_fn=_register_papercuts_cli,
+        handler_fn=_papercuts_command,
+        description="Manage workflow-friction papercuts and the optional daily autofix cron job.",
     )

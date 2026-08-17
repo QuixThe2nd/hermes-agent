@@ -67,6 +67,7 @@ The repo ships these bundled plugins under `plugins/`. All are opt-in — enable
 | `image_gen/xai` | image backend | xAI `grok-2-image` backend |
 | `hermes-achievements` | dashboard tab | Steam-style collectible badges generated from your real Hermes session history |
 | `kanban/dashboard` | dashboard tab | Kanban board UI for the multi-agent dispatcher — tasks, comments, fan-out, board switching. See [Kanban Multi-Agent](./kanban.md). |
+| `papercuts` | tool + CLI command | Structured workflow-friction journal (`papercuts` tool) plus an opt-in daily autofix cron installer (`hermes papercuts autofix install`) that turns small mechanical papercuts into PRs |
 
 Memory providers (`plugins/memory/*`) and context engines (`plugins/context_engine/*`) are listed separately on [Memory Providers](./memory-providers.md) — they're managed through `hermes memory` and `hermes plugins` respectively. The full per-plugin detail for the two long-running hooks-based plugins follows.
 
@@ -319,6 +320,26 @@ Adds a **Steam-style achievements tab to the dashboard** — 60+ collectible, ti
 **Enabling:** Nothing to enable — `hermes-achievements` is a dashboard-only plugin (no lifecycle hooks, no model-visible tools). It auto-registers as a tab in `hermes dashboard` on first launch. The `plugins.enabled` config only gates lifecycle/tool plugins; dashboard plugins are discovered purely via their `dashboard/manifest.json`.
 
 **Opting out:** Delete or rename `plugins/hermes-achievements/dashboard/manifest.json`, or override it with a user plugin of the same name in `~/.hermes/plugins/hermes-achievements/` that ships no dashboard. The plugin's state files under `$HERMES_HOME/plugins/hermes-achievements/` survive — reinstalling preserves your unlock history.
+
+### papercuts
+
+A private complaint box for the agent — a structured journal of small but reusable workflow friction (dead-end tool calls, misleading docs, missing helpers, platform limitations), stored as an append-only JSONL journal at `$HERMES_HOME/papercuts/events.jsonl`.
+
+**Tool** — one `papercuts` tool with actions `log` / `list` / `resolve` / `ignore` / `stats`. Agents log friction after pushing through it, review the open list, and resolve items only when actually addressed.
+
+**Autofix cron installer** — the plugin also ships a CLI command that installs an optional daily cron job turning the journal into pull requests:
+
+```bash
+hermes papercuts autofix install      # create or update the daily job
+hermes papercuts autofix status       # schedule, last run, next run
+hermes papercuts autofix uninstall    # remove the job
+```
+
+Each run lists open papercuts, classifies them (small mechanical AUTO-FIX vs human JUDGEMENT), fixes at most `--max-fixes` (default 3) in a dated scratch git clone, pushes branches, opens PRs, watches CI (classifying failures as caused / baseline / flaky), and only resolves a papercut with a PR URL plus verification evidence. The live checkout is never mutated.
+
+**Prerequisites:** `gh` CLI authenticated, push access to the PR remote (your own fork's `origin` by default), and the plugin enabled (`hermes plugins enable papercuts`). Install-time overrides cover `--repo`, `--remote`, `--base-repo`, `--schedule`, `--deliver`, and `--max-fixes`; preflight fails cleanly on a non-git repo, a non-GitHub remote, or missing `gh` auth.
+
+See `plugins/papercuts/README.md` for the full safety contract.
 
 ## Adding a bundled plugin
 
