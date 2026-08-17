@@ -3,7 +3,7 @@
 An edition of [Hermes Agent](https://github.com/NousResearch/hermes-agent) with extra tooling and gateway behavior, kept current with upstream (auto-synced hourly). Everything lands via PR with full CI.
 
 **What's different here:**
-- **Delegation tools** — Cursor Agent CLI + Claude Code/GLM-5.2 as native tools
+- **Delegation tools** — Cursor Agent CLI + Claude Code CLI as native tools (wire any model)
 - **MoA tools** — `consult_moa` + `moa_debate` restored from the archive
 - **Gateway footer** — timing breakdown, injected-context in footer/progress feed
 - **Discord** — stable-username sessions, thread-rename-once, platform progress limits
