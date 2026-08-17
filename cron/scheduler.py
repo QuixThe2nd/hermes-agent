@@ -13,6 +13,7 @@ import atexit
 import concurrent.futures
 import contextlib
 import contextvars
+import errno
 import json
 import logging
 import os
@@ -854,6 +855,60 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
     now = time.time()
     stale: list = []
 
+    # Latest durable execution per RELEASABLE-LOOKING in-flight job id, loaded
+    # in one indexed query.  Used for the persisted-state reconciliation below
+    # (t_8b5480b3): an in-memory claim whose OWN run's execution row is
+    # terminal cannot represent a live run — the durable ledger proves that
+    # run already ended — so the claim is stale by construction, regardless of
+    # its in-memory age.  A leaked claim is then recoverable without
+    # force-run/resume.  Two-phase so the healthy steady state pays no DB
+    # work: a claim with a live future is never released, so the query only
+    # covers claims whose future is missing/pending/done (the snapshot is
+    # taken under _running_lock; iterating a set concurrently mutated by
+    # try_register/release_running_job can raise RuntimeError).  A claim that
+    # becomes releasable between the snapshot and the sweep loop simply waits
+    # for the next tick's query.
+    from cron.executions import _TERMINAL_STATES as _terminal_states
+
+    with _running_lock:
+        _claim_futures = {
+            job_id: _running_futures.get(job_id) for job_id in _running_job_ids
+        }
+    _ledger_candidates = [
+        job_id
+        for job_id, fut in _claim_futures.items()
+        if fut is None or fut is _FUTURE_PENDING or fut.done()
+    ]
+    _latest: dict = {}
+    if _ledger_candidates:
+        try:
+            from cron.executions import latest_executions as _latest_execs
+            _latest = _latest_execs(_ledger_candidates)
+        except Exception:
+            _latest = {}
+
+    def _row_belongs_to_claim(row: dict, claim_started: float) -> bool:
+        """True when the ledger row was claimed at/after this in-memory claim.
+
+        The latest terminal row proves THIS claim's run ended only if it was
+        created by this claim's dispatch (create_execution runs moments AFTER
+        try_register_running_job).  A terminal row older than the in-memory
+        claim is the PREVIOUS run's outcome — for a recurring job that is the
+        common case in the window between try_register and create_execution,
+        and releasing on it would double-dispatch a healthy fresh claim.
+        Unparseable timestamps fail closed (row treated as previous-run; the
+        age-based path below still bounds the claim).
+        """
+        claimed_at = row.get("claimed_at")
+        if not claimed_at:
+            return False
+        try:
+            from cron.jobs import _ensure_aware as _ensure_aware_ts
+            row_ts = _ensure_aware_ts(datetime.fromisoformat(claimed_at))
+            return row_ts.timestamp() >= claim_started
+        except (ValueError, TypeError, OSError):
+            return False
+
     # Precompute job intervals OUTSIDE _running_lock so croniter evaluation
     # does not block try_register/release_running_job for other jobs.
     _intervals = {jid: _job_interval_minutes(j) for jid, j in by_id.items()}
@@ -871,8 +926,6 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
             allowance = floor_seconds
             if interval_minutes:
                 allowance = max(allowance, 2.0 * interval_minutes * 60.0)
-            if age < allowance:
-                continue
             fut = _running_futures.get(job_id)
             if fut is _FUTURE_PENDING:
                 # The claim is past its allowance and the owning future still
@@ -882,13 +935,40 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
                 pass
             elif fut is not None and not fut.done():
                 continue  # genuinely still executing
+            # Persisted-state reconciliation: if the durable executions ledger
+            # shows THIS claim's run reached a terminal state, the claim is
+            # provably stale even if it is still inside its in-memory age
+            # allowance (or was adopted fresh this tick).  Release it now so
+            # the job re-dispatches on the next tick without force-run/resume
+            # (t_8b5480b3 — the 2026-08-14 recurring-router wedge where the
+            # in-memory age bound alone could not see a run the ledger had
+            # already finished).  The row must belong to THIS claim
+            # (claimed_at >= claim registration): for a recurring job the
+            # latest terminal row is usually the PREVIOUS run's outcome —
+            # a fresh claim in the try_register→create_execution window, or a
+            # finished run whose worker finally hasn't released yet, would
+            # otherwise be force-released and double-dispatched.  Reaching
+            # here implies the future is missing/pending/done (the live-future
+            # case continued above), so every claim in this branch was a
+            # ledger-query candidate.
+            latest = _latest.get(job_id)
+            if (
+                latest is not None
+                and latest.get("status") in _terminal_states
+                and _row_belongs_to_claim(latest, started)
+            ):
+                reason = "ledger-terminal"
+            elif age >= allowance:
+                reason = "age"
+            else:
+                continue
             _running_job_ids.discard(job_id)
             _running_since.pop(job_id, None)
             _running_futures.pop(job_id, None)
             _forced_release_count += 1
-            stale.append((job_id, age, allowance, fut))
+            stale.append((job_id, age, allowance, fut, reason))
 
-    for job_id, age, allowance, fut in stale:
+    for job_id, age, allowance, fut, _reason in stale:
         job = by_id.get(job_id) or {}
         name = job.get("name") or job_id
         if fut is _FUTURE_PENDING:
@@ -898,9 +978,10 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
         else:
             future_state = "finished"
         logger.warning(
-            "cron.inflight.forced_release event=forced_release job='%s' id=%s "
-            "age=%.0fs allowance=%.0fs future=%s — stale in-flight claim "
+            "cron.inflight.forced_release event=forced_release reason=%s job='%s' "
+            "id=%s age=%.0fs allowance=%.0fs future=%s — stale in-flight claim "
             "released; the job was skipping every fire with 'already running'",
+            _reason,
             name,
             job_id,
             age,
@@ -908,6 +989,18 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
             future_state,
         )
         _record_forced_release(job_id, name, age, allowance)
+        # A ledger-terminal release is authoritative: the durable executions
+        # ledger ALREADY records how the last run ended (completed/failed/
+        # unknown), so we must NOT call mark_job_run here — doing so would
+        # clobber an honest completed/ok status with a synthetic failure, or
+        # double-write an already-recorded failure.  We only release the claim
+        # so the job re-dispatches on its next due tick; the ledger is the
+        # record of record for the outcome.  The age-based release below keeps
+        # the original wedge-surfacing mark_job_run behaviour (an age-release
+        # may have no ledger row at all, so surfacing last_error is the only
+        # way the wedge becomes visible).
+        if _reason == "ledger-terminal":
+            continue
         # Finite-repeat guard: a forced release is NOT a real run, so it must
         # not consume a finite one-shot's repeat budget or let mark_job_run
         # auto-delete the row (completed >= times).  The claim is released and
@@ -1332,6 +1425,73 @@ def _get_lock_paths() -> tuple[Path, Path]:
     hermes_home = _get_hermes_home()
     lock_dir = hermes_home / "cron"
     return lock_dir, lock_dir / ".tick.lock"
+
+
+# Errnos that mean "another ticker (or manual tick) holds the tick lock",
+# as opposed to a real failure opening/locking the file.  Everything else —
+# most importantly EMFILE/ENFILE (fd exhaustion, #87644) and EACCES on
+# open() — must be surfaced, never swallowed as lock contention.
+def _is_lock_contention_errno(err: OSError) -> bool:
+    """Return True when *err* from the lock syscall means the lock is held.
+
+    - POSIX: ``flock(LOCK_EX|LOCK_NB)`` reports EWOULDBLOCK/EAGAIN when
+      another process holds the lock (EACCES on some NFS implementations).
+    - Windows: ``msvcrt.locking(LK_NBLCK)`` reports EACCES/EDEADLK.
+    """
+    if err.errno is None:
+        return False
+    if fcntl is not None:
+        return err.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES)
+    if msvcrt is not None:
+        return err.errno in (errno.EACCES, errno.EDEADLK)
+    return False
+
+
+def _is_fd_exhaustion_text(text: str) -> bool:
+    """Text-level half of :func:`_is_fd_exhaustion` (shared with the CLI hint)."""
+    lowered = text.lower()
+    return "too many open files" in lowered or "emfile" in lowered
+
+
+def _is_fd_exhaustion(exc: BaseException) -> bool:
+    """Return True when *exc* indicates file-descriptor exhaustion.
+
+    Recognizes EMFILE/ENFILE by errno, and the "Too many open files" wording
+    for wrapped exceptions (``load_jobs`` wraps the raw OSError in a
+    RuntimeError with that message, #87644).
+    """
+    if isinstance(exc, OSError) and exc.errno in (errno.EMFILE, errno.ENFILE):
+        return True
+    return _is_fd_exhaustion_text(str(exc))
+
+
+def _reclaim_fds_best_effort() -> None:
+    """Best-effort attempt to free leaked file descriptors.
+
+    The cron FD-leak family (#60859, #79742, #80792) leaks descriptors from
+    abandoned workers/sessions.  Two safe, idempotent levers:
+
+    1. ``gc.collect()`` — closes file-like objects held only in reference
+       cycles (the classic unclosed-file leak shape), which CPython would
+       otherwise never finalize.
+    2. ``apply_nofile_soft_limit()`` — raise RLIMIT_NOFILE's soft limit
+       toward the configured target when the hard limit allows, giving the
+       process headroom to keep serving even before every leak is freed.
+
+    Never raises: a reclamation attempt must not make the ticker worse.
+    """
+    try:
+        import gc
+
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        from hermes_cli.resource_limits import apply_nofile_soft_limit
+
+        apply_nofile_soft_limit(None)
+    except Exception:
+        pass
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -6471,7 +6631,12 @@ def tick(
     lock_dir, lock_file = _get_lock_paths()
     lock_dir.mkdir(parents=True, exist_ok=True)
 
-    # Cross-platform file locking: fcntl on Unix, msvcrt on Windows
+    # Cross-platform file locking: fcntl on Unix, msvcrt on Windows.
+    # Only genuine lock contention (another ticker holds the lock) skips the
+    # tick silently.  A real OSError — most importantly EMFILE/ENFILE from fd
+    # exhaustion — must NOT be swallowed as "another instance holds the
+    # lock": that previously made the scheduler appear healthy (tick returned
+    # 0, heartbeat recorded success) while no job ever ran again (#87644).
     lock_fd = None
     try:
         lock_fd = open(lock_file, "w", encoding="utf-8")
@@ -6479,11 +6644,35 @@ def tick(
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         elif msvcrt:
             msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
-    except (OSError, IOError):
-        logger.debug("Tick skipped — another instance holds the lock")
+    except OSError as exc:
+        if lock_fd is not None and _is_lock_contention_errno(exc):
+            logger.debug("Tick skipped — another instance holds the lock")
+            try:
+                lock_fd.close()
+            except OSError:
+                pass
+            return 0
+        # Real failure: log loudly, attempt fd reclamation, and let the
+        # caller (ticker loop) see a FAILED tick so liveness degrades
+        # instead of reporting healthy-while-stalled.
         if lock_fd is not None:
-            lock_fd.close()
-        return 0
+            try:
+                lock_fd.close()
+            except OSError:
+                pass
+        if _is_fd_exhaustion(exc):
+            # Reclamation is owned by the ticker loop's except handler
+            # (scheduler_provider.py) — it classifies the raised error and
+            # runs _reclaim_fds_best_effort exactly once per failed tick.
+            # Calling it here too would double the gc.collect() pause.
+            logger.error(
+                "Cron tick could not acquire tick lock: %s — scheduler will "
+                "attempt fd reclamation and retry with backoff",
+                exc,
+            )
+        else:
+            logger.error("Cron tick could not acquire tick lock: %s", exc)
+        raise
 
     try:
         # Global emergency stop (`hermes pause`): skip dispatch entirely while
