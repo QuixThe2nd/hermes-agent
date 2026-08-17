@@ -8726,6 +8726,14 @@ class AIAgent:
             if task_started:
                 task_finished = True
                 finish_task_run(**task_context, result=result)
+            # Footer timing breakdown: early-exit paths (max-iteration,
+            # guardrail halt) return a result dict without api_time/tool_time.
+            # Copy the per-turn accumulators so the gateway footer always
+            # surfaces real values regardless of which return path executed.
+            # setdefault: values already set by finalize_turn win.
+            if isinstance(result, dict):
+                result.setdefault("api_time", getattr(self, "_turn_api_time", 0.0))
+                result.setdefault("tool_time", getattr(self, "_turn_tool_time", 0.0))
             return result
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, InterruptedError)) or (
