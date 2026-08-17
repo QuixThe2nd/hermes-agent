@@ -196,7 +196,7 @@ def test_schema_registration():
     assert required == {"task", "workdir"}
 
     props = schema["parameters"]["properties"]
-    assert props["model"]["default"] == "kimi-k3-high"
+    assert "default" not in props["model"]
     assert props["timeout_seconds"]["default"] == 900
     assert props["force"]["default"] is True
 
@@ -545,13 +545,40 @@ def test_happy_path_e2e(monkeypatch, tmp_path):
         "-p",
         "--trust",
         "--force",
-        "--model",
-        "kimi-k3-high",
         "--output-format",
         "stream-json",
         "implement feature",
     ]
     assert proc.cwd == str(workdir.resolve())
+
+
+def test_explicit_model_adds_flag(monkeypatch, tmp_path):
+    from tools import cursor_agent_tool
+
+    monkeypatch.setattr("tools.cursor_agent_tool.resolve_cursor_agent_binary", lambda: "/usr/bin/agent")
+    monkeypatch.setattr("tools.cursor_agent_tool.subprocess.Popen", _StreamingFakePopen)
+
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+
+    cursor_agent_tool.delegate_cursor_agent(
+        task="implement feature",
+        workdir=str(workdir.resolve()),
+        model="composer-2.5",
+    )
+
+    proc = _FakePopen.instances[0]
+    assert proc.cmd == [
+        "/usr/bin/agent",
+        "-p",
+        "--trust",
+        "--force",
+        "--model",
+        "composer-2.5",
+        "--output-format",
+        "stream-json",
+        "implement feature",
+    ]
 
 
 @pytest.mark.parametrize(
