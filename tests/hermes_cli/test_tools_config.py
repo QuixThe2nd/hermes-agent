@@ -2,6 +2,7 @@
 
 import logging
 import subprocess
+from argparse import Namespace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -17,6 +18,7 @@ from hermes_cli.tools_config import (
     _checklist_toolset_keys,
     _configure_provider,
     _reconfigure_provider,
+    _get_effective_configurable_toolsets,
     _get_platform_tools,
     _platform_toolset_summary,
     _reconfigure_tool,
@@ -30,9 +32,44 @@ from hermes_cli.tools_config import (
     _visible_providers,
     provider_readiness_status,
     tools_command,
+    tools_disable_enable_command,
 )
 
 
+
+
+# ─── moa toolset: configurable surface + default-off semantics ───────────────
+
+
+def test_moa_is_a_configurable_toolset():
+    """The moa toolset must appear in the effective configurable list so
+    ``hermes tools list/enable/disable`` and the dashboard tools API accept it."""
+    keys = {ts_key for ts_key, _, _ in _get_effective_configurable_toolsets()}
+    assert "moa" in keys
+
+
+def test_moa_enable_for_discord_persists_in_platform_toolsets(capsys):
+    """``hermes tools enable moa --platform discord`` must not hit the unknown
+    toolset path and must write moa into the saved discord toolset list."""
+    config = {"platform_toolsets": {"discord": ["hermes-discord", "web"]}}
+    with patch("hermes_cli.tools_config.load_config", return_value=config), \
+         patch("hermes_cli.tools_config.save_config") as mock_save:
+        tools_disable_enable_command(
+            Namespace(tools_action="enable", names=["moa"], platform="discord")
+        )
+    out = capsys.readouterr().out
+    assert "Unknown toolset 'moa'" not in out
+    saved = mock_save.call_args[0][0]
+    assert "moa" in saved["platform_toolsets"]["discord"]
+
+
+def test_moa_default_off_not_enabled_on_fresh_discord_config():
+    """moa stays opt-in: listed in _DEFAULT_OFF_TOOLSETS and absent from a
+    fresh discord resolution even though hermes-discord carries the tools."""
+    assert "moa" in _DEFAULT_OFF_TOOLSETS
+    enabled = _get_platform_tools({}, "discord", include_default_mcp_servers=False)
+    assert "moa" not in enabled
+    assert "moa" in _checklist_toolset_keys("discord")
 
 
 def test_all_invalid_platform_toolsets_logs_runtime_warning(caplog):
