@@ -9,6 +9,8 @@ See: https://github.com/NousResearch/hermes-agent/issues/1264
 """
 
 import os
+import subprocess
+import sys
 import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -20,6 +22,14 @@ from tools.environments.local import (
     _HERMES_PROVIDER_ENV_BLOCKLIST,
     _HERMES_PROVIDER_ENV_FORCE_PREFIX,
 )
+
+
+def _running_venv_site_packages() -> Path:
+    """Independently construct the host-native venv site-packages path."""
+    if sys.platform == "win32":
+        return Path(sys.prefix) / "Lib" / "site-packages"
+    pyver = f"python{sys.version_info[0]}.{sys.version_info[1]}"
+    return Path(sys.prefix) / "lib" / pyver / "site-packages"
 
 
 def _make_fake_popen(captured: dict):
@@ -314,262 +324,450 @@ class TestActiveVenvMarkerStripping:
         assert "CONDA_PREFIX" in _ACTIVE_VENV_MARKER_VARS
 
 
-class TestPythonpathSelectiveStrip:
-    """PYTHONPATH site-packages stripping for cross-version ABI safety (#74817).
+def _make_directory_link(link: Path, target: Path) -> None:
+    """Create a directory link without requiring symlink privileges.
 
-    The Desktop Electron app injects the Hermes venv's site-packages
-    (Python 3.11) into PYTHONPATH.  When this leaks into subprocesses
-    running a different Python (e.g. 3.13), 3.11 C extensions appear on
-    sys.path and crash with ImportError.  ``_strip_mismatched_site_packages``
-    surgically removes only the dangerous entries, preserving user paths.
+    POSIX: Path.symlink_to.  Windows: try symlink_to first (works with
+    Developer Mode enabled), then fall back to an unprivileged directory
+    junction via `cmd /c mklink /J` -- junctions do not require the
+    SeCreateSymbolicLinkPrivilege.  Raises the original error when no
+    mechanism is available so callers can skip with a clear reason.
+    """
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError:
+        if sys.platform != "win32":
+            raise
+    # Binary capture: on a localized Windows the junction message is in the
+    # console code page (e.g. GBK), which would raise UnicodeDecodeError in
+    # the reader thread under UTF-8 mode.  Only the exit code matters.
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise OSError(detail or f"mklink /J failed: {result.returncode}")
+
+
+def _physical_repo_root(tmp_path: Path) -> Path:
+    """Create the physical repo checkout directory for junction tests."""
+    physical_root = tmp_path / "physical-home" / "hermes-agent"
+    physical_root.mkdir(parents=True)
+    return physical_root
+
+
+class TestPythonpathSelectiveStrip:
+    """PYTHONPATH Hermes-owned entry stripping (#74817).
+
+    The Desktop Electron app injects the Hermes repo root and the Hermes
+    venv's site-packages (Python 3.11) into PYTHONPATH.  When this leaks
+    into subprocesses running a different Python (e.g. 3.13), 3.11 C
+    extensions appear on sys.path and crash with ImportError.
+    ``_strip_hermes_owned_pythonpath`` surgically removes only the
+    entries Hermes itself owns (repo root, own venv site-packages),
+    preserving user paths — including user paths whose names merely
+    contain another Python version.
     """
 
-    def test_hermes_venv_site_packages_stripped(self):
-        """A site-packages entry under the Hermes venv is removed."""
-        from tools.environments.local import _strip_mismatched_site_packages
-        import sys
+    def test_owned_entries_stripped_matrix(self):
+        """Exact Hermes-owned entries are removed; everything else survives
+        verbatim (ordering, duplicates, empty components).
 
-        # Construct a path that looks like the Hermes venv site-packages.
-        # Use the running interpreter's version so it hits the "under Hermes
-        # venv" check (check 2), not the cross-version check (check 1).
-        pyver = f"python{sys.version_info[0]}.{sys.version_info[1]}"
-        venv_sp = str(
-            __import__("pathlib").Path(sys.prefix) / "lib" / pyver / "site-packages"
-        )
-        env = {
-            "PYTHONPATH": os.pathsep.join([venv_sp, "/home/user/my-lib"]),
-        }
-        _strip_mismatched_site_packages(env)
-        assert "PYTHONPATH" in env
-        entries = env["PYTHONPATH"].split(os.pathsep)
-        assert venv_sp not in entries
-        assert "/home/user/my-lib" in entries
+        Covers: the running venv's site-packages, the repo root (computed
+        independently via parents[2] so an off-by-one in _hermes_repo_root
+        cannot silently pass), duplicate Hermes entries, all-owned input
+        (PYTHONPATH key removed), and mixed user/Hermes ordering with an
+        empty component preserved.
+        """
+        from tools.environments.local import _strip_hermes_owned_pythonpath
 
-    def test_user_pythonpath_preserved(self):
-        """User PYTHONPATH entries pass through untouched."""
-        from tools.environments.local import _strip_mismatched_site_packages
-        user_pp = os.pathsep.join(["/opt/my-lib", "/another/path"])
+        venv_sp = str(_running_venv_site_packages())
+        local_file = Path(__import__("tools.environments.local", fromlist=["__file__"]).__file__).resolve()
+        repo_root = str(local_file.parents[2])
+        cases = [
+            ([venv_sp, "/home/user/my-lib"], ["/home/user/my-lib"]),
+            ([repo_root, "/home/user/my-lib"], ["/home/user/my-lib"]),
+            ([venv_sp, "/user/lib", venv_sp, "/user/lib"], ["/user/lib", "/user/lib"]),
+            ([venv_sp], None),  # all owned -> PYTHONPATH key removed
+            (["/first/user/lib", repo_root, "", venv_sp, "/second/user/lib"],
+             ["/first/user/lib", "", "/second/user/lib"]),
+        ]
+        for input_entries, expected in cases:
+            env = {"PYTHONPATH": os.pathsep.join(input_entries)}
+            _strip_hermes_owned_pythonpath(env)
+            if expected is None:
+                assert "PYTHONPATH" not in env
+            else:
+                assert env["PYTHONPATH"].split(os.pathsep) == expected
+
+    @pytest.mark.parametrize("user_pp", [
+        os.pathsep.join(["/opt/my-lib", "/another/path"]),
+        "/nix/store/abc123-user-plugin/lib/python3.12/site-packages",
+        os.pathsep.join(["/old/lib/python2.7/site-packages", "/home/user/lib"]),
+        os.pathsep.join(["/opt/tools/python3.13/bin", "/opt/downloads/python3.13", "/custom/python3.13"]),
+        os.pathsep.join([" /opt/user-lib ", "relative/../lib", "", "/opt/user-lib", "/opt/user-lib"]),
+        os.pathsep.join(["/foo", "", "/bar"]),
+        "",
+    ])
+    def test_non_owned_entries_preserved(self, user_pp):
+        """Anything not proven Hermes-owned is preserved byte-for-byte.
+
+        One invariant, one matrix: ordinary user paths, Nix store paths,
+        other-major/minor-version site-packages, paths merely containing a
+        pythonX.Y component, raw spellings (whitespace, relative segments,
+        duplicates), empty components, and an empty PYTHONPATH all reduce to
+        the same contract -- ownership is decided by provenance, never by
+        path shape or version (P1/P2, #74817 follow-ups).
+        """
+        from tools.environments.local import _strip_hermes_owned_pythonpath
         env = {"PYTHONPATH": user_pp}
-        _strip_mismatched_site_packages(env)
+        _strip_hermes_owned_pythonpath(env)
         assert env.get("PYTHONPATH") == user_pp
 
-    def test_cross_version_site_packages_stripped(self):
-        """A python3.12/site-packages entry is stripped even if NOT under the
-        Hermes venv path - simulates a leak from systemd or another source."""
-        from tools.environments.local import _strip_mismatched_site_packages
+    def test_non_owned_runtime_shaped_entries_preserved(self):
+        """Runtime-derived user spellings are preserved: site-packages for a
+        different interpreter version, a descendant of the Hermes venv
+        site-packages, and direct/deeper children of the repo root.  The
+        repo root is computed independently (parents[2] of this file) so an
+        off-by-one in _hermes_repo_root cannot silently pass; no launcher
+        injects a direct child as a standalone entry, so such paths are user
+        paths by contract.
+        """
+        from tools.environments.local import _strip_hermes_owned_pythonpath
         import sys
 
-        # Use a version different from the running interpreter.
-        running_major = sys.version_info[0]
         running_minor = sys.version_info[1]
-        # Pick a guaranteed-different version.
         other_minor = running_minor + 1 if running_minor < 20 else running_minor - 1
-        other_ver = f"python{running_major}.{other_minor}"
-
-        mismatched_sp = f"/opt/other-venv/lib/{other_ver}/site-packages"
-        env = {
-            "PYTHONPATH": os.pathsep.join([mismatched_sp, "/home/user/my-lib"]),
-        }
-        _strip_mismatched_site_packages(env)
-        assert "PYTHONPATH" in env
-        entries = env["PYTHONPATH"].split(os.pathsep)
-        assert mismatched_sp not in entries
-        assert "/home/user/my-lib" in entries
-
-    def test_cross_major_version_stripped(self):
-        """A python2.7/site-packages entry is always stripped."""
-        from tools.environments.local import _strip_mismatched_site_packages
-        env = {
-            "PYTHONPATH": "/old/lib/python2.7/site-packages:/home/user/lib",
-        }
-        _strip_mismatched_site_packages(env)
-        entries = env["PYTHONPATH"].split(os.pathsep)
-        assert "/old/lib/python2.7/site-packages" not in entries
-        assert "/home/user/lib" in entries
+        local_file = Path(__import__("tools.environments.local", fromlist=["__file__"]).__file__).resolve()
+        real_repo_root = local_file.parents[2]
+        inputs = [
+            os.pathsep.join([
+                f"/opt/other-venv/lib/python{sys.version_info[0]}.{other_minor}/site-packages",
+                "/home/user/my-lib",
+            ]),
+            os.pathsep.join([str(_running_venv_site_packages() / "some-user-path"), "/home/user/my-lib"]),
+            os.pathsep.join([str(real_repo_root / "tools"), "/home/user/my-lib"]),
+            os.pathsep.join([str(real_repo_root / "tools" / "environments"), "/home/user/my-lib"]),
+        ]
+        for user_pp in inputs:
+            env = {"PYTHONPATH": user_pp}
+            _strip_hermes_owned_pythonpath(env)
+            assert env["PYTHONPATH"] == user_pp
 
     def test_windows_backslash_paths(self):
-        """Windows-style backslash paths with site-packages are handled.
+        """Windows-style backslash paths are handled for Hermes-owned entries.
 
         On Windows, os.pathsep is ';'.  We mock it so the test runs
-        correctly on POSIX CI."""
-        from tools.environments.local import _strip_mismatched_site_packages
+        correctly on POSIX CI.  On a POSIX host a backslash path is a
+        single path component, so ``Path`` cannot identify it as
+        Hermes-owned — the critical invariant is that user Windows paths
+        (including site-packages paths for another Python version) are
+        never destroyed.  On a real Windows host, Path splits on
+        backslashes and Hermes venv site-packages entries are stripped
+        by the same Hermes-owned check (covered by the Windows-only test
+        below).
+        """
+        from tools.environments.local import _strip_hermes_owned_pythonpath
         import sys
 
-        # Construct a Windows-style path with a different Python version.
-        running_major = sys.version_info[0]
-        running_minor = sys.version_info[1]
-        other_minor = running_minor + 1 if running_minor < 20 else running_minor - 1
-        other_ver = f"python{running_major}.{other_minor}"
-
-        mismatched_win = f"C:\\venv\\lib\\{other_ver}\\site-packages"
-        user_win = "D:\\user\\lib"
+        pyver = f"python{sys.version_info[0]}.{sys.version_info[1]}"
+        hermes_win = f"C:\\\\Users\\\\u\\\\.hermes\\\\hermes-agent\\\\venv\\\\lib\\\\{pyver}\\\\site-packages"
+        user_win = "D:\\\\user\\\\lib"
         env = {
-            "PYTHONPATH": ";".join([mismatched_win, user_win]),
+            "PYTHONPATH": ";".join([hermes_win, user_win]),
         }
         # Mock os.pathsep to ';' (Windows) just for the strip call.
         with patch("os.pathsep", ";"):
-            _strip_mismatched_site_packages(env)
+            _strip_hermes_owned_pythonpath(env)
         assert "PYTHONPATH" in env
         entries = env["PYTHONPATH"].split(";")
-        assert mismatched_win not in entries
+        # Both survive on POSIX: user paths must always be preserved, and
+        # the Hermes-owned check cannot match a backslash path here.
+        assert hermes_win in entries
+        assert user_win in entries
+
+    @pytest.mark.windows_only
+    def test_windows_hermes_owned_paths_stripped(self):
+        """On Windows, a Hermes venv site-packages entry written with
+        backslashes is stripped by the same Hermes-owned check, while a
+        user Windows path is preserved.  Windows-only: POSIX ``Path`` does
+        not split on backslashes, so this cannot be meaningfully simulated
+        on a POSIX host."""
+        from tools.environments.local import _strip_hermes_owned_pythonpath
+
+        venv_sp = str(_running_venv_site_packages())
+        # Windows form: C:\...\venv\Lib\site-packages (backslashes)
+        hermes_win = venv_sp
+        user_win = "D:\\\\user\\\\lib"
+        env = {
+            "PYTHONPATH": ";".join([hermes_win, user_win]),
+        }
+        _strip_hermes_owned_pythonpath(env)
+        entries = env["PYTHONPATH"].split(";")
+        assert hermes_win not in entries
         assert user_win in entries
 
     def test_empty_pythonpath_unchanged(self):
         """An empty PYTHONPATH is a no-op (falsy -> early return)."""
-        from tools.environments.local import _strip_mismatched_site_packages
+        from tools.environments.local import _strip_hermes_owned_pythonpath
         env = {"PYTHONPATH": ""}
-        _strip_mismatched_site_packages(env)
+        _strip_hermes_owned_pythonpath(env)
         # Empty string is falsy, so the function returns early without
         # modifying the dict.  The key stays as-is (empty string).
         assert env.get("PYTHONPATH") == ""
 
+    def test_empty_component_preserved(self):
+        """An empty component means cwd and must survive unchanged."""
+        from tools.environments.local import _strip_hermes_owned_pythonpath
+
+        user_pp = os.pathsep.join(["/foo", "", "/bar"])
+        env = {"PYTHONPATH": user_pp}
+
+        _strip_hermes_owned_pythonpath(env)
+
+        assert env["PYTHONPATH"] == user_pp
+
+    def test_raw_user_spelling_preserved(self):
+        """The sanitizer does not trim, normalize, or deduplicate user entries."""
+        from tools.environments.local import _strip_hermes_owned_pythonpath
+
+        user_pp = os.pathsep.join([
+            " /opt/user-lib ",
+            "relative/../lib",
+            "",
+            "/opt/user-lib",
+            "/opt/user-lib",
+        ])
+        env = {"PYTHONPATH": user_pp}
+
+        _strip_hermes_owned_pythonpath(env)
+
+        assert env["PYTHONPATH"] == user_pp
+
+
+    def test_base_python_sanitizer_uses_validated_separate_runtime_venv(self, tmp_path, monkeypatch):
+        """A base interpreter strips the exact Windows runtime site-packages.
+
+        This deliberately uses a synthetic Hermes venv separate from the test
+        runner: sys.prefix represents base Python, while validated VIRTUAL_ENV
+        identifies ``<repo>/venv`` as the Hermes runtime producer contract.
+        """
+        import tools.environments.local as local
+
+        repo_root = tmp_path / "hermes-agent"
+        runtime_venv = repo_root / "venv"
+        runtime_sp = runtime_venv / "Lib" / "site-packages"
+        runtime_sp.mkdir(parents=True)
+        (runtime_venv / "pyvenv.cfg").write_text("version = 3.11\n", encoding="utf-8")
+        base_prefix = tmp_path / "base-python"
+        unrelated = "/custom/lib/python3.13/site-packages"
+
+        monkeypatch.setattr(local, "_hermes_repo_root_aliases", (repo_root,))
+        monkeypatch.setattr(local, "_in_venv", False)
+        monkeypatch.setattr(local, "_hermes_site_packages", None)
+        monkeypatch.setattr(local.sys, "prefix", str(base_prefix))
+        monkeypatch.setattr(local.sys, "base_prefix", str(base_prefix))
+
+        env = {
+            "VIRTUAL_ENV": str(runtime_venv),
+            "PYTHONPATH": os.pathsep.join([str(runtime_sp), unrelated]),
+        }
+        result = local._sanitize_subprocess_env(env)
+
+        assert Path(local.sys.prefix) == base_prefix
+        assert runtime_venv != Path(local.sys.prefix)
+        assert result["PYTHONPATH"] == unrelated
+        assert "VIRTUAL_ENV" not in result
+
+    def test_unrelated_virtual_env_is_not_runtime_provenance(self, tmp_path, monkeypatch):
+        """An arbitrary inherited VIRTUAL_ENV cannot claim PYTHONPATH ownership."""
+        import tools.environments.local as local
+
+        repo_root = tmp_path / "hermes-agent"
+        repo_root.mkdir()
+        unrelated_venv = tmp_path / "user-venv"
+        unrelated_sp = unrelated_venv / "Lib" / "site-packages"
+        unrelated_sp.mkdir(parents=True)
+        (unrelated_venv / "pyvenv.cfg").write_text("version = 3.13\n", encoding="utf-8")
+
+        monkeypatch.setattr(local, "_hermes_repo_root_aliases", (repo_root,))
+        monkeypatch.setattr(local, "_in_venv", False)
+        monkeypatch.setattr(local, "_hermes_site_packages", None)
+
+        env = {
+            "VIRTUAL_ENV": str(unrelated_venv),
+            "PYTHONPATH": str(unrelated_sp),
+        }
+        local._strip_hermes_owned_pythonpath(env)
+
+        assert env["PYTHONPATH"] == str(unrelated_sp)
+
+
     def test_no_pythonpath_key(self):
         """Missing PYTHONPATH key is a no-op."""
-        from tools.environments.local import _strip_mismatched_site_packages
+        from tools.environments.local import _strip_hermes_owned_pythonpath
         env = {"PATH": "/usr/bin"}
-        _strip_mismatched_site_packages(env)
+        _strip_hermes_owned_pythonpath(env)
         assert "PYTHONPATH" not in env
 
-    def test_all_entries_stripped_removes_key(self):
-        """If all entries are stripped, PYTHONPATH key is removed entirely."""
-        from tools.environments.local import _strip_mismatched_site_packages
-        import sys
 
-        running_major = sys.version_info[0]
-        running_minor = sys.version_info[1]
-        other_minor = running_minor + 1 if running_minor < 20 else running_minor - 1
-        other_ver = f"python{running_major}.{other_minor}"
+    @pytest.mark.parametrize("builder", [
+        "_make_run_env",
+        "_sanitize_subprocess_env",
+        "hermes_subprocess_env",
+    ])
+    def test_builders_strip_hermes_venv_pythonpath(self, builder):
+        """Every subprocess env builder applies the same sanitation contract:
+        Hermes venv site-packages is stripped, user entries survive.
+        """
+        from tools.environments import local as local_mod
 
-        env = {"PYTHONPATH": f"/a/lib/{other_ver}/site-packages"}
-        _strip_mismatched_site_packages(env)
-        assert "PYTHONPATH" not in env
-
-    def test_make_run_env_strips_hermes_venv_pythonpath(self):
-        """_make_run_env strips Hermes venv site-packages from PYTHONPATH."""
-        from tools.environments.local import _make_run_env
-        import sys
-
-        pyver = f"python{sys.version_info[0]}.{sys.version_info[1]}"
-        venv_sp = str(
-            __import__("pathlib").Path(sys.prefix) / "lib" / pyver / "site-packages"
-        )
-        with patch.dict(os.environ, {
+        venv_sp = str(_running_venv_site_packages())
+        seed = {
             "PATH": "/usr/bin:/bin",
-            "PYTHONPATH": os.pathsep.join([venv_sp, "/home/user/my-lib"]),
-        }, clear=True):
-            run_env = _make_run_env({})
-        pp = run_env.get("PYTHONPATH", "")
-        entries = pp.split(os.pathsep) if pp else []
-        assert venv_sp not in entries
-        assert "/home/user/my-lib" in entries
-
-    def test_sanitize_subprocess_env_strips_hermes_venv_pythonpath(self):
-        """_sanitize_subprocess_env strips Hermes venv site-packages."""
-        from tools.environments.local import _sanitize_subprocess_env
-        import sys
-
-        pyver = f"python{sys.version_info[0]}.{sys.version_info[1]}"
-        venv_sp = str(
-            __import__("pathlib").Path(sys.prefix) / "lib" / pyver / "site-packages"
-        )
-        base = {
-            "PATH": "/usr/bin",
             "HOME": "/home/user",
             "PYTHONPATH": os.pathsep.join([venv_sp, "/home/user/my-lib"]),
         }
-        result = _sanitize_subprocess_env(base)
+        with patch.dict(os.environ, seed, clear=True):
+            if builder == "_make_run_env":
+                result = local_mod._make_run_env({})
+            elif builder == "_sanitize_subprocess_env":
+                result = local_mod._sanitize_subprocess_env(dict(os.environ))
+            else:
+                result = local_mod.hermes_subprocess_env()
         pp = result.get("PYTHONPATH", "")
         entries = pp.split(os.pathsep) if pp else []
         assert venv_sp not in entries
         assert "/home/user/my-lib" in entries
 
-    def test_hermes_subprocess_env_strips_hermes_venv_pythonpath(self):
-        """hermes_subprocess_env strips Hermes venv site-packages."""
-        from tools.environments.local import hermes_subprocess_env
-        import sys
-
-        pyver = f"python{sys.version_info[0]}.{sys.version_info[1]}"
-        venv_sp = str(
-            __import__("pathlib").Path(sys.prefix) / "lib" / pyver / "site-packages"
-        )
-        with patch.dict(os.environ, {
-            "PATH": "/usr/bin:/bin",
-            "HOME": "/home/user",
-            "PYTHONPATH": os.pathsep.join([venv_sp, "/home/user/my-lib"]),
-        }, clear=True):
-            result = hermes_subprocess_env()
-        pp = result.get("PYTHONPATH", "")
-        entries = pp.split(os.pathsep) if pp else []
-        assert venv_sp not in entries
-        assert "/home/user/my-lib" in entries
-
-    def test_scrub_child_env_strips_mismatched_pythonpath(self):
-        """execute_code's _scrub_child_env path: after scrubbing, mismatched
-        site-packages entries should be stripped when _strip_mismatched_site_packages
-        is applied (as the spawn path does)."""
+    def test_scrub_child_env_strips_hermes_venv_pythonpath(self):
+        """execute_code's _scrub_child_env path: after scrubbing, Hermes venv
+        site-packages entries should be stripped when
+        _strip_hermes_owned_pythonpath is applied (as the spawn path does),
+        while user entries (even for another Python version) are preserved.
+        """
         from tools.code_execution_tool import _scrub_child_env
-        from tools.environments.local import _strip_mismatched_site_packages
-        import sys
+        from tools.environments.local import _strip_hermes_owned_pythonpath
 
-        running_major = sys.version_info[0]
-        running_minor = sys.version_info[1]
-        other_minor = running_minor + 1 if running_minor < 20 else running_minor - 1
-        other_ver = f"python{running_major}.{other_minor}"
-
-        mismatched_sp = f"/opt/other-venv/lib/{other_ver}/site-packages"
+        venv_sp = str(_running_venv_site_packages())
+        other_sp = "/opt/other-venv/lib/python3.99/site-packages"
         source = {
             "PATH": "/usr/bin",
             "HOME": "/home/user",
-            "PYTHONPATH": os.pathsep.join([mismatched_sp, "/home/user/my-lib"]),
+            "PYTHONPATH": os.pathsep.join([venv_sp, other_sp, "/home/user/my-lib"]),
         }
         scrubbed = _scrub_child_env(source)
         # The scrubber passes PYTHONPATH through (it's in _SAFE_ENV_PREFIXES).
         assert "PYTHONPATH" in scrubbed
         # Now apply the selective strip (as the spawn path does).
-        _strip_mismatched_site_packages(scrubbed)
+        _strip_hermes_owned_pythonpath(scrubbed)
         pp = scrubbed.get("PYTHONPATH", "")
         entries = pp.split(os.pathsep) if pp else []
-        assert mismatched_sp not in entries
+        assert venv_sp not in entries
+        assert other_sp in entries
         assert "/home/user/my-lib" in entries
 
-    def test_repo_root_stripped(self):
-        """The Hermes repo root entry is stripped from PYTHONPATH.
+    @pytest.mark.parametrize("same_env", [True, False])
+    def test_execute_code_composition_strips_inherited_hermes_entries(self, same_env):
+        """Integration: execute_code's real spawn path composes a clean PYTHONPATH.
 
-        Electron prepends the *actual* repository root (the directory
-        containing ``tools/``, ``hermes_cli/``, etc.) to PYTHONPATH so the
-        backend can ``import tools``.  This test independently computes that
-        real repo root from the source-file location - three levels up from
-        ``tools/environments/local.py`` - rather than reusing the module
-        constant under test.  That way an off-by-one in ``_hermes_repo_root``
-        (e.g. ``parents[1]`` resolving to ``tools/``) would cause this test
-        to fail instead of silently passing.
+        Seeds a contaminated inherited PYTHONPATH (Hermes repo root + Hermes
+        venv site-packages + user entries) through os.environ and drives
+        execute_code all the way to Popen.  Proves the #84500 conditional
+        composition and the #82581 selective strip compose correctly:
+
+        * inherited Hermes venv site-packages never survive into the sandbox;
+        * the staging tmpdir stays the first entry;
+        * the repo root is deliberately re-added exactly once for a same-env
+          child (the single occurrence proves the inherited copy was stripped
+          first) and stays absent for an external-environment child;
+        * user entries survive after the controlled entries.
         """
-        from tools.environments.local import _strip_mismatched_site_packages
+        import tools.code_execution_tool as cet
+        from tools.code_execution_tool import execute_code
 
-        # Independently compute the real repo root: local.py lives at
-        # tools/environments/local.py, so the repo root is parents[2].
-        local_file = Path(__import__("tools.environments.local", fromlist=["__file__"]).__file__).resolve()
-        real_repo_root = str(local_file.parents[2])
+        def _mock_handle_function_call(function_name, function_args, task_id=None, user_task=None):
+            return '{"output": "mock", "exit_code": 0}'
 
-        env = {
-            "PYTHONPATH": os.pathsep.join([real_repo_root, "/home/user/my-lib"]),
-        }
-        _strip_mismatched_site_packages(env)
-        pp = env.get("PYTHONPATH", "")
-        entries = pp.split(os.pathsep) if pp else []
-        assert real_repo_root not in entries
-        assert "/home/user/my-lib" in entries
+        hermes_root = str(Path(cet.__file__).resolve().parents[1])
+        venv_sp = str(_running_venv_site_packages())
+        user_a = "/home/user/my-lib"
+        user_b = "/opt/project/lib"
+        captured = {}
 
-    def test_repo_root_direct_child_stripped(self):
-        """A direct child of the repo root (depth=1) is stripped.
+        def _fake_popen(cmd, **kwargs):
+            captured["env"] = kwargs.get("env", {})
+            captured["staging"] = os.path.dirname(cmd[1])
+            proc = MagicMock()
+            proc.stdout.read.return_value = b""
+            proc.stderr.read.return_value = b""
+            proc.wait.return_value = 0
+            proc.returncode = 0
+            proc.poll.return_value = 0
+            return proc
 
-        Check 3's depth rule is ``depth <= 1``: the repo root itself is
-        depth=0 (covered above), and a top-level package directory like
-        ``<repo>/tools`` is depth=1.  Both are stripped because Electron
-        prepends exactly these shallow paths so ``import tools`` works in
-        the backend, and they shadow user packages of the same name.
+        with patch("tools.code_execution_tool._load_config",
+                   return_value={"mode": "strict"}), \
+             patch("model_tools.handle_function_call",
+                   side_effect=_mock_handle_function_call), \
+             patch("tools.code_execution_tool._uses_hermes_python_environment",
+                   return_value=same_env), \
+             patch("subprocess.Popen", side_effect=_fake_popen), \
+             patch.dict(os.environ, {
+                 "PYTHONPATH": os.pathsep.join(
+                     [hermes_root, venv_sp, user_a, user_b]),
+             }):
+            execute_code(code="pass", task_id="test-int", enabled_tools=[])
+
+        assert "PYTHONPATH" in captured["env"], \
+            "execute_code never reached Popen"
+        parts = captured["env"]["PYTHONPATH"].split(os.pathsep)
+        # Windows path comparison is case-insensitive: the inherited entries
+        # and the re-added repo root can carry a different case than the
+        # resolve()/abspath()-derived spellings used in this test (e.g. a
+        # launcher-written lowercase PYTHONPATH).  Normalize with
+        # os.path.normcase so a case-only difference never fails the
+        # composition contract (identity on POSIX).
+        norm_parts = [os.path.normcase(p) for p in parts]
+        norm_staging = os.path.normcase(captured["staging"])
+        norm_root = os.path.normcase(hermes_root)
+        norm_venv = os.path.normcase(venv_sp)
+        norm_user_a = os.path.normcase(user_a)
+        norm_user_b = os.path.normcase(user_b)
+        assert norm_parts[0] == norm_staging, \
+            "staging tmpdir must be the first PYTHONPATH entry"
+        assert norm_venv not in norm_parts, \
+            "inherited Hermes venv site-packages must be stripped"
+        assert norm_user_a in norm_parts and norm_user_b in norm_parts, \
+            "user PYTHONPATH entries must survive"
+        assert norm_parts.index(norm_user_a) > norm_parts.index(norm_staging), \
+            "user entries must come after the staging tmpdir"
+        if same_env:
+            assert norm_parts.count(norm_root) == 1, \
+                "repo root must be re-added exactly once for a same-env child"
+            assert norm_parts.index(norm_user_a) > norm_parts.index(norm_root), \
+                "user entries must come after the re-added repo root"
+        else:
+            assert norm_root not in norm_parts, \
+                "repo root must stay absent for an external-env child"
+
+
+    def test_repo_root_direct_child_preserved(self):
+        """A direct child of the repo root (depth=1) is PRESERVED.
+
+        Independent audit of every real launcher producer (Electron
+        ``apps/desktop/electron/main.ts``,
+        ``gateway/run.py::_ensure_windows_gateway_venv_imports``,
+        ``cron/scheduler.py::_windows_cron_python_invocation``,
+        ``tui_gateway/host_supervisor.py``) shows they all inject the exact
+        repo root and/or the venv site-packages — none injects
+        ``<repo>/tools`` or another direct child as an independent
+        PYTHONPATH entry.  A user path that merely happens to live under
+        the repo directory must therefore be preserved.
         """
-        from tools.environments.local import _strip_mismatched_site_packages
+        from tools.environments.local import _strip_hermes_owned_pythonpath
 
         local_file = Path(__import__("tools.environments.local", fromlist=["__file__"]).__file__).resolve()
         real_repo_root = local_file.parents[2]
@@ -578,33 +776,298 @@ class TestPythonpathSelectiveStrip:
         env = {
             "PYTHONPATH": os.pathsep.join([direct_child, "/home/user/my-lib"]),
         }
-        _strip_mismatched_site_packages(env)
+        _strip_hermes_owned_pythonpath(env)
         pp = env.get("PYTHONPATH", "")
         entries = pp.split(os.pathsep) if pp else []
-        assert direct_child not in entries
+        assert direct_child in entries
         assert "/home/user/my-lib" in entries
 
-    def test_deep_path_under_repo_root_preserved(self):
-        """A deeper path under the repo root (depth=2) is preserved.
+    def test_configured_home_alias_matches_launcher_output(self, tmp_path, monkeypatch):
+        """The real producer spelling is derived and consumed end to end."""
+        import tools.environments.local as local
+        from hermes_cli.gateway_windows import _preserve_hermes_home_path
 
-        ``<repo>/tools/environments`` is depth=2, past the ``depth <= 1``
-        cutoff.  Such a path is not something Electron injects and may be
-        a legitimate user library path, so it must survive Check 3.
-        """
-        from tools.environments.local import _strip_mismatched_site_packages
+        physical_home = tmp_path / "physical-home"
+        physical_root = _physical_repo_root(tmp_path)
+        configured_home = tmp_path / "configured-home"
+        try:
+            _make_directory_link(configured_home, physical_home)
+        except OSError as exc:
+            pytest.skip(f"directory link unavailable on this host: {exc}")
+        monkeypatch.setenv("HERMES_HOME", str(configured_home))
 
-        local_file = Path(__import__("tools.environments.local", fromlist=["__file__"]).__file__).resolve()
-        real_repo_root = local_file.parents[2]
-        deep_path = str(real_repo_root / "tools" / "environments")
+        launcher_entry = Path(_preserve_hermes_home_path(physical_root))
+        aliases = local._build_hermes_repo_root_aliases(
+            physical_root.resolve(),
+            physical_root,
+            configured_home,
+        )
 
+        assert launcher_entry == configured_home / "hermes-agent"
+        assert launcher_entry in aliases
+
+        monkeypatch.setattr(local, "_hermes_repo_root_aliases", aliases)
+        nested_user_path = launcher_entry / "user-data"
         env = {
-            "PYTHONPATH": os.pathsep.join([deep_path, "/home/user/my-lib"]),
+            "PYTHONPATH": os.pathsep.join([
+                str(launcher_entry),
+                str(nested_user_path),
+                "/home/user/my-lib",
+            ])
         }
-        _strip_mismatched_site_packages(env)
-        pp = env.get("PYTHONPATH", "")
-        entries = pp.split(os.pathsep) if pp else []
-        assert deep_path in entries
-        assert "/home/user/my-lib" in entries
+        local._strip_hermes_owned_pythonpath(env)
+
+        assert env["PYTHONPATH"].split(os.pathsep) == [
+            str(nested_user_path),
+            "/home/user/my-lib",
+        ]
+
+    def test_profile_rehome_keeps_junction_lexical_alias(self, tmp_path, monkeypatch):
+        """Profile re-home must not lose the launcher's lexical repo-root spelling.
+
+        The desktop/CLI spawn children with HERMES_HOME and PYTHONPATH in the
+        configured (junction) spelling, but --profile / sticky active_profile
+        re-home HERMES_HOME through resolve_profile_env() before the
+        sanitizer loads.  Regression (junction + profile re-home): the alias
+        builder must still recover the lexical root so the inherited lexical
+        repo-root entry is stripped.
+        """
+        import tools.environments.local as local
+        from hermes_cli.profiles import resolve_profile_env
+
+        physical_home = tmp_path / "physical-home"
+        physical_root = physical_home / "hermes-agent"
+        physical_root.mkdir(parents=True)
+        (physical_home / "profiles" / "coder").mkdir(parents=True)
+        configured_home = tmp_path / "configured-home"
+        try:
+            _make_directory_link(configured_home, physical_home)
+        except OSError as exc:
+            pytest.skip(f"directory link unavailable on this host: {exc}")
+
+        # Launcher contract: the configured spelling is the env and the root.
+        monkeypatch.setenv("HERMES_HOME", str(configured_home))
+        lexical_root = configured_home / "hermes-agent"
+
+        # Profile re-home keeps the configured spelling (physically identical
+        # through the link; lexically the launcher spelling is preserved).
+        assert Path(resolve_profile_env("default")) == configured_home
+        assert Path(resolve_profile_env("coder")) == configured_home / "profiles" / "coder"
+
+        # The sanitizer now runs under the re-homed (profile) HERMES_HOME.
+        aliases = local._build_hermes_repo_root_aliases(
+            physical_root.resolve(),
+            physical_root,
+            configured_home / "profiles" / "coder",
+        )
+        assert any(local._same_path(a, lexical_root) for a in aliases)
+
+        monkeypatch.setattr(local, "_hermes_repo_root_aliases", aliases)
+        env = {"PYTHONPATH": os.pathsep.join([str(lexical_root), "/home/user/my-lib"])}
+        local._strip_hermes_owned_pythonpath(env)
+        assert env["PYTHONPATH"].split(os.pathsep) == ["/home/user/my-lib"]
+
+
+    def test_repo_level_junction_recovers_lexical_alias(self, tmp_path, monkeypatch):
+        """The repo itself may be a junction under the configured root
+        (e.g. D:\\hermes\\hermes-agent -> C:\\...\\hermes-agent) while the
+        editable import spelling resolves to the physical location.  The
+        alias builder must recover the lexical spelling via exact-identity
+        proof (strict resolve), not a name-based guess.
+        """
+        import tools.environments.local as local
+
+        physical_root = _physical_repo_root(tmp_path)
+        configured_home = tmp_path / "configured-home"
+        configured_home.mkdir()
+        # repo-level link: <configured-home>/hermes-agent -> physical repo
+        try:
+            _make_directory_link(configured_home / "hermes-agent", physical_root)
+        except OSError as exc:
+            pytest.skip(f"directory link unavailable on this host: {exc}")
+
+        lexical_root = configured_home / "hermes-agent"
+        aliases = local._build_hermes_repo_root_aliases(
+            physical_root.resolve(),
+            physical_root,
+            configured_home,
+        )
+        assert any(local._same_path(a, lexical_root) for a in aliases)
+
+        monkeypatch.setattr(local, "_hermes_repo_root_aliases", aliases)
+        env = {"PYTHONPATH": os.pathsep.join([str(lexical_root), "/home/user/my-lib"])}
+        local._strip_hermes_owned_pythonpath(env)
+        assert env["PYTHONPATH"].split(os.pathsep) == ["/home/user/my-lib"]
+
+    def test_same_named_non_owned_directories_preserved(self, tmp_path, monkeypatch):
+        """Negative controls: a directory that merely shares the repo's name
+        -- whether under the configured root or in an unrelated location --
+        is never aliased or stripped.  Exact filesystem identity decides,
+        not the name; no ownership provenance means no strip.
+        """
+        import tools.environments.local as local
+
+        physical_root = _physical_repo_root(tmp_path)
+        configured_home = tmp_path / "configured-home"
+        (configured_home / "hermes-agent").mkdir(parents=True)
+        unrelated = tmp_path / "user-tools" / "hermes-agent"
+        unrelated.mkdir(parents=True)
+
+        aliases = local._build_hermes_repo_root_aliases(
+            physical_root.resolve(),
+            physical_root,
+            configured_home,
+        )
+        for lookalike in (configured_home / "hermes-agent", unrelated):
+            assert not any(local._same_path(a, lookalike) for a in aliases)
+
+        monkeypatch.setattr(local, "_hermes_repo_root_aliases", aliases)
+        for lookalike in (configured_home / "hermes-agent", unrelated):
+            env = {"PYTHONPATH": os.pathsep.join([str(lookalike), "/home/user/my-lib"])}
+            local._strip_hermes_owned_pythonpath(env)
+            assert env["PYTHONPATH"].split(os.pathsep) == [str(lookalike), "/home/user/my-lib"]
+
+    def test_profile_home_with_repo_level_junction(self, tmp_path, monkeypatch):
+        """Profile re-home + repo-level junction together: the configured home
+        is <root>/profiles/<name> while the repo is a link at <root>/hermes-agent.
+        The root spelling must be derived (profiles -> grandparent) and then
+        the lexical repo alias recovered from it.
+        """
+        import tools.environments.local as local
+
+        physical_root = _physical_repo_root(tmp_path)
+        configured_root = tmp_path / "configured-root"
+        (configured_root / "profiles" / "coder").mkdir(parents=True)
+        try:
+            _make_directory_link(configured_root / "hermes-agent", physical_root)
+        except OSError as exc:
+            pytest.skip(f"directory link unavailable on this host: {exc}")
+
+        configured_home = configured_root / "profiles" / "coder"
+        lexical_root = configured_root / "hermes-agent"
+        aliases = local._build_hermes_repo_root_aliases(
+            physical_root.resolve(),
+            physical_root,
+            configured_home,
+        )
+        assert any(local._same_path(a, lexical_root) for a in aliases)
+        assert not any(local._same_path(a, configured_home / "hermes-agent") for a in aliases)
+
+        monkeypatch.setattr(local, "_hermes_repo_root_aliases", aliases)
+        env = {"PYTHONPATH": os.pathsep.join([str(lexical_root), "/home/user/my-lib"])}
+        local._strip_hermes_owned_pythonpath(env)
+        assert env["PYTHONPATH"].split(os.pathsep) == ["/home/user/my-lib"]
+
+    def test_validated_runtime_venv_lexical_after_repo_recovery(self, tmp_path, monkeypatch):
+        """uv-base gateway: once the lexical repo alias is recovered, a lexical
+        VIRTUAL_ENV (<lexical repo>/venv) validates and its site-packages is
+        stripped together with the repo root, while user entries survive.
+        """
+        import tools.environments.local as local
+
+        physical_root = _physical_repo_root(tmp_path)
+        venv_dir = physical_root / "venv"
+        venv_dir.mkdir(parents=True)
+        (venv_dir / "pyvenv.cfg").write_text("home = x\n", encoding="utf-8")
+        configured_home = tmp_path / "configured-home"
+        configured_home.mkdir()
+        try:
+            _make_directory_link(configured_home / "hermes-agent", physical_root)
+        except OSError as exc:
+            pytest.skip(f"directory link unavailable on this host: {exc}")
+
+        lexical_root = configured_home / "hermes-agent"
+        aliases = local._build_hermes_repo_root_aliases(
+            physical_root.resolve(),
+            physical_root,
+            configured_home,
+        )
+        assert any(local._same_path(a, lexical_root) for a in aliases)
+        monkeypatch.setattr(local, "_hermes_repo_root_aliases", aliases)
+
+        lexical_venv = lexical_root / "venv"
+        validated = local._validated_runtime_venv({"VIRTUAL_ENV": str(lexical_venv)})
+        assert validated is not None
+        assert local._same_path(validated, lexical_venv)
+
+        local._hermes_site_packages = None
+        env = {"PYTHONPATH": os.pathsep.join([
+            str(lexical_root),
+            str(lexical_venv / "Lib" / "site-packages"),
+            "/home/user/my-lib",
+        ]), "VIRTUAL_ENV": str(lexical_venv)}
+        local._strip_hermes_owned_pythonpath(env)
+        assert env["PYTHONPATH"].split(os.pathsep) == ["/home/user/my-lib"]
+
+
+
+
+
+class TestPythonhomeSanitized:
+    """PYTHONHOME must not leak from the Hermes runtime into subprocesses.
+
+    The gateway inherits/sets PYTHONHOME in its process environment; a child
+    interpreter (system Python, another venv, cron no_agent scripts) that
+    inherits it redirects its stdlib search to the Hermes venv and crashes
+    with version-mismatch errors before importing anything (#75018).
+    """
+
+    @pytest.mark.parametrize("builder", [
+        "_make_run_env",
+        "_sanitize_subprocess_env",
+        "hermes_subprocess_env",
+        "build_subprocess_env",
+    ])
+    def test_builders_strip_pythonhome(self, builder):
+        """The gateway's inherited PYTHONHOME must not reach any subprocess
+        builder -- terminal, background/PTY, cron no_agent scripts, and
+        execute_code children (#75018).
+        """
+        from tools.environments import local as local_mod
+
+        seed = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/home/user",
+            "PYTHONHOME": "/opt/hermes-venv",
+        }
+        with patch.dict(os.environ, seed, clear=True):
+            if builder == "_make_run_env":
+                result = local_mod._make_run_env({})
+            elif builder == "_sanitize_subprocess_env":
+                result = local_mod._sanitize_subprocess_env(dict(os.environ))
+            elif builder == "hermes_subprocess_env":
+                result = local_mod.hermes_subprocess_env()
+            else:
+                result = local_mod.build_subprocess_env()
+        assert "PYTHONHOME" not in result
+
+    def test_pythonhome_removed_from_active_venv_markers(self):
+        """PYTHONHOME is part of _ACTIVE_VENV_MARKER_VARS so all builders
+        that iterate it drop the variable."""
+        from tools.environments.local import _ACTIVE_VENV_MARKER_VARS
+        assert "PYTHONHOME" in _ACTIVE_VENV_MARKER_VARS
+
+    def test_build_subprocess_env_no_scrub_preserves_pythonhome(self):
+        """``build_subprocess_env(scrub_secrets=False)`` is the documented
+        byte-for-byte escape hatch: no key is removed, so PYTHONHOME (and
+        everything else) survives there by contract, not by omission.
+
+        Callers that explicitly opt out of scrubbing (git credential flows,
+        secret CLIs) must not have their environment silently altered — this
+        test pins that exception as intentional.
+        """
+        from tools.environments.local import build_subprocess_env
+        base = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/home/user",
+            "PYTHONHOME": "/opt/hermes-venv",
+            "VIRTUAL_ENV": "/opt/hermes-venv",
+            "SERVICE_TOKEN": "s3cr3t",
+        }
+        result = build_subprocess_env(base, scrub_secrets=False)
+        assert result.get("PYTHONHOME") == "/opt/hermes-venv"
+        assert result.get("VIRTUAL_ENV") == "/opt/hermes-venv"
+        assert result.get("SERVICE_TOKEN") == "s3cr3t"
 
 
 class TestProfileScopedPassthrough:
@@ -827,25 +1290,42 @@ class TestSanePathIncludesHomebrew:
         assert "/opt/homebrew/bin" in _SANE_PATH
 
 
-    def test_make_run_env_appends_homebrew_on_minimal_path(self):
-        """When PATH is minimal, _make_run_env appends missing sane entries."""
+    def test_make_run_env_appends_homebrew_on_minimal_path(self, monkeypatch):
+        """When PATH is minimal, _make_run_env appends missing sane entries.
+
+        POSIX: the sane-path merge appends the Homebrew dirs.  Windows:
+        _append_missing_sane_path_entries is a documented passthrough (the
+        native PATH must not be touched), so the assertion is the unchanged
+        input.  Git Bash dir prepending is neutralised so the merged PATH
+        layout is deterministic on every host.
+        """
+        from tools.environments import local as local_mod
         from tools.environments.local import _SANE_PATH, _make_run_env
+        monkeypatch.setattr(local_mod, "_git_bash_bin_dirs", lambda: [])
         minimal_env = {"PATH": "/some/custom/bin"}
         with patch.dict(os.environ, minimal_env, clear=True):
             result = _make_run_env({})
-        path_entries = result["PATH"].split(":")
+        path_entries = result["PATH"].split(os.pathsep)
         assert path_entries[0] == "/some/custom/bin"
-        for entry in _SANE_PATH.split(":"):
-            assert entry in path_entries
+        if sys.platform == "win32":
+            assert result["PATH"] == "/some/custom/bin"
+        else:
+            for entry in _SANE_PATH.split(os.pathsep):
+                assert entry in path_entries
 
 
+    @pytest.mark.macos_only
     def test_make_run_env_real_launchd_path_gains_homebrew(self):
-        """The literal macOS launchd PATH is the production trigger for #35613."""
+        """The literal macOS launchd PATH is the production trigger for #35613.
+
+        macOS-only: the regression is the launchd environment on macOS, and
+        the sane-path merge is a documented passthrough on Windows.
+        """
         from tools.environments.local import _make_run_env
-        launchd_env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
+        launchd_env = {"PATH": os.pathsep.join(["/usr/bin", "/bin", "/usr/sbin", "/sbin"])}
         with patch.dict(os.environ, launchd_env, clear=True):
             result = _make_run_env({})
-        path_entries = result["PATH"].split(":")
+        path_entries = result["PATH"].split(os.pathsep)
         assert "/opt/homebrew/bin" in path_entries
         assert "/opt/homebrew/sbin" in path_entries
         # Original entries keep their leading precedence.
@@ -908,7 +1388,11 @@ class TestHermesBinDirOnPath:
         from tools.environments.local import _make_run_env
         self._reset_cache()
         local_mod._HERMES_BIN_DIR = "/opt/hermes/bin"
-        with patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}, clear=True):
+        with patch.dict(
+            os.environ,
+            {"PATH": os.pathsep.join(["/usr/bin", "/bin"])},
+            clear=True,
+        ):
             result = _make_run_env({})
         entries = result["PATH"].split(os.pathsep)
         assert entries[0] == "/opt/hermes/bin"
