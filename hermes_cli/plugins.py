@@ -1063,6 +1063,13 @@ class PluginManifest:
     # ``image_gen/openai``. When empty, falls back to ``name``.
     key: str = ""
     portable: bool = False
+    # Fork convention: bundled plugins (source == "bundled") that declare
+    # ``default_enabled: true`` in plugin.yaml load WITHOUT a
+    # ``plugins.enabled`` entry. Lets the fork ship custom plugins that are
+    # on by default on every instance running the fork. Ignored for
+    # user-installed and project plugins (untrusted code stays behind the
+    # allowlist). ``plugins.disabled`` still wins.
+    default_enabled: bool = False
     skill_namespace: str = ""
     # Declared capability ids from the manifest ``capabilities:`` list
     # (#64228). Normalized to KNOWN ids only — see
@@ -3964,6 +3971,18 @@ class PluginManager:
                 self._register_deferred_platform(manifest)
                 continue
 
+            # Fork convention: bundled plugins declaring
+            # ``default_enabled: true`` in plugin.yaml load without a
+            # ``plugins.enabled`` entry, so custom fork plugins are on by
+            # default on every instance running the fork. Only honored for
+            # bundled source — user-installed/project plugins stay behind
+            # the allowlist. ``plugins.disabled`` was checked above and
+            # still wins. Routed through ``to_load`` so requires_plugins
+            # ordering applies like any other standalone plugin.
+            if manifest.source == "bundled" and manifest.default_enabled:
+                to_load[lookup_key] = manifest
+                continue
+
             # Everything else (standalone, user-installed backends,
             # entry-point plugins) is opt-in via plugins.enabled.
             # Accept both the path-derived key and the legacy bare name
@@ -4340,6 +4359,7 @@ class PluginManager:
                 path=str(plugin_dir),
                 kind=kind,
                 key=key,
+                default_enabled=data.get("default_enabled", False) is True,
                 capabilities=_parse_declared_capabilities(
                     data.get("capabilities"), name
                 ),

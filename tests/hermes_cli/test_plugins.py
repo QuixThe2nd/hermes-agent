@@ -2066,3 +2066,96 @@ class TestDispatchToolWithoutCliRef:
             assert calls[0][1].get("parent_agent") is None
         finally:
             registry.deregister("_test_dispatch_probe")
+
+
+class TestDefaultEnabledForkPlugins:
+    """Fork convention: bundled plugins with ``default_enabled: true`` in
+    plugin.yaml load without a ``plugins.enabled`` entry. User-installed
+    plugins cannot use the flag, and ``plugins.disabled`` still wins."""
+
+    def _home(self, tmp_path, monkeypatch, config: dict | None = None) -> Path:
+        home = tmp_path / "home"
+        home.mkdir(exist_ok=True)
+        (home / "plugins").mkdir(exist_ok=True)
+        if config is not None:
+            (home / "config.yaml").write_text(yaml.safe_dump(config))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        return home
+
+    def _bundled(self, tmp_path, monkeypatch) -> Path:
+        bundled = tmp_path / "bundled"
+        bundled.mkdir(exist_ok=True)
+        monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(bundled))
+        return bundled
+
+    def test_bundled_default_enabled_loads_without_allowlist(
+        self, tmp_path, monkeypatch
+    ):
+        self._home(tmp_path, monkeypatch, config={"plugins": {"enabled": []}})
+        bundled = self._bundled(tmp_path, monkeypatch)
+        _make_plugin_dir(
+            bundled,
+            "fork_custom",
+            manifest_extra={"default_enabled": True},
+            auto_enable=False,
+            home=tmp_path / "home",
+        )
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert mgr._plugins["fork_custom"].enabled is True
+        assert mgr._plugins["fork_custom"].error is None
+
+    def test_bundled_without_flag_stays_gated(self, tmp_path, monkeypatch):
+        self._home(tmp_path, monkeypatch, config={"plugins": {"enabled": []}})
+        bundled = self._bundled(tmp_path, monkeypatch)
+        _make_plugin_dir(
+            bundled, "upstream_optin", auto_enable=False, home=tmp_path / "home"
+        )
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert mgr._plugins["upstream_optin"].enabled is False
+        assert "not enabled" in (mgr._plugins["upstream_optin"].error or "")
+
+    def test_user_plugin_cannot_self_enable(self, tmp_path, monkeypatch):
+        home = self._home(
+            tmp_path, monkeypatch, config={"plugins": {"enabled": []}}
+        )
+        self._bundled(tmp_path, monkeypatch)
+        _make_plugin_dir(
+            home / "plugins",
+            "sneaky_user_plugin",
+            manifest_extra={"default_enabled": True},
+            auto_enable=False,
+            home=home,
+        )
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert mgr._plugins["sneaky_user_plugin"].enabled is False
+        assert "not enabled" in (mgr._plugins["sneaky_user_plugin"].error or "")
+
+    def test_disabled_list_still_wins(self, tmp_path, monkeypatch):
+        self._home(
+            tmp_path,
+            monkeypatch,
+            config={"plugins": {"enabled": [], "disabled": ["fork_custom"]}},
+        )
+        bundled = self._bundled(tmp_path, monkeypatch)
+        _make_plugin_dir(
+            bundled,
+            "fork_custom",
+            manifest_extra={"default_enabled": True},
+            auto_enable=False,
+            home=tmp_path / "home",
+        )
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert mgr._plugins["fork_custom"].enabled is False
+        assert mgr._plugins["fork_custom"].error == "disabled via config"
