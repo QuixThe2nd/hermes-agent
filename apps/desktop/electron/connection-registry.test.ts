@@ -24,11 +24,14 @@ import {
   migrateV1ToRegistry,
   normalizeConnectionInput,
   normalizeRegistry,
+  parseRemoteProfileListing,
   REGISTRY_VERSION,
+  rememberSshEnumeration,
   removeConnection,
   resolveRegistryLocalRoute,
   setPrimaryConnection,
   shouldDeferLocalEnumeration,
+  shouldRetrySshInventory,
   uniqueLabel,
   updateEligibility,
   upsertConnection
@@ -202,6 +205,43 @@ test('roster: unique profiles keep bare handles; duplicates get @name-device', (
   assert.equal(byKey.get('local/default'), 'default')
   assert.equal(byKey.get('homelab/coder'), 'coder')
   assert.equal(roster.length, 4)
+})
+
+test('rememberSshEnumeration: live list wins, cache then seed default', () => {
+  assert.deepEqual(rememberSshEnumeration({ profiles: ['bob', 'kai'] }, ['stale'], 'ssh'), {
+    profiles: ['bob', 'kai']
+  })
+  assert.deepEqual(
+    rememberSshEnumeration({ profiles: null, error: 'connect-on-demand' }, ['bob', 'kai', 'rook'], 'ssh'),
+    { profiles: ['bob', 'kai', 'rook'], error: 'connect-on-demand' }
+  )
+  assert.deepEqual(rememberSshEnumeration({ profiles: null, error: 'connect-on-demand' }, null, 'ssh'), {
+    profiles: ['default'],
+    error: 'connect-on-demand'
+  })
+  assert.deepEqual(rememberSshEnumeration({ profiles: null, error: 'connect-on-demand' }, null, 'remote'), {
+    profiles: null,
+    error: 'connect-on-demand'
+  })
+})
+
+test('shouldRetrySshInventory: first try, cooldown, then retry; cache never retries', () => {
+  assert.equal(shouldRetrySshInventory(false, null, 1_000), true)
+  assert.equal(shouldRetrySshInventory(false, 1_000, 30_000, 60_000), false)
+  assert.equal(shouldRetrySshInventory(false, 1_000, 61_000, 60_000), true)
+  assert.equal(shouldRetrySshInventory(true, 1_000, 120_000, 60_000), false)
+})
+
+test('parseRemoteProfileListing: Mini/Spark dirs become roster names and drop rollbacks', () => {
+  const listed = parseRemoteProfileListing(
+    ['bob', 'dixie', 'goose', 'rambo', 'bob.rollback-old', '.hidden', '', 'not a name'].join('\n')
+  )
+
+  assert.deepEqual(listed, ['default', 'bob', 'dixie', 'goose', 'rambo'])
+})
+
+test('parseRemoteProfileListing: empty listing is still the default agent', () => {
+  assert.deepEqual(parseRemoteProfileListing(''), ['default'])
 })
 
 test('roster: unreachable sources contribute no rows and cannot fake duplicates', () => {

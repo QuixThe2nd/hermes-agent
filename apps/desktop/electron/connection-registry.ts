@@ -255,6 +255,80 @@ export interface RosterAgent {
 }
 
 /**
+ * SSH roster enumeration skips undialed sources (connect-on-demand). Reuse the
+ * last successful profile list so Bot Mode does not go empty the moment the
+ * window switches back to local. Never-seen SSH sources still get a `default`
+ * seed so the device is clickable.
+ */
+export function rememberSshEnumeration(
+  enumeration: Pick<ConnectionAgents, 'error' | 'profiles'>,
+  cached: null | string[] | undefined,
+  kind: ConnectionKind
+): Pick<ConnectionAgents, 'error' | 'profiles'> {
+  if (enumeration.profiles && enumeration.profiles.length > 0) {
+    return enumeration
+  }
+
+  if (kind !== 'ssh') {
+    return enumeration
+  }
+
+  if (cached && cached.length > 0) {
+    return { profiles: cached, error: enumeration.error }
+  }
+
+  if (enumeration.error === 'connect-on-demand') {
+    return { profiles: ['default'], error: 'connect-on-demand' }
+  }
+
+  return enumeration
+}
+
+/** Whether an undialed SSH source should be inventoried again. Cached
+ *  successes never retry. Failures retry after `retryAfterMs` so a cold box
+ *  does not stay seeded as `default` until the user hits Test. */
+export function shouldRetrySshInventory(
+  hasCache: boolean,
+  lastAttemptMs: null | number | undefined,
+  nowMs: number,
+  retryAfterMs = 60_000
+): boolean {
+  if (hasCache) {
+    return false
+  }
+
+  if (lastAttemptMs == null) {
+    return true
+  }
+
+  return nowMs - lastAttemptMs >= retryAfterMs
+}
+
+const PROFILE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/
+
+/** Turn `ls ~/.hermes/profiles` output into roster names. Always includes
+ *  `default`. Drops rollback snapshots and junk lines. */
+export function parseRemoteProfileListing(text: string): string[] {
+  const names = new Set<string>(['default'])
+
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const name = raw.trim()
+
+    if (!name || name.startsWith('.') || name.endsWith('.rollback-old')) {
+      continue
+    }
+
+    if (!PROFILE_NAME_RE.test(name)) {
+      continue
+    }
+
+    names.add(name)
+  }
+
+  return ['default', ...[...names].filter(name => name !== 'default').sort()]
+}
+
+/**
  * Flatten per-connection profile enumerations into the union roster, applying
  * the duplicate-handle rule ONCE across all sources. Pure so the disambiguation
  * policy is testable without IPC; main.ts feeds it live enumerations.
