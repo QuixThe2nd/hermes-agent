@@ -196,7 +196,7 @@ def test_schema_registration():
     assert required == {"task", "workdir"}
 
     props = schema["parameters"]["properties"]
-    assert props["model"]["default"] == "kimi-k3-high"
+    assert props["model"]["default"] == "composer-2.5"
     assert props["timeout_seconds"]["default"] == 900
     assert props["force"]["default"] is True
 
@@ -546,7 +546,7 @@ def test_happy_path_e2e(monkeypatch, tmp_path):
         "--trust",
         "--force",
         "--model",
-        "kimi-k3-high",
+        "composer-2.5",
         "--output-format",
         "stream-json",
         "implement feature",

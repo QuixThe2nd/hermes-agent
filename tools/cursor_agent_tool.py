@@ -42,7 +42,7 @@ _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CURSOR_AGENT_MODEL = "kimi-k3-high"
+DEFAULT_CURSOR_AGENT_MODEL = "composer-2.5"
 DEFAULT_TIMEOUT_SECONDS = 900
 MIN_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 1800
