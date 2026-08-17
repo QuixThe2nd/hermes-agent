@@ -11,12 +11,13 @@ An edition of [Hermes Agent](https://github.com/NousResearch/hermes-agent) with 
 - **Plugins**
   - dev-pipeline — hand a repo + task to an automated pipeline: MoA planning, Cursor execution, mechanical verification, dual-model review, draft PR
   - Discord History — read-only search over an owner-authorized PostgreSQL archive of Discord messages
-  - Papercuts — structured journal of workflow friction (log/list/resolve/stats), feeds the daily triage cron
+  - Papercuts — structured journal of workflow friction, plus an opt-in daily autofix cron (`hermes papercuts autofix install`) that turns small mechanical fixes into PRs
 - **Other**
   - Gateway — replies can end with a timing breakdown: total, API, tools, other (off by default upstream)
   - Discord — sessions keyed to your stable username, not your per-server nickname
   - Discord — threads renamed once, after the first reply lands, never mid-turn
   - Discord — progress updates respect each platform's real message limits
+  - Cron — lifecycle guard blocks cron-spawned commands that would restart the gateway or rewrite the live checkout (quote-aware)
   - Config — API retry backoff timing
   - Config — web search and extract fallback chains
 
