@@ -127,6 +127,22 @@ DEFAULT_CONFIG = {
         "retry_base_delay": 2.0,
         # Upper cap (seconds) on any single API retry backoff wait. Default 60s.
         "retry_max_delay": 60.0,
+        # Empty-response retry guard (NS-503).  The empty-retry loop
+        # re-sends the full conversation input at full price on every
+        # attempt; these settings stop it from re-billing *deterministic*
+        # empties (unsignaled provider refusals with zero output tokens)
+        # while failing open on any ambiguous evidence (missing usage,
+        # any generated tokens, model/provider change mid-streak).
+        "empty_response_guard": {
+            # Master switch for both guards below. False restores the
+            # legacy fixed 3-retry behaviour unconditionally.
+            "enabled": True,
+            # When the estimated input cost of a single empty attempt
+            # meets or exceeds this many USD, the retry budget for the
+            # streak drops from 3 to 1. Unknown pricing or missing usage
+            # leaves the budget untouched.
+            "cost_threshold_usd": 0.25,
+        },
         "service_tier": "",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
@@ -1994,6 +2010,14 @@ DEFAULT_CONFIG = {
         #                     never crammed into a chat bubble), apply with
         #                     /skills approve <id> or drop with /skills reject <id>.
         "write_approval": False,
+        # Per-mutation audit ledger (tracker #79686 P3). Every skill mutation
+        # — curator, agent, or user — appends one JSONL entry to
+        # ~/.hermes/skills/.curator_ledger.jsonl with before/after file
+        # hashes; file contents are stored content-addressed (deduped) under
+        # ~/.hermes/.curator_backups/blobs/. Enables `hermes curator ledger`
+        # and single-mutation `hermes curator rollback <entry-id>`.
+        # Telemetry, never a gate: ledger failures cannot block a mutation.
+        "ledger": True,
     },
 
     # Curator — background skill maintenance.
@@ -2036,6 +2060,11 @@ DEFAULT_CONFIG = {
         # genuine non-use (never a mass-prune on the first run). Set to false
         # to keep all bundled built-ins permanently.
         "prune_builtins": True,
+        # TTL purge of skills/.archive/. 0 (default) = never purge — archived
+        # skills are kept forever. When > 0, `hermes curator purge` deletes
+        # archived skills older than this many days (explicit command only,
+        # never automatic; every purge is recorded in the audit ledger).
+        "archive_ttl_days": 0,
         # Pre-run backup: before every real curator pass (dry-run is
         # skipped), snapshot ~/.hermes/skills/ into
         # ~/.hermes/skills/.curator_backups/<utc-iso>/skills.tar.gz so the

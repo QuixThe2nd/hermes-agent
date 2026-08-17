@@ -1051,6 +1051,22 @@ function paintMathFace(svg, t) {
     er.setAttribute('cy', eyeY)
   }
 
+  // Catchlights ride the pupils (upper-left offset) — without this they
+  // stay at the circle-face position and drift outside e.g. the cloud's
+  // lower-set eyes.
+  const hl = svg.querySelector('[data-hb-hl-l]')
+  const hr = svg.querySelector('[data-hb-hl-r]')
+
+  if (hl) {
+    hl.setAttribute('cx', eyeL - 0.6)
+    hl.setAttribute('cy', eyeY - 0.7)
+  }
+
+  if (hr) {
+    hr.setAttribute('cx', eyeR - 0.6)
+    hr.setAttribute('cy', eyeY - 0.7)
+  }
+
   if (open) {
     open.setAttribute('opacity', pose.blink ? '0' : '1')
   }
@@ -1155,6 +1171,10 @@ function BotFace({ shape, color, image, size = 36, name = 'agent', mood = 'idle'
   const eyeFill = isDarkColor(color) ? 'rgba(232,220,195,0.95)' : 'rgba(0,0,0,0.85)'
   const ring = sampleFaceRing(shape)
   const rest = facePose(working ? 'work' : 'idle', 0)
+  // Shape-aware initial eye line — the cloud body sits lower, so its eyes
+  // (and their catchlights) start at the cloud position instead of jumping
+  // there on the first clock paint.
+  const eyeY0 = shape === 'cloud' ? 22 : 17.2
 
   return jsxs('svg', {
     'data-bot-face': name,
@@ -1177,15 +1197,15 @@ function BotFace({ shape, color, image, size = 36, name = 'agent', mood = 'idle'
       jsxs('g', {
         'data-hb-open': '1',
         children: [
-          jsx('ellipse', { 'data-hb-el': '1', cx: 15.4, cy: 17.2, rx: 2.2, ry: working ? 2.6 : 2.3, fill: eyeFill }),
-          jsx('ellipse', { 'data-hb-er': '1', cx: 24.6, cy: 17.2, rx: 2.2, ry: working ? 2.6 : 2.3, fill: eyeFill }),
-          jsx('circle', { cx: 14.8, cy: 16.5, r: 0.65, fill: 'rgba(255,255,255,0.85)' }),
-          jsx('circle', { cx: 24, cy: 16.5, r: 0.65, fill: 'rgba(255,255,255,0.85)' })
+          jsx('ellipse', { 'data-hb-el': '1', cx: 15.4, cy: eyeY0, rx: 2.2, ry: working ? 2.6 : 2.3, fill: eyeFill }),
+          jsx('ellipse', { 'data-hb-er': '1', cx: 24.6, cy: eyeY0, rx: 2.2, ry: working ? 2.6 : 2.3, fill: eyeFill }),
+          jsx('circle', { 'data-hb-hl-l': '1', cx: 14.8, cy: eyeY0 - 0.7, r: 0.65, fill: 'rgba(255,255,255,0.85)' }),
+          jsx('circle', { 'data-hb-hl-r': '1', cx: 24, cy: eyeY0 - 0.7, r: 0.65, fill: 'rgba(255,255,255,0.85)' })
         ]
       }),
       jsx('path', {
         'data-hb-shut': '1',
-        d: 'M12.8 17.2 L18 17.2 M22 17.2 L27.2 17.2',
+        d: `M12.8 ${eyeY0} L18 ${eyeY0} M22 ${eyeY0} L27.2 ${eyeY0}`,
         stroke: eyeFill,
         strokeWidth: 2,
         strokeLinecap: 'round',
@@ -2817,21 +2837,20 @@ function messagingProtocolSection(name, roster) {
     'into it, like a DM. To message a teammate, run:',
     '',
     '```',
-    'hermes -p <agent-name> chat --in ~ -c "Bot Chat" -Q -q "Message from \uD83E\uDD16 ' + handle + ' (@' + handle + '): your message"',
+    'hermes -p <agent-name> chat --in ~ -c "Bot Chat" --create-if-missing -Q -q "Message from \uD83E\uDD16 ' + handle + ' (@' + handle + '): your message"',
     '',
     'Run the send with background=true and notify_on_complete=true on the',
     'terminal tool, then finish your turn — the reply arrives later as a',
     'background process notification. Never block waiting for it.',
     '```',
     '',
-    '(`--in ~ -c "Bot Chat"` resumes their canonical conversation in the home',
-    'workspace. `-Q` keeps output clean. Always open with the',
+    '(`--in ~ -c "Bot Chat" --create-if-missing` resumes their canonical',
+    'conversation in the home workspace, creating it if the target has no',
+    '"Bot Chat" yet. `-Q` keeps output clean. Always open with the',
     '"Message from \uD83E\uDD16 ' + handle + ' (@' + handle + '):" prefix so they know',
     'who is talking (the @handle lets the app show your avatar to them).',
     'Their reply prints to stdout — relay the relevant part back to the',
-    'user, and say which agent it came from. In the rare case the target',
-    'has no "Bot Chat" yet, send once WITHOUT -c, then',
-    '`hermes -p <agent-name> sessions rename <session-id> "Bot Chat"`.)',
+    'user, and say which agent it came from.)',
     '',
     'If a message in YOUR chat starts with "Message from \uD83E\uDD16 <name>", it is',
     'a teammate messaging you, not the user. Answer it directly — your reply',
@@ -5436,6 +5455,7 @@ function CreateRoutineDialog({ bot, open, onClose }) {
   const [name, setName] = useState('')
   const [instruction, setInstruction] = useState('')
   const [sched, setSched] = useState(defaultScheduleState())
+  const [continuity, setContinuity] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
   const activeProfile = useValue(host.state.profile)
@@ -5445,6 +5465,7 @@ function CreateRoutineDialog({ bot, open, onClose }) {
     setName('')
     setInstruction('')
     setSched(defaultScheduleState())
+    setContinuity(false)
     setBusy(false)
     setError(null)
   }
@@ -5477,7 +5498,8 @@ function CreateRoutineDialog({ bot, open, onClose }) {
         schedule: schedule.trim(),
         prompt: routinePrompt(bot, title, task, activeProfile),
         ...(bot ? { profile: bot } : {}),
-        ...(repeatN ? { repeat: repeatN } : {})
+        ...(repeatN ? { repeat: repeatN } : {}),
+        ...(continuity ? { continuity: true } : {})
       })
       await invalidateRoutineOwner(bot)
       host.notify({ kind: 'success', message: `Cronjob "${title}" scheduled` })
@@ -5530,6 +5552,18 @@ function CreateRoutineDialog({ bot, open, onClose }) {
               })
             ),
             labeled('When to run', jsx(SchedulePicker, { state: sched, setState: setSched })),
+            jsxs('label', {
+              className: 'flex items-center gap-2 text-xs text-(--ui-text-tertiary) cursor-pointer select-none',
+              children: [
+                jsx('input', {
+                  type: 'checkbox',
+                  className: 'accent-(--ui-accent)',
+                  checked: continuity,
+                  onChange: event => setContinuity(event.target.checked)
+                }),
+                'Continuity: each run sees the previous run\u2019s output (dedupe, continue where it left off)'
+              ]
+            }),
             error
               ? jsx('div', {
                   className: 'rounded-md border border-(--ui-stroke-secondary) px-3 py-2 text-xs text-(--ui-accent)',
@@ -6647,8 +6681,8 @@ export default {
           const note =
             '\n\n[@mention handoff — for each mentioned agent (' + mentioned.map(botHandle).join(', ') + '): ' +
             'COMPOSE a message from you (' + senderName + ') to that agent conveying what the user wants — do not forward this text verbatim (avoid double quotes in your composed message). Send it with exactly one terminal call, run with background=true AND notify_on_complete=true (the recipient may take minutes; the user must not be blocked):\n' +
-            mentioned.map(n => '`hermes -p ' + shellQuote(n) + ' chat --in ~ -c "Bot Chat" -Q -q "Message from \uD83E\uDD16 ' + shellDoubleQuote(senderName) + ' (@' + shellDoubleQuote(botHandle(active)) + '): <your composed message>"`').join('\n') +
-            '\nAfter dispatching, tell the user the message was sent and END YOUR TURN — do not wait or poll; when the background process completes, its notification carries the reply — relay it then, attributed to that agent. If it fails with "No session found matching \'Bot Chat\'", send once without the -c flag, then run `hermes -p <agent> sessions rename <session_id from the output> "Bot Chat"`. ' +
+            mentioned.map(n => '`hermes -p ' + shellQuote(n) + ' chat --in ~ -c "Bot Chat" --create-if-missing -Q -q "Message from \uD83E\uDD16 ' + shellDoubleQuote(senderName) + ' (@' + shellDoubleQuote(botHandle(active)) + '): <your composed message>"`').join('\n') +
+            '\nAfter dispatching, tell the user the message was sent and END YOUR TURN — do not wait or poll; when the background process completes, its notification carries the reply — relay it then, attributed to that agent. ' +
             'Relay the reply back to the user, attributed to that agent.]'
 
           return { ...draft, text: text + note }
