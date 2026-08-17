@@ -9,9 +9,9 @@ An edition of [Hermes Agent](https://github.com/NousResearch/hermes-agent) with 
   - MoA — `consult_moa` and `moa_debate`, restored from the archive
   - Memory (Honcho) — memory tools surface backend failures (dead API keys, auth 401s, timeouts) as explicit errors instead of silently looking like "nothing stored"
 - **Plugins**
-  - dev-pipeline — hand a repo + task to an automated pipeline: MoA planning, Cursor execution, mechanical verification, dual-model review, draft PR (toolset on by default)
+  - dev-pipeline — hand a repo + task to an automated pipeline: MoA planning, Cursor execution, mechanical verification, dual-model review, draft PR
   - Discord History — read-only search over an owner-authorized PostgreSQL archive of Discord messages
-  - Papercuts — structured journal of workflow friction (log/list/resolve/stats), plus an opt-in daily autofix cron (`hermes papercuts autofix install`) that triages the journal, fixes small mechanical items in a scratch clone, opens PRs, watches CI, and only resolves items with a PR URL plus verification evidence
+  - Papercuts — structured journal of workflow friction, plus an opt-in daily autofix cron (`hermes papercuts autofix install`) that turns small mechanical fixes into PRs
 - **Other**
   - Gateway — replies can end with a timing breakdown: total, API, tools, other (off by default upstream)
   - Discord — sessions keyed to your stable username, not your per-server nickname
