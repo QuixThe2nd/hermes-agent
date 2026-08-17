@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import stat
@@ -8,15 +7,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
-PLUGIN = Path(__file__).with_name("__init__.py")
-spec = importlib.util.spec_from_file_location("papercuts_plugin_under_test", PLUGIN)
-assert spec and spec.loader
-papercuts = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(papercuts)
+from tools import papercuts_tool
+from tools.registry import registry
 
 
-class PapercutsPluginTests(unittest.TestCase):
+class PapercutsToolTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         os.environ["HERMES_PAPERCUTS_DIR"] = self.tmp.name
@@ -27,7 +22,7 @@ class PapercutsPluginTests(unittest.TestCase):
 
     def call(self, args, *, session="s1", turn="t1"):
         return json.loads(
-            papercuts.handle_papercuts(
+            papercuts_tool.handle_papercuts(
                 args,
                 session_id=session,
                 turn_id=turn,
@@ -113,6 +108,15 @@ class PapercutsPluginTests(unittest.TestCase):
         self.assertEqual(missing["error"]["code"], "invalid_input")
         bad_action = self.call({"action": "explode"})
         self.assertEqual(bad_action["error"]["code"], "invalid_input")
+
+
+class PapercutsRegistryTests(unittest.TestCase):
+    def test_registry_registers_papercuts_tool(self):
+        entry = registry.get_entry("papercuts")
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.schema["name"], "papercuts")
+        self.assertEqual(entry.toolset, "papercuts")
 
 
 if __name__ == "__main__":

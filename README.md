@@ -8,10 +8,10 @@ An edition of [Hermes Agent](https://github.com/NousResearch/hermes-agent) with 
   - Delegation — send coding tasks to the Claude Code CLI, straight from chat
   - MoA — `consult_moa` and `moa_debate`, restored from the archive
   - Memory (Honcho) — memory tools surface backend failures (dead API keys, auth 401s, timeouts) as explicit errors instead of silently looking like "nothing stored"
+  - Papercuts — structured journal of workflow friction (log/list/resolve/stats), feeds the daily triage cron
 - **Plugins**
   - dev-pipeline — hand a repo + task to an automated pipeline: MoA planning, Cursor execution, mechanical verification, dual-model review, draft PR
   - Discord History — read-only search over an owner-authorized PostgreSQL archive of Discord messages
-  - Papercuts — structured journal of workflow friction (log/list/resolve/stats), feeds the daily triage cron
 - **Other**
   - Gateway — replies can end with a timing breakdown: total, API, tools, other (off by default upstream)
   - Discord — sessions keyed to your stable username, not your per-server nickname
