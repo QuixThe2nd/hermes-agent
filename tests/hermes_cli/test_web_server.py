@@ -2469,7 +2469,14 @@ class TestNewEndpoints:
         listing = {t["name"]: t for t in self.client.get("/api/tools/toolsets").json()}
         assert listing["discord"]["platform"] == "discord"
         assert listing["discord"]["platform_label"] == "Discord"
-        assert listing["discord"]["enabled"] is False
+        # NOTE(fork): discord/discord_admin are default-ON on the fork, so
+        # exercise the write path by disabling first, then re-enabling.
+        assert listing["discord"]["enabled"] is True
+
+        resp = self.client.put("/api/tools/toolsets/discord", json={"enabled": False})
+        assert resp.status_code == 200
+        config = load_config()
+        assert "discord" not in config["platform_toolsets"]["discord"]
 
         resp = self.client.put("/api/tools/toolsets/discord", json={"enabled": True})
         assert resp.status_code == 200
@@ -2488,7 +2495,14 @@ class TestNewEndpoints:
 
         listing = {t["name"]: t for t in self.client.get("/api/tools/toolsets").json()}
         assert listing["discord"]["enabled"] is True
-        assert listing["discord_admin"]["enabled"] is False
+        assert listing["discord_admin"]["enabled"] is True
+
+        resp = self.client.put(
+            "/api/tools/toolsets/discord_admin", json={"enabled": False}
+        )
+        assert resp.status_code == 200
+        config = load_config()
+        assert "discord_admin" not in config["platform_toolsets"]["discord"]
 
         resp = self.client.put(
             "/api/tools/toolsets/discord_admin", json={"enabled": True}

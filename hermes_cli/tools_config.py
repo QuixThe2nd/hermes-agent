@@ -154,10 +154,13 @@ def gui_toolset_label(label: str) -> str:
 # `hermes tools` → X (Twitter) Search setup walks users through credential
 # setup. The tool's check_fn means the schema still won't appear to the
 # model if the credential later goes missing or expires.
-# NOTE(fork): "dev-pipeline" removed from the default-off set — the fork ships
-# the dev_pipeline plugin and wants delegate_development available by default
-# on every instance running the fork. Upstream keeps it opt-in.
-_DEFAULT_OFF_TOOLSETS = {"moa", "homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a"}
+# NOTE(fork): "dev-pipeline", "discord" and "discord_admin" removed from the
+# default-off set — the fork wants its dev pipeline and Discord-native
+# toolsets available by default on every instance running the fork.
+# discord/discord_admin stay platform-restricted to discord via
+# _TOOLSET_PLATFORM_RESTRICTIONS, so this only affects Discord sessions.
+# Upstream keeps all three opt-in.
+_DEFAULT_OFF_TOOLSETS = {"moa", "homeassistant", "spotify", "video", "video_gen", "x_search", "a2a"}
 
 
 # Config-only capabilities: they appear in `hermes tools` for provider/API-key
@@ -1076,16 +1079,10 @@ def install_cua_driver(
         # baked in by CD and errors cleanly on missing-arch assets.
         return _run_cua_driver_installer(label="Installing")
 
-    # An installed driver that fails Hermes' runtime contract (version floor,
-    # missing manifest verbs) is repaired regardless of the caller's mode.
-    # Hermes' own minimum requirement IS the confirmation that an upgrade is
-    # needed, so the ``upgrade=True`` path must not defer to the driver's
-    # ``check-update`` verb here — a cached/indeterminate "no update" answer
-    # would otherwise pin users on an unusable driver forever (observed:
-    # 0.19.3 installs hard-failing every computer_use call after the 0.20
-    # contract landed, with `hermes update` declining to refresh).
     contract = _cua_driver_contract_status(binary) if binary else None
-    repair_existing = bool(binary and contract and not contract.get("ready"))
+    repair_existing = bool(
+        binary and not upgrade and contract and not contract.get("ready")
+    )
 
     # A compatible existing installation needs no download. Finish the small
     # host-specific setup that the upstream installer normally owns.

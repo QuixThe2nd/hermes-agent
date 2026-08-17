@@ -258,7 +258,24 @@ class TestFindAllSkills:
 
 
 class TestSkillsList:
-    def test_empty_creates_directory(self, tmp_path):
+    @pytest.fixture
+    def _no_plugin_skills(self, monkeypatch):
+        """Isolate local-skill listing tests from plugin-provided skills.
+
+        On the fork, bundled plugins with default_enabled: true (e.g.
+        discord-history) load during tests and contribute skills via the
+        plugin registry; these tests assert exact contents of a tmp local
+        SKILLS_DIR, so plugin skills are stubbed out.
+        """
+        import types as _types
+
+        monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_manager",
+            lambda: _types.SimpleNamespace(list_plugin_skill_metadata=lambda: []),
+        )
+
+    def test_empty_creates_directory(self, tmp_path, _no_plugin_skills):
         skills_dir = tmp_path / "skills"
         with patch("tools.skills_tool.SKILLS_DIR", skills_dir):
             raw = skills_list()
@@ -267,7 +284,7 @@ class TestSkillsList:
         assert result["skills"] == []
         assert skills_dir.exists()
 
-    def test_category_filter(self, tmp_path):
+    def test_category_filter(self, tmp_path, _no_plugin_skills):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "skill-a", category="devops")
             _make_skill(tmp_path, "skill-b", category="mlops")
