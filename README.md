@@ -1,3 +1,18 @@
+> **⚠️ Personal fork — [QuixThe2nd/hermes-agent](https://github.com/QuixThe2nd/hermes-agent)**
+>
+> This is a personal fork of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent), running a single operator's production Hermes deployment (Discord gateway + cron). It tracks upstream closely — `.github/workflows/fork-sync.yml` auto-merges `upstream/main` every 6 hours — and carries a small set of additions that haven't been upstreamed. Everything here lands via PR with full CI; upstream remains the source of truth for the core.
+>
+> **What this fork adds:**
+> - **Delegation tools** — `delegate_cursor_agent` (Cursor Agent CLI lane) and `delegate_claude_agent` (Claude Code + GLM-5.2 lane) as native model tools, with cross-platform process-group handling and the sanctioned subprocess-env factory
+> - **MoA tools restored** — `consult_moa` (Mixture-of-Agents consultation) and `moa_debate` (adversarial debate), recovered from the archive
+> - **Gateway observability** — runtime footer timing breakdown (total/API/tool/other), injected-context surfacing in the footer and tool-progress feed
+> - **Discord behavior** — sessions attributed to stable username (not guild nickname), threads renamed exactly once after the first reply lands, platform-correct progress limits/units
+> - **Configurability** — API retry backoff timing, web search/extract fallback chains
+> - **Plugins** — dev-pipeline converted to a plugin, plus Discord History and Papercuts plugins
+> - **Fork ops** — 6h upstream sync workflow, contributor-attribution mapping for agent-authored commits
+>
+> If you're looking for the upstream project, you want [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent). Everything below this notice is upstream's README.
+
 <p align="center">
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>
