@@ -3,11 +3,15 @@
 An edition of [Hermes Agent](https://github.com/NousResearch/hermes-agent) with extra tooling and gateway behavior, kept current with upstream (auto-synced hourly). Everything lands via PR with full CI.
 
 **What's different here:**
-- **Delegation tools** — Cursor Agent CLI + Claude Code CLI as native tools
-- **MoA tools** — `consult_moa` + `moa_debate` restored from the archive
-- **Gateway footer** — timing breakdown, injected-context in footer/progress feed
-- **Discord** — stable-username sessions, thread-rename-once, platform progress limits
-- **Config** — retry backoff timing, search/extract fallback chains
+- **Cursor delegation** — send coding tasks to the Cursor Agent CLI, straight from chat
+- **Claude delegation** — send coding tasks to the Claude Code CLI, straight from chat
+- **MoA tools** — `consult_moa` and `moa_debate`, restored from the archive
+- **Footer timing** — each reply can end with a timing breakdown: total, API, tools, other (off by default upstream)
+- **Discord identity** — sessions are keyed to your stable username, not your per-server nickname
+- **Discord threads** — a thread is renamed once, after the first reply lands, never mid-turn
+- **Discord progress** — progress updates respect each platform's real message limits
+- **Retry config** — API retry backoff timing is configurable
+- **Search config** — web search and extract fallback chains are configurable
 - **Plugins** — dev-pipeline, Discord History, Papercuts
 
 For the upstream project, see [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent). Everything below this header is upstream's README.
