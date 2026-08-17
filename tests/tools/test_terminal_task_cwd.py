@@ -201,9 +201,11 @@ def test_record_session_cwd_updates_when_stale_cwd_falls_back(monkeypatch, tmp_p
         cwd = missing
 
         def execute(self, command, **kwargs):
-            # Simulate _resolve_safe_cwd: env.cwd gets set to a real dir
+            # Simulate _resolve_safe_cwd: env.cwd gets set to a real dir.
+            # cwd_observed mirrors the real marker path: a command that ran
+            # to completion reports its finishing cwd (the dual-write gate).
             self.cwd = str(fallback)
-            return {"output": "ok", "returncode": 0}
+            return {"output": "ok", "returncode": 0, "cwd_observed": True}
 
     recorded = []
     task_id = "session-deleted-cwd"
