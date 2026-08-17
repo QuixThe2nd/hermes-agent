@@ -152,13 +152,14 @@ function trackInboundActivity(roster) {
 /** Last good cron list, same idea as the roster snapshot. */
 const $lastJobs = atom([])
 
-/** User pref: hide canonical "Bot Chat" sessions from the global Sessions
- *  sidebar (they always remain in the Bots roster). Persisted via ctx.storage.
- *  Default ON — Bot Chats are plugin-owned forever-chats, not scratch sessions,
- *  so keeping them out of the shared recents list is the expected behavior.
- *  Backed by the core generic `hidden` session flag (session.create hidden:true
- *  / session.set_hidden); older gateways ignore it and Bot Chats stay visible. */
-const $hideBotChats = atom(true)
+// Bot Mode sessions are ALWAYS hidden from the global Sessions sidebar:
+// canonical Bot Chats are plugin-owned forever-chats and group-chat member
+// sessions are room plumbing — neither is a scratch conversation, and a
+// 6-member room would otherwise dump six identical "Group: ..." rows into
+// recents. Backed by the core generic `hidden` session flag (session.create
+// hidden:true / session.set_hidden); the Bots pane browses them via
+// session.list include_hidden. Older gateways ignore the flag and the
+// sessions simply stay visible there.
 
 /** Bot the Routines tile is scoped to. Follows the live gateway profile
  *  (the bot you're actually chatting with) and roster clicks. */
@@ -268,27 +269,25 @@ async function saveBotMeta(name, patch) {
   return { serverPersisted: serverOutcome === 'persisted', serverOutcome }
 }
 
-/** Flip the "hide Bot Chats from the sidebar" pref, persist it, and reconcile
- *  every known canonical chat via the core session.set_hidden RPC so the change
- *  applies to already-created Bot Chats (not just future ones). Feature-detected:
- *  older gateways lack session.set_hidden and simply keep the chats visible. */
-async function setHideBotChats(hidden) {
-  $hideBotChats.set(hidden)
-
-  try {
-    Promise.resolve(pluginCtx?.storage?.set?.('hide-bot-chats', hidden)).catch(() => undefined)
-  } catch {
-    /* storage unavailable — pref holds for this window only */
-  }
-
-  const meta = $botMeta.get()
-  const ids = Object.values(meta)
+/** One-time reconciliation: Bot Mode sessions are always hidden, but rooms
+ *  and Bot Chats created before this policy (or while the old pref was off)
+ *  left visible rows behind. On every plugin load, sweep every session id we
+ *  own — canonical chats from bot meta plus each group room's member
+ *  sessions — through the core session.set_hidden RPC. Idempotent (the DB
+ *  setter is a no-op on already-hidden rows) and feature-detected: older
+ *  gateways lack session.set_hidden and simply keep the rows visible. */
+function hideOwnedBotSessions() {
+  const canonical = Object.values($botMeta.get())
     .map(m => m && m.chat)
     .filter(Boolean)
+  const rooms = Object.values($groupChats.get())
+    .flatMap(room => Object.values(room?.sessions || {}))
+    .filter(sid => Boolean(sid) && sid !== true)
+  const ids = [...new Set([...canonical, ...rooms])]
 
-  await Promise.all(
+  return Promise.all(
     ids.map(sid =>
-      Promise.resolve(host.request('session.set_hidden', { session_id: sid, hidden })).catch(() => undefined)
+      Promise.resolve(host.request('session.set_hidden', { session_id: sid, hidden: true })).catch(() => undefined)
     )
   )
 }
@@ -1327,6 +1326,11 @@ function BotFace({ shape, color, image, size = 36, name = 'agent', mood = 'idle'
 
   const working = mood === 'work'
   const eyeFill = isDarkColor(color) ? 'rgba(232,220,195,0.95)' : 'rgba(0,0,0,0.85)'
+  // Catchlight contrast follows the pupil, not the body: dark pupils get the
+  // white sparkle, light (cream) pupils on dark bodies get a dark one — a
+  // white dot on a cream pupil is invisible, which read as "no eye dots" on
+  // maroon/ink/oxblood avatars.
+  const hlFill = isDarkColor(color) ? 'rgba(0,0,0,0.6)' : 'rgba(255,255,255,0.85)'
   const ring = sampleFaceRing(shape)
   const rest = facePose(working ? 'work' : 'idle', 0)
   // Shape-aware initial eye line — the cloud body sits lower, so its eyes
@@ -1357,8 +1361,8 @@ function BotFace({ shape, color, image, size = 36, name = 'agent', mood = 'idle'
         children: [
           jsx('ellipse', { 'data-hb-el': '1', cx: 15.4, cy: eyeY0, rx: 2.2, ry: working ? 2.6 : 2.3, fill: eyeFill }),
           jsx('ellipse', { 'data-hb-er': '1', cx: 24.6, cy: eyeY0, rx: 2.2, ry: working ? 2.6 : 2.3, fill: eyeFill }),
-          jsx('circle', { 'data-hb-hl-l': '1', cx: 14.8, cy: eyeY0 - 0.7, r: 0.65, fill: 'rgba(255,255,255,0.85)' }),
-          jsx('circle', { 'data-hb-hl-r': '1', cx: 24, cy: eyeY0 - 0.7, r: 0.65, fill: 'rgba(255,255,255,0.85)' })
+          jsx('circle', { 'data-hb-hl-l': '1', cx: 14.8, cy: eyeY0 - 0.7, r: 0.65, fill: hlFill }),
+          jsx('circle', { 'data-hb-hl-r': '1', cx: 24, cy: eyeY0 - 0.7, r: 0.65, fill: hlFill })
         ]
       }),
       jsx('path', {
@@ -1517,6 +1521,13 @@ function McpSetupButton({ profile, entry, onDone, ensureProfile }) {
   }
 
   const beginOAuth = async () => {
+    // A second click (retry, impatient double-click) must not orphan the
+    // previous poll interval — an overwritten pollRef leaks a 2s poller that
+    // runs until unmount and can flip phase from a stale OAuth session.
+    if (pollRef.current) {
+      clearInterval(pollRef.current)
+      pollRef.current = null
+    }
     setPhase('busy')
     setMessage('')
     const profile = await resolveProfile()
@@ -2526,7 +2537,8 @@ async function ensureRemoteCanonicalChat(route, profile) {
   const created = await host.requestProfile(route, 'session.create', {
     profile,
     title: 'Bot Chat',
-    ...($hideBotChats.get() ? { hidden: true } : {})
+    // Bot Mode sessions are always hidden from the global sidebar.
+    hidden: true
   })
 
   return { runtime: created?.session_id || null, stored: created?.stored_session_id || null }
@@ -2744,10 +2756,11 @@ function createCanonicalChat(name) {
     const res = await host.request('session.create', {
       profile: name,
       title: 'Bot Chat',
-      // Born hidden from the global sidebar when the pref is on. Core applies
-      // this via the generic `hidden` flag (deferred as pending_hidden until the
-      // row exists); older gateways ignore the unknown param and it stays visible.
-      ...($hideBotChats.get() ? { hidden: true } : {})
+      // Always born hidden from the global sidebar — Bot Mode sessions are
+      // plugin-owned. Core applies this via the generic `hidden` flag
+      // (deferred as pending_hidden until the row exists); older gateways
+      // ignore the unknown param and it stays visible.
+      hidden: true
     })
     const sid = res?.stored_session_id
     const runtime = res?.session_id
@@ -3067,7 +3080,7 @@ function parseGroupChatMentions(text, members) {
     // Cross-connection members are also addressable by their @name-device
     // handle (the roster's disambiguated form) — same-named agents on two
     // machines resolve to the right one.
-    const handle = String(member.handle || '').trim()
+    const handle = String(member.handle || botHandle(member.name, member) || '').trim()
     const forms = new Set([
       member.name.toLowerCase(),
       member.name.toLowerCase().replace(/[\s_-]+/g, ''),
@@ -3153,6 +3166,13 @@ function rotateGroupSpeakers(members, round) {
   return [...members.slice(shift), ...members.slice(0, shift)]
 }
 
+/** Transcript form of a room speaker's profile name. The primary profile is
+ *  literally named "default" — render it as Hermes (matching displayName and
+ *  the @hermes handle) so the main agent never loses its name in rooms. */
+function groupSpeakerLabel(name) {
+  return (name || '').trim().toLowerCase() === 'default' ? 'Hermes' : name
+}
+
 /** Room-log line as a member sees it: `Name (user): …` / `Name: …` /
  *  `Name (you): …`. */
 function formatGroupChatLine(entry, viewerName) {
@@ -3165,7 +3185,7 @@ function formatGroupChatLine(entry, viewerName) {
   // two machines stay tellable apart in every member's transcript.
   const source = entry.from.source ? ` [${entry.from.source}]` : ''
 
-  return `${entry.from.name}${suffix}${source}: ${entry.text}`
+  return `${groupSpeakerLabel(entry.from.name)}${suffix}${source}: ${entry.text}`
 }
 
 /** The full per-turn payload for one member: participation rules + the room
@@ -3176,13 +3196,13 @@ function buildGroupChatTurnPrompt({ groupName, members, viewer, deltaLines }) {
   const peers = members.filter(m => groupMemberKey(m) !== viewerKey)
   const peerNames = peers
     .map(m => {
-      const handle = m.title ? `${m.title} (@${m.name})` : `@${m.name}`
+      const handle = m.title ? `${m.title} (@${botHandle(m.name, m)})` : `@${botHandle(m.name, m)}`
       return m.remoteSource ? `${handle} [on ${m.connectionLabel || m.connectionId}]` : handle
     })
     .join(', ')
 
   return [
-    `[Group chat: "${groupName}"] You are @${viewer.name}, one participant in a group chat with ${peerNames || 'no one else yet'} and the user.`,
+    `[Group chat: "${groupName}"] You are @${botHandle(viewer.name, viewer)}, one participant in a group chat with ${peerNames || 'no one else yet'} and the user.`,
     '',
     'New messages in the room since your last turn (oldest first):',
     ...deltaLines.map(line => `  ${line}`),
@@ -3353,7 +3373,8 @@ async function ensureGroupChatSession(group, member) {
   const created = await requestForBot(member, 'session.create', {
     profile: member.name,
     title,
-    ...($hideBotChats.get() ? { hidden: true } : {})
+    // Room member sessions are plumbing — always hidden from the sidebar.
+    hidden: true
   })
   const stored = created?.stored_session_id || null
 
@@ -5988,11 +6009,30 @@ async function invalidateRoutineOwner(profile) {
 function selectRoutineJobs(data, error, lastJobs, bot) {
   const live = Array.isArray(data?.jobs) ? data.jobs : null
   const all = live ?? (error ? lastJobs : [])
+  const scopedToBot = normalizedProfileName(data?.scoped) === normalizedProfileName(bot)
   return {
     live,
     all,
-    jobs: all.filter(job => routineBot(job) === bot)
+    jobs: scopedToBot ? all : all.filter(job => (routineBot(job) || 'default') === bot)
   }
+}
+
+/**
+ * Why the Routines pane can be empty while the bot's cron store has jobs.
+ *
+ * On older gateways the pane only shows jobs namespaced `[bot:<name>]` for the
+ * active bot (plus untagged legacy jobs on the default bot). When jobs exist in
+ * the store but none surface for this bot, the user is left staring at the
+ * generic empty state with no hint that cronjobs are present but hidden.
+ * Return a short explanation string in that case, or null when the store is
+ * genuinely empty (or the active bot's jobs are already shown).
+ */
+function routineFilterHint(all, jobs) {
+  if (jobs.length !== 0 || !Array.isArray(all) || all.length === 0) {
+    return null
+  }
+  return 'Cronjobs exist in this profile but none are tagged for this bot. ' +
+    'Name a job "[bot:<name>] …" to show it here, or see them in Cron below.'
 }
 
 function normalizedProfileName(profile) {
@@ -6540,6 +6580,7 @@ function RoutinesPane() {
   const staleNotice = error && !view.live && view.all.length
     ? 'Could not refresh cronjobs. Showing the last list we had.'
     : null
+  const filterHint = routineFilterHint(view.all, jobs)
 
   return jsxs('div', {
     className: 'flex h-full flex-col',
@@ -6620,13 +6661,15 @@ function RoutinesPane() {
                 jsx(Codicon, { name: 'calendar', className: 'text-[1.6rem] text-(--ui-text-quaternary)' }),
                 jsx('div', {
                   className: 'text-xs leading-5 text-(--ui-text-tertiary)',
-                  children: 'Cronjobs are recurring tasks this agent runs on a schedule.'
+                  children: filterHint
+                    ? filterHint
+                    : 'Cronjobs are recurring tasks this agent runs on a schedule.'
                 }),
                 jsx(Button, {
                   variant: 'secondary',
                   size: 'sm',
                   onClick: openCreate,
-                  children: 'Create Cronjob'
+                  children: filterHint ? 'Create a cronjob for this bot' : 'Create Cronjob'
                 })
               ]
             })
@@ -6638,14 +6681,15 @@ function RoutinesPane() {
               })
             }),
       jsx(CreateRoutineDialog, {
-        key: createTarget,
         bot: createTarget,
         open: createOpen,
         onClose: () => {
           setCreateOpen(false)
           setCreateOwner(null)
         }
-      })
+        // key is the jsx() THIRD argument — as a prop it is silently ignored
+        // and the dialog kept stale per-bot form state when the target changed.
+      }, createTarget)
     ]
   })
 }
@@ -6673,7 +6717,9 @@ function useProfileSessions(botName, gatewayGeneration) {
   return useQuery({
     queryKey: [ID, 'profile-sessions', botName, gatewayGeneration],
     enabled: Boolean(botName),
-    queryFn: () => host.request('session.list', { profile: botName, limit: PROFILE_SESSION_LIST_LIMIT }),
+    // include_hidden: this browser exists precisely to see the profile's own
+    // (always-hidden) Bot Mode sessions alongside its regular ones.
+    queryFn: () => host.request('session.list', { profile: botName, limit: PROFILE_SESSION_LIST_LIMIT, include_hidden: true }),
     refetchInterval: 8000,
     staleTime: 4000,
     retry: false
@@ -7139,6 +7185,10 @@ function GroupChatWorkspace({ group, members }) {
   const room = rooms[group] || { log: [], running: false }
   const [draft, setDraft] = useState('')
   const [confirmDisband, setConfirmDisband] = useState(false)
+  // Click-to-disambiguate: which log entry is showing its speaker's full
+  // @handle (the roster's name-device form when names collide across
+  // connections). Naturally every speaker just shows its display name.
+  const [revealedSpeaker, setRevealedSpeaker] = useState(null)
 
   const header = jsxs('div', {
     className: 'flex items-center gap-2 px-2.5 pt-2.5 pb-2',
@@ -7152,6 +7202,22 @@ function GroupChatWorkspace({ group, members }) {
       jsx('div', {
         className: 'min-w-0 flex-1 truncate text-sm font-semibold',
         children: `${group} — group chat`
+      }),
+      // Member faces: the room's roster at a glance, matching each bot's
+      // avatar in the sidebar. Falls back to the count for the title tooltip.
+      jsx('div', {
+        className: 'flex shrink-0 items-center -space-x-1.5',
+        title: members.map(b => displayName(b, botRosterMeta(b, allMeta))).join(', '),
+        children: members.slice(0, 6).map(b => {
+          const bMeta = botRosterMeta(b, allMeta)
+          const { shape, color, image } = botAppearance(b.name, bMeta)
+          const photo = Boolean(image && !isBackfilledFacePng(image))
+
+          return jsx('div', {
+            className: 'rounded-full ring-2 ring-(--ui-bg-primary,#111)',
+            children: jsx(BotFace, { shape, color, image: photo ? image : null, size: 20, name: b.name })
+          }, botRosterKey(b))
+        })
       }),
       jsx('span', {
         className: 'shrink-0 text-[0.65rem] text-(--ui-text-quaternary)',
@@ -7201,37 +7267,88 @@ function GroupChatWorkspace({ group, members }) {
               ? room.log.map((entry, index) => {
                   const isUser = entry.from.kind === 'user'
                   const meta = isUser || entry.from.source ? null : allMeta[entry.from.name]
-                  const sourceBadge = !isUser && entry.from.source ? ` · ${entry.from.source}` : ''
+                  // Match this speaker back to its member descriptor so display
+                  // names and disambiguating handles come from the roster (the
+                  // primary "default" profile renders as Hermes, remote dupes
+                  // carry their @name-device handle) instead of raw profile ids.
+                  const member = isUser
+                    ? null
+                    : members.find(b =>
+                        b.name === entry.from.name &&
+                        (entry.from.source
+                          ? (b.connectionLabel || b.connectionId) === entry.from.source
+                          : !b.remoteSource)
+                      ) || null
+                  const display = isUser ? 'You' : displayName(member || { name: entry.from.name }, meta)
+                  const entryKey = `${entry.at}:${index}`
+                  const revealed = !isUser && revealedSpeaker === entryKey
+                  // Clicked: append the gateway name so same-named agents on
+                  // two connections are tellable apart on demand.
                   const label = isUser
                     ? 'You'
-                    : meta?.title
-                      ? `${meta.title} (@${entry.from.name})${sourceBadge}`
-                      : `@${entry.from.name}${sourceBadge}`
+                    : revealed
+                      ? `${display}${entry.from.source ? `-${entry.from.source}` : ''} (@${botHandle(entry.from.name, member || undefined)})`
+                      : display
+                  // Speaker avatar: same appearance pipeline as the roster
+                  // (custom image/pet, else deterministic shape+color face).
+                  // Remote speakers have no local meta and get the
+                  // deterministic face for their name — stable per bot.
+                  const { shape, color, image } = isUser
+                    ? { shape: null, color: null, image: null }
+                    : botAppearance(entry.from.name, meta)
+                  const photo = Boolean(image && !isBackfilledFacePng(image))
 
                   return jsxs('div', {
-                    className: isUser ? 'rounded-md bg-(--chrome-action-hover) px-2 py-1.5' : 'px-2 py-1',
+                    className: cn(
+                      'flex items-start gap-2',
+                      isUser ? 'rounded-md bg-(--chrome-action-hover) px-2 py-1.5' : 'px-2 py-1'
+                    ),
                     children: [
-                      jsxs('div', {
-                        className: 'flex items-baseline gap-2',
-                        children: [
-                          jsx('span', {
-                            className: isUser
-                              ? 'text-[0.7rem] font-semibold text-foreground'
-                              : 'text-[0.7rem] font-semibold text-(--ui-accent,#4f9cf9)',
-                            children: label
+                      isUser
+                        ? null
+                        : jsx('div', {
+                            className: 'mt-0.5 shrink-0',
+                            children: jsx(BotFace, {
+                              shape,
+                              color,
+                              image: photo ? image : null,
+                              size: 24,
+                              name: entry.from.name
+                            })
                           }),
-                          jsx('span', {
-                            className: 'text-[0.625rem] text-(--ui-text-quaternary)',
-                            children: relativeTime(entry.at)
+                      jsxs('div', {
+                        className: 'min-w-0 flex-1',
+                        children: [
+                          jsxs('div', {
+                            className: 'flex items-baseline gap-2',
+                            children: [
+                              isUser
+                                ? jsx('span', {
+                                    className: 'text-[0.7rem] font-semibold text-foreground',
+                                    children: label
+                                  })
+                                : jsx('button', {
+                                    type: 'button',
+                                    className:
+                                      'cursor-pointer border-0 bg-transparent p-0 text-left text-[0.7rem] font-semibold text-(--ui-accent,#4f9cf9)',
+                                    title: revealed ? 'Hide full handle' : 'Show full handle',
+                                    onClick: () => setRevealedSpeaker(revealed ? null : entryKey),
+                                    children: label
+                                  }),
+                              jsx('span', {
+                                className: 'text-[0.625rem] text-(--ui-text-quaternary)',
+                                children: relativeTime(entry.at)
+                              })
+                            ]
+                          }),
+                          jsx('div', {
+                            className: 'text-xs text-(--ui-text-secondary) [&_p]:mb-1 [&_p:last-child]:mb-0',
+                            children: Streamdown ? jsx(Streamdown, { children: entry.text }) : entry.text
                           })
                         ]
-                      }),
-                      jsx('div', {
-                        className: 'text-xs text-(--ui-text-secondary) [&_p]:mb-1 [&_p:last-child]:mb-0',
-                        children: Streamdown ? jsx(Streamdown, { children: entry.text }) : entry.text
                       })
                     ]
-                  }, `${entry.at}:${index}`)
+                  }, entryKey)
                 })
               : [
                   jsx('div', {
@@ -7306,7 +7423,6 @@ function BotsPane() {
   const [deleting, setDeleting] = useState(null)
   const [grouping, setGrouping] = useState(null)
   const [query, setQuery] = useState('')
-  const hideBotChats = useValue($hideBotChats)
   const activityToasts = useValue($activityToasts)
   const sessionsWorkspaceName = useValue($botSessionsWorkspace)
   const groupChatName = useValue($groupChatWorkspace)
@@ -7422,16 +7538,6 @@ function BotsPane() {
                     'flex size-6 items-center justify-center rounded-md text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
                   onClick: () => setActivityToasts(!activityToasts),
                   children: jsx(Codicon, { name: activityToasts ? 'bell' : 'bell-slash' })
-                })
-              }),
-              jsx(Tip, {
-                label: hideBotChats ? 'Bot Chats hidden from Sessions — click to show' : 'Bot Chats shown in Sessions — click to hide',
-                children: jsx('button', {
-                  type: 'button',
-                  className:
-                    'flex size-6 items-center justify-center rounded-md text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
-                  onClick: () => void setHideBotChats(!hideBotChats),
-                  children: jsx(Codicon, { name: hideBotChats ? 'eye-closed' : 'eye' })
                 })
               }),
               jsxs(DropdownMenu, {
@@ -7792,18 +7898,9 @@ export default {
       /* no storage on this shell — defaults stay */
     }
 
-    // Hydrate the "hide Bot Chats from the sidebar" pref (default ON).
-    try {
-      Promise.resolve(ctx.storage?.get?.('hide-bot-chats'))
-        .then(value => {
-          if (typeof value === 'boolean') {
-            $hideBotChats.set(value)
-          }
-        })
-        .catch(() => undefined)
-    } catch {
-      /* no storage — default (hide) stays */
-    }
+    // Bot Mode sessions are always hidden now — the old "hide Bot Chats"
+    // pref is gone (its stored key is simply ignored). The reconciliation
+    // sweep below hides any rows born visible under the old pref.
 
     // Hydrate the activity-toast pref (default OFF).
     try {
@@ -7848,12 +7945,45 @@ export default {
     }
 
     // Routines follow the chat you're in: track the live gateway profile.
-    host.state.profile.listen(profile => {
+    // Capture the unbinds: without them a disable → re-enable cycle stacks a
+    // duplicate listener per cycle (same survives-disable class as the face
+    // clock before its onDispose hook — these kept firing until app restart).
+    const unbindProfileListener = host.state.profile.listen(profile => {
       if (profile && typeof profile === 'string') {
         $selectedBot.set(profile)
       }
     })
-    host.state.gateway.listen(handleSessionsGatewayTransition)
+    const unbindGatewayListener = host.state.gateway.listen(handleSessionsGatewayTransition)
+
+    if (typeof ctx.onDispose === 'function') {
+      ctx.onDispose(() => {
+        if (typeof unbindProfileListener === 'function') {
+          unbindProfileListener()
+        }
+        if (typeof unbindGatewayListener === 'function') {
+          unbindGatewayListener()
+        }
+      })
+    }
+
+    // Reconciliation sweep: hide every Bot Mode session we know about, on
+    // load and again on each reconnect (a swap can land on a gateway whose
+    // rows were created before the always-hidden policy). Deferred a tick so
+    // the meta/room storage hydrates above have landed; idempotent after that.
+    // (Feature-guarded: bare vm test harnesses have no setTimeout global.)
+    const scheduleHideSweep = () => {
+      try {
+        setTimeout(() => void hideOwnedBotSessions(), 0)
+      } catch {
+        void hideOwnedBotSessions()
+      }
+    }
+    host.state.gateway.listen(state => {
+      if (state === 'open') {
+        scheduleHideSweep()
+      }
+    })
+    scheduleHideSweep()
 
     ctx.register({
       id: 'pane',
