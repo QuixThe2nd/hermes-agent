@@ -761,6 +761,264 @@ class TestLifecycleGuardModule:
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("daily ops", str(script))
 
+    # -- Non-shell payload false-positive regressions ---------------------
+
+    def test_python_heredoc_proc_scan_not_blocked(self):
+        """A read-only ``python3 - <<'PY'`` heredoc whose body scans /proc
+        must not be blocked: the heredoc body is stdin data for python, not
+        shell, so its path tokens (``/proc`` — an existing DIRECTORY, which
+        the referenced-script reader fails closed on) must never be walked
+        as script references. Blocked a real process-tree inspection."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        command = (
+            "pstree -ap 1234 2>&1 || true\n"
+            "python3 - <<'PY'\n"
+            "import os\n"
+            "for e in os.scandir('/proc'):\n"
+            "    if e.name.isdigit():\n"
+            "        print(open(f'/proc/{e.name}/cmdline','rb').read())\n"
+            "PY\n"
+        )
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd="/tmp"
+        ) is False
+
+    def test_quoted_multiline_interpreter_payload_not_walked(self, tmp_path):
+        """A quoted multi-line ``python3 -c \"...\"`` payload is ONE argv word
+        to the shell. Splitting it on raw newlines exposed inner payload
+        lines as phantom commands; a path literal inside (here a real text
+        file containing a lifecycle-looking string) was then read and
+        regex-scanned as if it were a referenced script."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        bait = tmp_path / "notes.txt"
+        # Content that MUST trip the regex if it is ever scanned as a
+        # referenced script — proving the payload path is no longer walked.
+        bait.write_text("systemctl --user restart hermes-gateway\n", encoding="utf-8")
+        command = (
+            'python3 -c "\n'
+            "from pathlib import Path\n"
+            f"print(Path({str(bait)!r}).read_text())\n"
+            '"\n'
+        )
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd="/tmp"
+        ) is False
+
+    def test_non_shell_shebang_script_content_not_walked(self, tmp_path):
+        """A directly executed shim with a non-shell shebang
+        (``#!/usr/bin/env node``) is interpreted by node, never shell-parsed.
+        Walking its content as shell used to recurse into require() paths
+        until the depth cap failed closed (``npm uninstall -g`` was blocked).
+        The content is still regex-scanned for literal lifecycle commands."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        shim = tmp_path / "shim"
+        # A deep shell-looking reference chain no real shell would parse.
+        shim.write_text(
+            "#!/usr/bin/env node\n"
+            f"require('{tmp_path}/lib/a.js')\n",
+            encoding="utf-8",
+        )
+        lib = tmp_path / "lib"
+        lib.mkdir()
+        # Chain of .js files referencing each other deeper than the depth cap.
+        for i in range(12):
+            nxt = f"b{i + 1}.js"
+            (lib / ("a.js" if i == 0 else f"b{i}.js")).write_text(
+                f"require('./{nxt}');\n", encoding="utf-8"
+            )
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            f"{shim} uninstall -g somepkg", cwd="/tmp"
+        ) is False
+
+    def test_non_shell_shebang_script_with_lifecycle_literal_still_blocked(
+        self, tmp_path
+    ):
+        """Skipping the walk for non-shell content must NOT weaken the
+        guard: a lifecycle command embedded in a node/python script is still
+        caught by the direct regex on the content."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        shim = tmp_path / "evilshim"
+        shim.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "os.system('systemctl --user restart hermes-gateway')\n",
+            encoding="utf-8",
+        )
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            str(shim), cwd="/tmp"
+        ) is True
+
+    def test_shell_heredoc_body_still_walked(self, tmp_path):
+        """``bash <<EOF`` feeds its body to a shell: the body IS shell and
+        must still be scanned/walked. Only non-shell receivers are masked."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "bash <<'EOF'\nsystemctl --user restart hermes-gateway\nEOF\n",
+            cwd="/tmp",
+        ) is True
+
+    def test_heredoc_masking_does_not_hide_following_script_walk(self, tmp_path):
+        """A masked non-shell heredoc must not swallow later lines: a real
+        script reference AFTER the heredoc is still walked and blocked."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        evil = tmp_path / "evil.sh"
+        evil.write_text("hermes gateway stop\n", encoding="utf-8")
+        command = (
+            "python3 - <<'PY'\nprint('/proc self inspect')\nPY\n"
+            f"bash {evil}\n"
+        )
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd="/tmp"
+        ) is True
+
+    def test_cloud_backed_symlink_fails_closed_without_opening_target(
+        self, tmp_path, monkeypatch
+    ):
+        """A FileProvider placeholder must not block terminal preflight.
+
+        ``O_NONBLOCK`` has no effect on regular files.  On macOS, opening an
+        iCloud placeholder can therefore wait indefinitely for hydration,
+        before the terminal command's own timeout has even started.  Detect
+        the resolved FileProvider path from local metadata and fail closed
+        without opening it.
+        """
+        import cron.lifecycle_guard as lifecycle_guard
+
+        cloud_dir = (
+            tmp_path
+            / "Library"
+            / "Mobile Documents"
+            / "com~apple~CloudDocs"
+            / "scripts"
+        )
+        cloud_dir.mkdir(parents=True)
+        target = cloud_dir / "helper"
+        target.write_text("#!/bin/sh\necho safe\n", encoding="utf-8")
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        launcher = bin_dir / "helper"
+        launcher.symlink_to(target)
+
+        real_open = lifecycle_guard.os.open
+
+        def reject_cloud_open(path, flags, *args, **kwargs):
+            if str(path) == str(launcher):
+                pytest.fail("lifecycle guard opened a cloud-backed symlink")
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(lifecycle_guard.os, "open", reject_cloud_open)
+
+        assert lifecycle_guard.contains_gateway_lifecycle_command_or_referenced_script(
+            str(launcher)
+        ) is True
+
+    def test_third_party_cloudstorage_path_fails_closed_without_opening(
+        self, tmp_path, monkeypatch
+    ):
+        """~/Library/CloudStorage (Dropbox/OneDrive/Google Drive) is the same
+        FileProvider hazard as iCloud's Mobile Documents: an evicted
+        placeholder's open() can hang preflight. The guard must fail closed
+        on the lexical path without opening the file."""
+        import cron.lifecycle_guard as lifecycle_guard
+
+        cloud_dir = (
+            tmp_path
+            / "Library"
+            / "CloudStorage"
+            / "Dropbox-Personal"
+            / "scripts"
+        )
+        cloud_dir.mkdir(parents=True)
+        script = cloud_dir / "helper.sh"
+        script.write_text("#!/bin/sh\necho safe\n", encoding="utf-8")
+
+        real_open = lifecycle_guard.os.open
+
+        def reject_cloud_open(path, flags, *args, **kwargs):
+            if str(path) == str(script):
+                pytest.fail("lifecycle guard opened a CloudStorage path")
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(lifecycle_guard.os, "open", reject_cloud_open)
+
+        assert lifecycle_guard.contains_gateway_lifecycle_command_or_referenced_script(
+            str(script)
+        ) is True
+
+    def test_read_referenced_script_choke_point_refuses_cloud_paths(
+        self, tmp_path, monkeypatch
+    ):
+        """The cloud refusal lives in _read_referenced_script itself so EVERY
+        caller (terminal walk AND cron-script scan) is covered — not just the
+        walk-level short-circuit in _contains_unsafe_gateway_action."""
+        import cron.lifecycle_guard as lifecycle_guard
+
+        cloud_dir = tmp_path / "Library" / "CloudStorage" / "OneDrive" / "s"
+        cloud_dir.mkdir(parents=True)
+        script = cloud_dir / "job.sh"
+        script.write_text("#!/bin/sh\necho safe\n", encoding="utf-8")
+
+        def forbid_open(path, flags, *args, **kwargs):  # pragma: no cover
+            pytest.fail("choke point opened a cloud placeholder path")
+
+        monkeypatch.setattr(lifecycle_guard.os, "open", forbid_open)
+
+        text, unsafe = lifecycle_guard._read_referenced_script(script)
+        assert text is None
+        assert unsafe is True
+
+    def test_cron_script_scan_blocks_cloud_script_without_opening(
+        self, tmp_path, monkeypatch
+    ):
+        """The cron-script scan path (_read_script_for_scanning via
+        check_gateway_lifecycle) must also refuse a cloud-resident script
+        without opening it, and the surfaced reason must attribute the
+        refusal to the cloud-synced path — not to a lifecycle command."""
+        import cron.lifecycle_guard as lifecycle_guard
+        from cron.lifecycle_guard import (
+            GatewayLifecycleBlocked,
+            check_gateway_lifecycle,
+        )
+
+        cloud_dir = (
+            tmp_path
+            / "Library"
+            / "Mobile Documents"
+            / "com~apple~CloudDocs"
+            / "scripts"
+        )
+        cloud_dir.mkdir(parents=True)
+        script = cloud_dir / "nightly.sh"
+        script.write_text("#!/bin/sh\necho safe\n", encoding="utf-8")
+
+        real_open = lifecycle_guard.os.open
+
+        def reject_cloud_open(path, flags, *args, **kwargs):
+            if str(path) == str(script):
+                pytest.fail("cron-script scan opened a cloud-resident script")
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(lifecycle_guard.os, "open", reject_cloud_open)
+
+        with pytest.raises(GatewayLifecycleBlocked) as excinfo:
+            check_gateway_lifecycle("nightly job", str(script))
+        message = str(excinfo.value)
+        assert "cloud-synced" in message
+        assert "lifecycle command" not in message
+
     # -- Whole-class regression tests (tilllt's T1-T4 on PR #79454) --------
 
     def test_tilde_nul_candidate_does_not_crash_terminal_walk(self):

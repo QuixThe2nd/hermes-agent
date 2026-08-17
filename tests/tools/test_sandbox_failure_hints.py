@@ -16,11 +16,17 @@ class TestSandboxFailureHint:
         assert "read_file" in h and "terminal" in h
         assert "normal tool call" in h
 
-    def test_builtin_helper_import_redirects(self):
+    def test_helper_import_error_recommends_supported_import(self):
         err = "ImportError: cannot import name 'json_parse' from 'hermes_tools'"
         h = _sandbox_failure_hint(err)
-        assert "BUILT-IN" in h
-        assert "no import" in h.lower()
+        assert h is not None
+        assert "from hermes_tools import json_parse" in h
+
+    def test_helper_name_error_recommends_supported_import(self):
+        err = "NameError: name 'json_parse' is not defined"
+        h = _sandbox_failure_hint(err)
+        assert h is not None
+        assert "from hermes_tools import json_parse" in h
 
     def test_missing_third_party_module(self):
         err = "ModuleNotFoundError: No module named 'matplotlib'"

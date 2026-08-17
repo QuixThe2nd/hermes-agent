@@ -42,7 +42,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home
+from tools.environments.local import build_subprocess_env
 from tools.registry import registry
+
+# Process-group signalling is POSIX-only. On Windows we degrade to
+# proc.terminate()/proc.kill() (see _terminate_process), so keep the
+# killpg paths behind a capability flag and use a SIGKILL fallback that
+# exists at import time on every platform.
+_KILLPG_SUPPORTED = hasattr(os, "killpg")
+_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 logger = logging.getLogger(__name__)
 
@@ -177,26 +185,32 @@ def _check_interrupted() -> bool:
 
 
 def _signal_process_group(proc: subprocess.Popen, sig: signal.Signals) -> bool:
+    if not _KILLPG_SUPPORTED:
+        return False
     try:
-        os.killpg(os.getpgid(proc.pid), sig)
+        os.killpg(os.getpgid(proc.pid), sig)  # windows-footgun: ok — guarded by _KILLPG_SUPPORTED
         return True
     except (OSError, ProcessLookupError, AttributeError):
         return False
 
 
 def _signal_pgid(pgid: int, sig: signal.Signals) -> bool:
+    if not _KILLPG_SUPPORTED:
+        return False
     try:
-        os.killpg(pgid, sig)
+        os.killpg(pgid, sig)  # windows-footgun: ok — guarded by _KILLPG_SUPPORTED
         return True
     except (OSError, ProcessLookupError):
         return False
 
 
 def _wait_pgid_reap(pgid: int, timeout: float) -> None:
+    if not _KILLPG_SUPPORTED:
+        return
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            os.killpg(pgid, 0)
+            os.killpg(pgid, 0)  # windows-footgun: ok — guarded by _KILLPG_SUPPORTED
         except ProcessLookupError:
             return
         except OSError as exc:
@@ -225,9 +239,9 @@ def _terminate_process(proc: subprocess.Popen, pgid: Optional[int] = None) -> No
         pass
 
     if pgid is not None:
-        _signal_pgid(pgid, signal.SIGKILL)
+        _signal_pgid(pgid, _SIGKILL)
         _wait_pgid_reap(pgid, _TERMINATE_GRACE_SECONDS)
-    elif not _signal_process_group(proc, signal.SIGKILL):
+    elif not _signal_process_group(proc, _SIGKILL):
         try:
             proc.kill()
         except Exception:
@@ -265,7 +279,9 @@ def _run_and_stream(
     # sparse-env caller works, and prepend ~/.local/bin so binary resolution
     # stays consistent when PATH is minimal. NO credentials are injected here
     # — the wrapper pulls them from <HERMES_HOME>/.env at runtime.
-    env = os.environ.copy()
+    # scrub_secrets=False + inherit_profile_home=False preserves exact legacy
+    # os.environ.copy() behavior while routing through the single env factory.
+    env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
     if not env.get("HOME"):
         env["HOME"] = str(Path.home())
     local_bin = str(Path.home() / ".local" / "bin")

@@ -1288,11 +1288,19 @@ class HonchoSessionManager:
         search_query: str | None = None,
         *,
         target: str | None = None,
+        raise_errors: bool = False,
     ) -> dict[str, Any]:
         """Fetch representation + peer card directly from a peer object.
 
         Raises HonchoAuthError when auth is dead or a 401 survives the forced
         refresh; the non-auth fallback chain would just repeat the failure.
+
+        Args:
+            raise_errors: Re-raise a failure of the primary peer.context()
+                call instead of falling through to the enrichment fetches.
+                Enrichment failures stay swallowed: once the primary call has
+                answered, an empty snapshot is a genuine result, not a backend
+                error.
         """
         representation = ""
         card: list[str] = []
@@ -1319,6 +1327,8 @@ class HonchoSessionManager:
             raise
         except Exception as e:
             logger.debug("Direct peer.context() failed for '%s': %s", peer_id, e)
+            if raise_errors:
+                raise
 
         if not representation:
             try:
@@ -1332,6 +1342,9 @@ class HonchoSessionManager:
             except HonchoAuthError:
                 raise
             except Exception as e:
+                # Best-effort enrichment: the primary call already answered,
+                # so a failure here must not flip a genuine empty result
+                # into a backend error, even under raise_errors=True.
                 logger.debug("Direct peer.representation() failed for '%s': %s", peer_id, e)
 
         if not card:
@@ -1340,16 +1353,28 @@ class HonchoSessionManager:
             except HonchoAuthError:
                 raise
             except Exception as e:
+                # Same best-effort rule as the representation enrichment above.
                 logger.debug("Direct peer card fetch failed for '%s': %s", peer_id, e)
 
         return {"representation": representation, "card": card}
 
-    def get_session_context(self, session_key: str, peer: str = "user") -> dict[str, Any]:
+    def get_session_context(
+        self,
+        session_key: str,
+        peer: str = "user",
+        *,
+        raise_errors: bool = False,
+    ) -> dict[str, Any]:
         """Fetch full session context from Honcho including summary.
 
         Uses the session-level context() API which returns summary,
         peer_representation, peer_card, and messages.
         Raises HonchoAuthError so callers can tell rejected credentials from no context.
+
+        Args:
+            raise_errors: Re-raise backend failures instead of returning {}.
+                Explicit tool calls pass True so a timeout or server error
+                surfaces as an error, not as "no context".
         """
         session = self._cache.get(session_key)
         if not session:
@@ -1360,7 +1385,9 @@ class HonchoSessionManager:
             peer_id = self._resolve_peer_id(session, peer)
             if peer_id is None:
                 peer_id = session.user_peer_id
-            return self._fetch_peer_context(peer_id, target=peer_id)
+            return self._fetch_peer_context(
+                peer_id, target=peer_id, raise_errors=raise_errors
+            )
 
         try:
             observer_peer_id, target_peer_id = self._resolve_observer_target(session, peer)
@@ -1398,6 +1425,8 @@ class HonchoSessionManager:
             raise
         except Exception as e:
             logger.debug("Session context fetch failed: %s", e)
+            if raise_errors:
+                raise
             return {}
 
     def _resolve_peer_id(self, session: HonchoSession, peer: str | None) -> str:
@@ -1434,13 +1463,24 @@ class HonchoSessionManager:
 
         return target_peer_id, None
 
-    def get_peer_card(self, session_key: str, peer: str = "user") -> list[str]:
+    def get_peer_card(
+        self,
+        session_key: str,
+        peer: str = "user",
+        *,
+        raise_errors: bool = False,
+    ) -> list[str]:
         """
         Fetch a peer card — a curated list of key facts.
 
         Fast, no LLM reasoning. Returns raw structured facts Honcho has
         inferred about the target peer (name, role, preferences, patterns).
         Empty list if unavailable; raises HonchoAuthError on rejected credentials.
+
+        Args:
+            raise_errors: Re-raise backend failures instead of returning [].
+                Explicit tool calls pass True so a timeout or server error
+                surfaces as an error, not as "no profile facts".
         """
         session = self._cache.get(session_key)
         if not session:
@@ -1460,6 +1500,8 @@ class HonchoSessionManager:
             raise
         except Exception as e:
             logger.debug("Failed to fetch peer card from Honcho: %s", e)
+            if raise_errors:
+                raise
             return []
 
     def search_context(
@@ -1468,6 +1510,8 @@ class HonchoSessionManager:
         query: str,
         max_tokens: int = 800,
         peer: str = "user",
+        *,
+        raise_errors: bool = False,
     ) -> str:
         """
         Search raw messages across every session visible from the target
@@ -1480,6 +1524,9 @@ class HonchoSessionManager:
             max_tokens: Approximate budget for returned content. Snippets are
                 accumulated until this budget (≈4 chars/token) is exhausted.
             peer: Peer alias or explicit peer ID whose sessions to search.
+            raise_errors: Re-raise backend failures instead of returning "".
+                Explicit tool calls pass True so a timeout or server error
+                surfaces as an error, not as "no relevant context".
 
         Returns:
             Ranked message excerpts as a formatted string, or empty string
@@ -1530,6 +1577,8 @@ class HonchoSessionManager:
                 raise
             except Exception as e2:
                 logger.debug("Honcho peer search fallback also failed: %s", e2)
+                if raise_errors:
+                    raise
                 return ""
 
         if not messages:
@@ -1693,13 +1742,23 @@ class HonchoSessionManager:
             logger.debug("Honcho list_conclusions failed: %s", e)
             return []
 
-    def set_peer_card(self, session_key: str, card: list[str], peer: str = "user") -> list[str] | None:
+    def set_peer_card(
+        self,
+        session_key: str,
+        card: list[str],
+        peer: str = "user",
+        *,
+        raise_errors: bool = False,
+    ) -> list[str] | None:
         """Update a peer's card.
 
         Args:
             session_key: Session key for peer resolution.
             card: New peer card as list of fact strings.
             peer: Peer alias or explicit peer ID.
+            raise_errors: Re-raise backend failures instead of returning None.
+                Explicit tool calls pass True so a timeout or server error
+                surfaces as an error, not as a generic update failure.
 
         Returns:
             Updated card on success, None on failure.
@@ -1731,6 +1790,8 @@ class HonchoSessionManager:
             raise
         except Exception as e:
             logger.error("Failed to set peer card: %s", e)
+            if raise_errors:
+                raise
             return None
 
     def seed_ai_identity(self, session_key: str, content: str, source: str = "manual") -> bool:

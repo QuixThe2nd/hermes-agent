@@ -109,6 +109,32 @@ _MAX_REFERENCED_SCRIPT_BYTES = 1024 * 1024
 _MAX_REFERENCED_SCRIPT_DEPTH = 8
 _CONTROL_CHARS = frozenset(";&|()")
 
+
+# Directory names that sit directly under a `Library` path component and
+# mark a FileProvider-backed subtree: `Mobile Documents` is iCloud Drive;
+# `CloudStorage` hosts every third-party FileProvider domain (Dropbox,
+# OneDrive, Google Drive, Box, ...) on modern macOS.
+_CLOUD_PLACEHOLDER_MARKERS = frozenset({"Mobile Documents", "CloudStorage"})
+
+
+def _is_cloud_placeholder_path(path: Path) -> bool:
+    """Return True for paths inside a macOS FileProvider-backed subtree.
+
+    ``O_NONBLOCK`` does not make regular-file reads non-blocking.  Opening an
+    evicted FileProvider placeholder below ``~/Library/Mobile Documents``
+    (iCloud Drive) or ``~/Library/CloudStorage`` (Dropbox / OneDrive /
+    Google Drive and other third-party providers) can therefore wait
+    indefinitely for hydration.  The lifecycle guard runs before a terminal
+    command's timeout starts, so it must identify this boundary from path
+    metadata and fail closed without opening the file.
+    """
+    parts = path.parts
+    return any(
+        parts[index - 1] == "Library" and part in _CLOUD_PLACEHOLDER_MARKERS
+        for index, part in enumerate(parts)
+        if index
+    )
+
 # Executables whose arguments are DATA, not commands: search patterns, SQL
 # statements, log filters. None of these can execute their argument text, so
 # a lifecycle-shaped string inside their arguments (a grep pattern hunting
@@ -151,32 +177,94 @@ _BINARY_SNIFF_BYTES = 4096
 _ReadRemoteScriptFn = Callable[[str], Optional[str]]
 
 
+def _split_shell_logical_lines(text: str) -> list[str]:
+    """Split on newlines that sit OUTSIDE shell quotes.
+
+    A quoted payload may itself contain newlines
+    (``python3 -c "line1\\nline2"`` is a single argv word to the shell).
+    Splitting such text on raw newlines exposes the payload's inner lines
+    as phantom commands whose path-looking tokens were then walked as
+    referenced scripts and could fail closed on unrelated filesystem
+    entries — e.g. a ``/proc`` literal inside a Python process scan
+    blocked the whole read-only command. Quote-aware splitting keeps each
+    quoted payload on one logical line, matching what the shell parses.
+    """
+    lines: list[str] = []
+    buf: list[str] = []
+    quote: Optional[str] = None
+    escaped = False
+    for ch in text:
+        if escaped:
+            buf.append(ch)
+            escaped = False
+            continue
+        if ch == "\\" and quote != "'":
+            buf.append(ch)
+            escaped = True
+            continue
+        if quote is not None:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            continue
+        if ch == "\n":
+            lines.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    if buf:
+        lines.append("".join(buf))
+    return lines
+
+
+def _tokenize_segment_line(line: str) -> Optional[list[str]]:
+    try:
+        lexer = shlex.shlex(
+            line,
+            posix=True,
+            punctuation_chars=";&|()",
+        )
+        lexer.whitespace_split = True
+        lexer.commenters = "#"
+        return list(lexer)
+    except ValueError:
+        return None
+
+
 def _iter_command_segments(command: str) -> Iterator[list[str]]:
     """Yield shell-tokenized command segments, honoring quotes and comments."""
     normalized = command.replace("\\\n", "")
-    for line in normalized.splitlines() or [normalized]:
-        try:
-            lexer = shlex.shlex(
-                line,
-                posix=True,
-                punctuation_chars=";&|()",
-            )
-            lexer.whitespace_split = True
-            lexer.commenters = "#"
-            tokens = list(lexer)
-        except ValueError:
+    for line in _split_shell_logical_lines(normalized):
+        tokens = _tokenize_segment_line(line)
+        if tokens is None and "\n" in line:
+            # Unbalanced quote spanning lines: fall back to scanning each
+            # raw physical line (the pre-quote-aware behavior) so malformed
+            # input keeps a best-effort walk instead of none at all.
+            for fragment in line.splitlines():
+                fragment_tokens = _tokenize_segment_line(fragment)
+                if fragment_tokens is not None:
+                    yield from _segments_from_tokens(fragment_tokens)
             continue
+        if tokens is None:
+            continue
+        yield from _segments_from_tokens(tokens)
 
-        segment: list[str] = []
-        for token in tokens:
-            if token and set(token) <= _CONTROL_CHARS:
-                if segment:
-                    yield segment
-                    segment = []
-                continue
-            segment.append(token)
-        if segment:
-            yield segment
+
+def _segments_from_tokens(tokens: list[str]) -> Iterator[list[str]]:
+    segment: list[str] = []
+    for token in tokens:
+        if token and set(token) <= _CONTROL_CHARS:
+            if segment:
+                yield segment
+                segment = []
+            continue
+        segment.append(token)
+    if segment:
+        yield segment
 
 
 def _command_token_index(segment: list[str]) -> Optional[int]:
@@ -414,6 +502,93 @@ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
                 break
 
 
+# Heredoc opener: `<<DELIM`, `<<-DELIM`, `<<'DELIM'`, `<<"DELIM"` (quotes
+# already stripped by shlex). `<<<` (herestring) carries its data inline on
+# the same line and has no body, so it must not match.
+_HEREDOC_OPEN = re.compile(r"<<-?([A-Za-z_][A-Za-z0-9_]*)$")
+
+
+def _mask_non_shell_heredoc_bodies(text: str) -> str:
+    """Drop heredoc bodies whose receiving command is not a POSIX shell.
+
+    A heredoc body is stdin data for the receiving command. It is parsed as
+    shell commands only when the receiver itself is a shell
+    (``bash <<EOF``). For any other receiver (``python3 - <<'PY'``, node,
+    or an unknown executable) the body is opaque payload text: walking its
+    path-looking tokens as referenced shell scripts false-positive-blocked
+    read-only commands whose Python payload merely mentioned paths such as
+    ``/proc``. The lifecycle REGEX still scans the full unmasked text, so a
+    literal ``systemctl restart hermes-gateway`` inside any heredoc stays
+    blocked; only the filesystem walk is masked.
+
+    Quoted ``<<EOF`` text on a line (e.g. ``echo "<<EOF"``) is
+    indistinguishable from a real opener after shlex quote removal; such a
+    line masks subsequent lines from the WALK only, never from the regex —
+    a deliberate fail-open direction for the walk, which is the
+    defense-in-depth layer.
+    """
+    if "<<" not in text:
+        return text
+    lines = text.split("\n")
+    out: list[str] = []
+    # Queue of (delimiter, mask?) pending heredoc bodies, in opener order.
+    pending: list[tuple[str, bool]] = []
+    for line in lines:
+        if pending:
+            delim, mask = pending[0]
+            if line.strip("\t") == delim:
+                pending.pop(0)
+            if not mask:
+                out.append(line)
+            continue
+        out.append(line)
+        for segment in _iter_command_segments(line):
+            index = _command_token_index(segment)
+            receiver = (
+                Path(segment[index]).name if index is not None else ""
+            )
+            is_shell_receiver = receiver in _SHELL_EXECUTABLES
+            tokens = segment if index is None else segment[index:]
+            for pos, token in enumerate(tokens):
+                match = _HEREDOC_OPEN.match(token)
+                if match:
+                    pending.append((match.group(1), not is_shell_receiver))
+                elif token in {"<<", "<<-"} and pos + 1 < len(tokens):
+                    pending.append((tokens[pos + 1], not is_shell_receiver))
+    return "\n".join(out)
+
+
+def _is_shell_parsed_script(text: str) -> bool:
+    """True when executing this file parses its content as POSIX shell.
+
+    A shebang naming a non-shell interpreter (python/node/ruby/...) means
+    the kernel hands the file to that interpreter and the content is never
+    shell-parsed, so walking its tokens as shell script references is a
+    false-positive generator — a directly executed npm/node shim had its
+    require() graph walked as shell until the recursion failed closed.
+    #77131 established the same rule for cron ``.py`` scripts: regex-scan
+    the content, skip the walk. No shebang (or an unparseable one) keeps
+    full shell treatment because shells re-parse such files after
+    execve(ENOEXEC).
+    """
+    if not text.startswith("#!"):
+        return True
+    first = text.split("\n", 1)[0]
+    words = first[2:].strip().split()
+    if not words:
+        return True
+    interpreter = Path(words[0]).name
+    if interpreter == "env":
+        for word in words[1:]:
+            if word.startswith("-"):
+                continue  # -S and other env flags precede the interpreter
+            interpreter = Path(word).name
+            break
+        else:
+            return True
+    return interpreter in _SHELL_EXECUTABLES
+
+
 def _resolve_script_directory(script_path: str) -> Optional[str]:
     """Return the directory *script_path* resolves to, handling relative names."""
     try:
@@ -426,7 +601,28 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
 
 
 def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
-    """Return ``(text, unsafe)`` using bounded, regular-file-only reads."""
+    """Return ``(text, unsafe)`` using bounded, regular-file-only reads.
+
+    This is the shared choke point for every local script read the guard
+    performs (the terminal walk in ``_contains_unsafe_gateway_action`` AND
+    the cron-script scan in ``_read_script_for_scanning``), so the
+    cloud-placeholder refusal lives here: a FileProvider path must never be
+    opened — not even to discover whether the file is hydrated — because an
+    evicted placeholder's ``open()`` can hang preflight indefinitely
+    (#88052). The lexical check covers direct cloud paths; the resolved
+    check covers local launchers that are symlinks into a cloud subtree.
+    """
+    if _is_cloud_placeholder_path(path):
+        return None, True
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, ValueError):
+        # OSError: unreadable/long paths. ValueError: embedded NUL byte
+        # from a binary's decoded contents tokenized as a path — a
+        # guarded path must never crash the guard (#76762).
+        resolved = path
+    if _is_cloud_placeholder_path(resolved):
+        return None, True
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
@@ -521,7 +717,14 @@ def _contains_unsafe_gateway_action(
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return True
 
-    for payload in _iter_shell_command_payloads(command):
+    # The walk below treats text as shell. Heredoc bodies feeding a
+    # non-shell command are opaque payload data, not shell — mask them so
+    # their path-looking tokens are never walked as referenced scripts.
+    # The direct scan above already ran on the FULL text, so masking here
+    # cannot hide a literal lifecycle command.
+    walk_text = _mask_non_shell_heredoc_bodies(command)
+
+    for payload in _iter_shell_command_payloads(walk_text):
         if _contains_unsafe_gateway_action(
             payload,
             cwd=cwd,
@@ -531,7 +734,15 @@ def _contains_unsafe_gateway_action(
         ):
             return True
 
-    for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
+    for script_path in _iter_referenced_shell_scripts(walk_text, cwd=cwd):
+        # Do not touch a FileProvider path even to discover whether the file
+        # is hydrated. The lexical check covers direct cloud paths; the
+        # resolved check below covers local launchers that are symlinks into
+        # a cloud subtree. _read_referenced_script repeats both checks as the
+        # shared choke point, so every caller stays covered even if this
+        # walk-level short-circuit is bypassed.
+        if _is_cloud_placeholder_path(script_path):
+            return True
         try:
             resolved = script_path.resolve(strict=False)
         except (OSError, ValueError):
@@ -539,6 +750,8 @@ def _contains_unsafe_gateway_action(
             # from a binary's decoded contents tokenized as a path — a
             # guarded path must never crash the guard (#76762).
             resolved = script_path
+        if _is_cloud_placeholder_path(resolved):
+            return True
         if resolved in visited:
             continue
         visited.add(resolved)
@@ -556,6 +769,13 @@ def _contains_unsafe_gateway_action(
             if unsafe:
                 return True
         if not script_text:
+            continue
+        if not _is_shell_parsed_script(script_text):
+            # Content interpreted by python/node/etc. is never shell-parsed;
+            # regex-scan it (catches an embedded literal lifecycle command)
+            # but never walk its tokens as shell script references.
+            if _direct_lifecycle_scan(script_text):
+                return True
             continue
         # Relative references inside a script resolve against that script's
         # directory, not the original command's cwd.
@@ -689,6 +909,29 @@ def check_gateway_lifecycle(
     python_script = False
     if script:
         resolved_script = _resolve_script_path(script)
+        if resolved_script is not None:
+            try:
+                real_script = resolved_script.resolve(strict=False)
+            except (OSError, ValueError):
+                real_script = resolved_script
+            if _is_cloud_placeholder_path(resolved_script) or _is_cloud_placeholder_path(
+                real_script
+            ):
+                # Attribute the refusal correctly: the script is not known to
+                # contain a lifecycle command — it lives on a cloud-synced
+                # FileProvider path (iCloud Drive / ~/Library/CloudStorage)
+                # that the guard refuses to open because an evicted
+                # placeholder can hang preflight indefinitely (#88052).
+                # Fail closed with the real reason instead of implying a
+                # dangerous lifecycle command.
+                raise GatewayLifecycleBlocked(
+                    "Blocked: the cron script lives on a cloud-synced path "
+                    "(iCloud Drive / ~/Library/CloudStorage). Opening an "
+                    "evicted FileProvider placeholder can hang the guard's "
+                    "preflight scan indefinitely, so it is refused without "
+                    "being read. Move the script to a local, non-cloud path "
+                    "(e.g. ~/.hermes/scripts/) and recreate the job."
+                )
         python_script = resolved_script is not None and resolved_script.suffix == ".py"
         script_text = _read_script_for_scanning(script)
         if script_text:

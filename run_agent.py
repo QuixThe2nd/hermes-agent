@@ -3571,9 +3571,19 @@ class AIAgent:
             return
         landed = file_mutation_result_landed(tool_name, result)
         if landed:
+            landed_paths = _extract_landed_file_mutation_paths(tool_name, args, result)
             changed = getattr(self, "_turn_file_mutation_paths", None)
             if changed is not None:
-                changed.update(_extract_landed_file_mutation_paths(tool_name, args, result))
+                changed.update(landed_paths)
+            # Feed the checkpoint agent-write ledger so /rollback's safe mode
+            # can tell Hermes-authored content from later user hand-edits.
+            mgr = getattr(self, "_checkpoint_mgr", None)
+            if mgr is not None and getattr(mgr, "enabled", False):
+                for _p in landed_paths:
+                    try:
+                        mgr.record_agent_write(_p)
+                    except Exception:
+                        pass
         if is_error and not landed:
             preview = _extract_error_preview(result)
             for path in targets:
@@ -8726,6 +8736,19 @@ class AIAgent:
             if task_started:
                 task_finished = True
                 finish_task_run(**task_context, result=result)
+            # Footer timing breakdown: early-exit paths (max-iteration,
+            # guardrail halt) return a result dict without api_time/tool_time.
+            # Copy the per-turn accumulators so the gateway footer always
+            # surfaces real values regardless of which return path executed.
+            # setdefault: values already set by finalize_turn win. Only inject
+            # when real time was measured — zero-valued additions would break
+            # the legacy result shape for callers that never timed anything.
+            if isinstance(result, dict):
+                _api_t = getattr(self, "_turn_api_time", 0.0) or 0.0
+                _tool_t = getattr(self, "_turn_tool_time", 0.0) or 0.0
+                if _api_t or _tool_t:
+                    result.setdefault("api_time", _api_t)
+                    result.setdefault("tool_time", _tool_t)
             return result
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, InterruptedError)) or (

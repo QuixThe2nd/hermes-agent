@@ -65,6 +65,29 @@ from tools.computer_use.browser_route import CuaTypedBrowserRoute
 
 logger = logging.getLogger(__name__)
 
+_MISSING = object()
+
+
+def _mcp_field(obj, snake: str, camel: str, default=None):
+    """Read an MCP model field across the 1.x -> 2.x field rename.
+
+    mcp 2.0 renamed model fields to snake_case, keeping camelCase only as a
+    serialization alias that pydantic does not expose to attribute access. A
+    plain ``getattr(result, "isError", False)`` therefore reads False for
+    *every* result on 2.x — a denied or failed cua-driver call would be
+    treated as a success. Reading both spellings keeps this correct on either
+    SDK generation.
+
+    Deliberately duplicated from ``tools.mcp_tool.mcp_field`` rather than
+    imported: computer_use talks to cua-driver over its own stdio client and
+    does not otherwise load the (much larger) config-driven MCP client module.
+    """
+    value = getattr(obj, snake, _MISSING)
+    if value is not _MISSING:
+        return value
+    value = getattr(obj, camel, _MISSING)
+    return default if value is _MISSING else value
+
 
 def _action_result_from(
     name: str,
@@ -1191,6 +1214,52 @@ def cua_driver_update_nudge() -> Optional[str]:
 
 _update_checked = False
 
+# One auto-repair attempt per process. The runtime-contract gate in
+# ``CuaDriverBackend.start()`` fails closed on an incompatible driver; when
+# the incompatibility is something a reinstall fixes (old version, missing
+# manifest verbs) we run the standard install/repair path once instead of
+# telling the user to do it by hand. Guarded so a failing installer can't
+# loop — the second start() in the same process goes straight to the error.
+_contract_repair_attempted = False
+
+
+def _maybe_repair_runtime_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """Try one automatic driver repair for a failed runtime contract.
+
+    Returns the post-repair contract state (or the original state when no
+    repair was attempted / the repair failed). Never raises. An explicit
+    ``HERMES_CUA_DRIVER_CMD`` override is authoritative even when broken, and
+    a missing binary means installation was never requested — both are left
+    for the caller's error message.
+    """
+    global _contract_repair_attempted
+    if contract.get("ready"):
+        return contract
+    if _contract_repair_attempted:
+        return contract
+    if os.environ.get(_CUA_DRIVER_CMD_ENV, "").strip():
+        return contract
+    if not contract.get("binary"):
+        return contract
+    _contract_repair_attempted = True
+    logger.info(
+        "computer_use: installed cua-driver is not usable (%s); "
+        "attempting automatic repair",
+        contract.get("reason") or "runtime contract is incomplete",
+    )
+    try:
+        from hermes_cli.tools_config import install_cua_driver
+
+        if not install_cua_driver(upgrade=False, show_installer_progress=False):
+            return contract
+    except Exception as exc:
+        logger.warning("computer_use: automatic cua-driver repair failed: %s", exc)
+        return contract
+    try:
+        return cua_driver_runtime_contract_status()
+    except Exception:
+        return contract
+
 
 def _maybe_nudge_update() -> None:
     """Emit an update nudge at most once per process, off-thread so the
@@ -1626,7 +1695,7 @@ class _CuaDriverSession:
                     }
                 else:
                     self._capabilities[tool_name] = set()
-                schema = getattr(tool, "inputSchema", None)
+                schema = _mcp_field(tool, "input_schema", "inputSchema")
                 if schema is None:
                     schema = (getattr(tool, "model_extra", None) or {}).get(
                         "inputSchema"
@@ -1939,7 +2008,7 @@ class _CuaDriverSession:
         On macOS the ``cua-driver mcp`` bridge forwards calls to the CuaDriver
         daemon over a non-blocking unix socket. Heavier ops (notably
         ``get_window_state``, which walks the AX tree and captures a PNG) can
-        come back as an ``McpError`` carrying ``Resource temporarily
+        come back as an ``MCPError`` carrying ``Resource temporarily
         unavailable (os error 35)`` — POSIX EAGAIN — when the socket buffer is
         momentarily full. This is transient by definition: the same call
         succeeds when retried after a short pause (which is why spaced-out
@@ -2250,8 +2319,10 @@ def _extract_tool_result(mcp_result: Any) -> Dict[str, Any]:
     image_mime_types: List[str] = []
     # Use identity, not truthiness: unittest mocks and proxy objects commonly
     # synthesize truthy attributes that were never present in the real result.
-    is_error = getattr(mcp_result, "isError", False) is True
-    structured: Optional[Dict] = getattr(mcp_result, "structuredContent", None) or None
+    is_error = _mcp_field(mcp_result, "is_error", "isError", False) is True
+    structured: Optional[Dict] = (
+        _mcp_field(mcp_result, "structured_content", "structuredContent") or None
+    )
     text_chunks: List[str] = []
     for part in getattr(mcp_result, "content", []) or []:
         ptype = getattr(part, "type", None)
@@ -2261,7 +2332,7 @@ def _extract_tool_result(mcp_result: Any) -> Dict[str, Any]:
             b64 = getattr(part, "data", None)
             if b64:
                 images.append(b64)
-                mime = getattr(part, "mimeType", None) or ""
+                mime = _mcp_field(part, "mime_type", "mimeType") or ""
                 image_mime_types.append(mime)
     if text_chunks:
         joined = "\n".join(t for t in text_chunks if t)
@@ -2526,6 +2597,11 @@ class CuaDriverBackend(ComputerUseBackend):
     # ── Lifecycle ──────────────────────────────────────────────────
     def start(self) -> None:
         contract = cua_driver_runtime_contract_status()
+        if not contract.get("ready"):
+            # An installed-but-incompatible driver (e.g. predating a Hermes
+            # version-floor bump) is a state we created — repair it once
+            # automatically instead of failing every computer_use call.
+            contract = _maybe_repair_runtime_contract(contract)
         if not contract.get("ready"):
             reason = contract.get("reason") or "runtime contract is incomplete"
             if os.environ.get(_CUA_DRIVER_CMD_ENV, "").strip():
@@ -3027,7 +3103,7 @@ class CuaDriverBackend(ComputerUseBackend):
             # 0x0 capture. Detect "no screenshot AND no parseable tree" and
             # force a one-shot CLI-transport re-fetch, which talks to the daemon
             # over a different socket and returns the full result. This is
-            # distinct from the EAGAIN McpError path (handled in call_tool);
+            # distinct from the EAGAIN MCPError path (handled in call_tool);
             # here the MCP call "succeeded" but gave us nothing usable.
             def _gws_is_empty(out: Dict[str, Any]) -> bool:
                 if out.get("images"):
