@@ -26,7 +26,7 @@ function runtime() {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__mergeMultiSourceRoster = mergeMultiSourceRoster;\nglobalThis.__botHandle = botHandle;\nglobalThis.__filterBots = filterBots;'
+      '\nglobalThis.__mergeMultiSourceRoster = mergeMultiSourceRoster;\nglobalThis.__botHandle = botHandle;\nglobalThis.__filterBots = filterBots;\nglobalThis.__botRowKey = botRowKey;'
     )
   vm.runInNewContext(code, context)
   return context
@@ -61,7 +61,13 @@ test('merge: local rows are annotated, remote rows appended with source tags', (
         profile: 'research',
         handle: 'research-homelab'
       },
-      { connectionId: 'homelab', connectionKind: 'remote', connectionLabel: 'Homelab', profile: 'coder', handle: 'coder' }
+      {
+        connectionId: 'homelab',
+        connectionKind: 'remote',
+        connectionLabel: 'Homelab',
+        profile: 'coder',
+        handle: 'coder'
+      }
     ]
   }
 
@@ -89,13 +95,56 @@ test('merge: union-only local profiles are NOT invented as thin rows', () => {
   const local = { profiles: [{ name: 'default' }] }
   const union = {
     agents: [
-      { connectionId: 'local', connectionKind: 'local', connectionLabel: 'This device', profile: 'ghost', handle: 'ghost' }
+      {
+        connectionId: 'local',
+        connectionKind: 'local',
+        connectionLabel: 'This device',
+        profile: 'ghost',
+        handle: 'ghost'
+      }
     ]
   }
 
   const out = merge(local, union)
   assert.equal(out.profiles.length, 1)
   assert.equal(out.profiles[0].name, 'default')
+})
+
+test('merge: duplicate source and local identities render once', () => {
+  const { __mergeMultiSourceRoster: merge } = runtime()
+  const local = {
+    profiles: [
+      { name: 'default', last_session: { id: 'newest' } },
+      { name: 'default', last_session: { id: 'stale' } }
+    ]
+  }
+  const union = {
+    agents: [
+      { connectionId: 'local', connectionKind: 'local', profile: 'default', handle: 'default-this-device' },
+      { connectionId: 'local', connectionKind: 'local', profile: 'default', handle: 'default-this-device' },
+      {
+        connectionId: 'homelab',
+        connectionKind: 'remote',
+        connectionLabel: 'Homelab',
+        profile: 'default',
+        handle: 'default-homelab'
+      },
+      {
+        connectionId: 'homelab',
+        connectionKind: 'remote',
+        connectionLabel: 'Homelab',
+        profile: 'default',
+        handle: 'default-homelab'
+      }
+    ]
+  }
+
+  const out = merge(local, union)
+
+  assert.equal(out.profiles.length, 2)
+  assert.equal(out.profiles[0].last_session.id, 'newest')
+  assert.equal(out.profiles[0].handle, 'default-this-device')
+  assert.equal(out.profiles[1].connectionId, 'homelab')
 })
 
 test('botHandle: precomputed multi-source handle wins; default stays hermes', () => {
@@ -125,4 +174,102 @@ test('filterBots: matches the source device name for remote rows', () => {
 
   // Bare profile search keeps matching both rows.
   assert.equal(filterBots(roster, {}, 'research').length, 2)
+})
+
+test('merge: active-gateway union agents annotate local rows, not duplicates (remote-primary desktop)', () => {
+  const { __mergeMultiSourceRoster: merge } = runtime()
+  const local = {
+    profiles: [
+      { name: 'default', last_session: { id: 's-default' } },
+      { name: 'dev', last_session: { id: 's-dev' } }
+    ]
+  }
+  const union = {
+    primaryConnectionId: '10-244-108-128-9119',
+    agents: [
+      // The ACTIVE remote gateway itself — same identities as local, must
+      // annotate in place rather than append phantom duplicates (#88344).
+      { connectionId: '10-244-108-128-9119', connectionKind: 'remote', connectionLabel: '10.244.108.128:9119', profile: 'default', handle: 'default-10-244-108-128-9119' },
+      { connectionId: '10-244-108-128-9119', connectionKind: 'remote', connectionLabel: '10.244.108.128:9119', profile: 'dev', handle: 'dev' },
+      // A genuinely separate source with a same-named profile keeps its own row.
+      { connectionId: 'local', connectionKind: 'local', connectionLabel: 'This device', profile: 'default', handle: 'default-this-device' },
+      { connectionId: 'local', connectionKind: 'local', connectionLabel: 'This device', profile: 'agent-mentor', handle: 'agent-mentor' }
+    ]
+  }
+
+  const out = merge(local, union)
+  // 2 annotated local rows + 2 other-source rows = 4, NOT 6 (no phantom copies).
+  assert.equal(out.profiles.length, 4)
+
+  const defaultRow = out.profiles.find(p => p.name === 'default' && !p.remoteSource)
+  // Annotated with the ACTIVE gateway's handle; rich fields survive.
+  assert.equal(defaultRow.last_session.id, 's-default')
+  assert.equal(defaultRow.handle, 'default-10-244-108-128-9119')
+
+  // The same-named profile on the local device stays a separate tagged row.
+  const localDefault = out.profiles.find(p => p.name === 'default' && p.remoteSource)
+  assert.equal(localDefault.handle, 'default-this-device')
+  assert.equal(localDefault.connectionId, 'local')
+
+  const mentor = out.profiles.find(p => p.name === 'agent-mentor')
+  assert.equal(mentor.remoteSource, true)
+
+  // Exactly the two other-source rows are tagged remote; none from the active gateway.
+  assert.equal(out.profiles.filter(p => p.remoteSource).length, 2)
+})
+
+test('merge: primary-local desktop keeps single-source behavior (no phantom rows)', () => {
+  const { __mergeMultiSourceRoster: merge } = runtime()
+  const local = { profiles: [{ name: 'default' }, { name: 'dev' }] }
+  const union = {
+    primaryConnectionId: 'local',
+    agents: [
+      { connectionId: 'local', connectionKind: 'local', connectionLabel: 'This device', profile: 'default', handle: 'default-this-device' },
+      { connectionId: 'local', connectionKind: 'local', connectionLabel: 'This device', profile: 'dev', handle: 'dev' }
+    ]
+  }
+
+  const out = merge(local, union)
+  assert.equal(out.profiles.length, 2)
+  assert.equal(out.profiles.filter(p => p.remoteSource).length, 0)
+  assert.equal(out.profiles[0].handle, 'default-this-device')
+})
+
+// The LIVE-active-id override: after the user activates a non-primary
+// source's agent, profiles.list answers from THAT source — the merge must
+// classify against the live id, not the registry primary, or the active
+// source's agents duplicate all over again.
+test('merge: live active id beats primaryConnectionId for active-source matching', () => {
+  const { __mergeMultiSourceRoster: merge } = runtime()
+  const local = { profiles: [{ name: 'default', last_session: { id: 's1' } }] }
+  const union = {
+    primaryConnectionId: 'local',
+    agents: [
+      { connectionId: 'local', connectionKind: 'local', connectionLabel: 'This device', profile: 'default', handle: 'default-this-device' },
+      { connectionId: 'vps', connectionKind: 'remote', connectionLabel: 'VPS', profile: 'default', handle: 'default-vps' }
+    ]
+  }
+
+  // Live gateway = vps: its union row annotates the rich row; the primary
+  // (local) row appends as the genuinely-other source.
+  const out = merge(local, union, 'vps')
+  assert.equal(out.profiles.length, 2)
+
+  const rich = out.profiles.find(p => p.last_session)
+  assert.equal(rich.handle, 'default-vps')
+  assert.equal(out.profiles.filter(p => p.remoteSource).length, 1)
+  assert.equal(out.profiles.find(p => p.remoteSource).connectionId, 'local')
+})
+
+test('botRowKey: same name on two sources yields distinct keys; local rows stay stable', () => {
+  const { __botRowKey: botRowKey } = runtime()
+
+  const localRow = botRowKey({ name: 'default' })
+  const remoteRow = botRowKey({ name: 'default', remoteSource: true, connectionId: 'homelab' })
+
+  assert.notEqual(localRow, remoteRow)
+  // Annotated ACTIVE-source rows (connectionId set, no remoteSource) keep the
+  // plain key — annotation must not remount every row on desktops that gain
+  // the union roster mid-session.
+  assert.equal(botRowKey({ name: 'default', connectionId: 'vps' }), localRow)
 })

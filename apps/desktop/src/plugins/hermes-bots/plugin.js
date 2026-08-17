@@ -2055,7 +2055,7 @@ function useRoster() {
       if (typeof host.agents === 'function') {
         try {
           const union = await host.agents()
-          return mergeMultiSourceRoster(local, union)
+          return mergeMultiSourceRoster(local, union, liveActiveConnectionId())
         } catch {
           /* older build or roster failure — single-source list stands */
         }
@@ -2072,25 +2072,82 @@ function useRoster() {
   })
 }
 
+/** Registry connection id of the LIVE active gateway (feature-detected;
+ *  null on older desktops or the local/legacy primary path). Live beats the
+ *  roster's primaryConnectionId when the user has activated a non-primary
+ *  source's agent — profiles.list answers from THAT source, so the merge
+ *  must classify against it, not the registry's primary. */
+function liveActiveConnectionId() {
+  if (typeof host.activeConnectionId !== 'function') {
+    return null
+  }
+
+  try {
+    return host.activeConnectionId()
+  } catch {
+    return null
+  }
+}
+
 /** Merge the union agent roster (host.agents) over the active gateway's
- *  profiles.list. Local-source rows are matched by profile name and only
- *  ANNOTATED (handle, connectionId) — their rich fields stay authoritative.
- *  Rows from other sources become new roster entries tagged with their
- *  source label so BotRow can badge them and route open/warm through
+ *  profiles.list. Rows from the ACTIVE gateway are matched by connection id
+ *  and only ANNOTATED (handle, connectionId) — their rich fields stay
+ *  authoritative and they are NOT duplicated. The active id prefers the LIVE
+ *  host.activeConnectionId() (the gateway may be a non-primary source after
+ *  the user opens another connection's agent), falls back to the roster's
+ *  primaryConnectionId, then to the legacy kind==='local' rule on older
+ *  desktops. Rows from other sources become new roster entries tagged with
+ *  their source label so BotRow can badge them and route open/warm through
  *  ensureAgent/warmAgent. Pure — exercised directly by the tests. */
-function mergeMultiSourceRoster(local, union) {
-  const profiles = Array.isArray(local?.profiles) ? local.profiles.slice() : []
+function mergeMultiSourceRoster(local, union, liveActiveId = null) {
+  // Keep the first rich local row for every profile. profiles.list is normally
+  // unique, but a duplicated backend response must not turn one agent into an
+  // unbounded list of visually identical Bots rows.
+  const profiles = []
+  const localByName = new Map()
+
+  for (const profile of Array.isArray(local?.profiles) ? local.profiles : []) {
+    const name = String(profile?.name || '').trim()
+
+    if (!name || localByName.has(name)) {
+      continue
+    }
+
+    localByName.set(name, profile)
+    profiles.push(profile)
+  }
+
   const agents = Array.isArray(union?.agents) ? union.agents : []
+  const primaryId = String(liveActiveId || union?.primaryConnectionId || '').trim()
 
   if (!agents.length) {
     return { ...local, profiles }
   }
 
-  const localByName = new Map(profiles.map(p => [p.name, p]))
+  // host.agents is an Electron/main-process capability. Defend the plugin
+  // boundary too: older shells or reconnect races can still hand us repeated
+  // identities even after the core roster deduplicates them.
+  const seenAgentIdentities = new Set()
 
   for (const agent of agents) {
-    const isLocalSource = agent.connectionKind === 'local'
-    const row = isLocalSource ? localByName.get(agent.profile) : null
+    const profile = String(agent?.profile || '').trim()
+    const connectionId = String(agent?.connectionId || '').trim()
+    const identity = `${connectionId}\0${profile}`
+
+    if (!profile || seenAgentIdentities.has(identity)) {
+      continue
+    }
+
+    seenAgentIdentities.add(identity)
+
+    // The union enumerates EVERY registered connection, including the active
+    // gateway that already answered profiles.list. Without this the active
+    // gateway's own agents (connectionKind 'remote' on a remote-primary
+    // desktop) would be appended as phantom duplicates — every bot listed
+    // twice. Older Electron builds predate primaryConnectionId; fall back to
+    // the legacy local-source rule so single-source behavior stays intact.
+    const isPrimarySource = primaryId ? connectionId === primaryId : agent.connectionKind === 'local'
+    const row = isPrimarySource ? localByName.get(profile) : null
 
     if (row) {
       // Annotate in place: the @name-device handle only differs from the
@@ -2100,16 +2157,16 @@ function mergeMultiSourceRoster(local, union) {
       continue
     }
 
-    if (isLocalSource) {
-      // Union saw a local profile profiles.list didn't return (older
-      // backend mid-refresh) — skip rather than invent a thin row.
+    if (isPrimarySource) {
+      // Union saw a primary-source profile profiles.list didn't return
+      // (older backend mid-refresh) — skip rather than invent a thin row.
       continue
     }
 
     profiles.push({
-      name: agent.profile,
+      name: profile,
       handle: agent.handle,
-      connectionId: agent.connectionId,
+      connectionId,
       connectionKind: agent.connectionKind,
       connectionLabel: agent.connectionLabel,
       remoteSource: true
@@ -2117,6 +2174,15 @@ function mergeMultiSourceRoster(local, union) {
   }
 
   return { ...local, profiles }
+}
+
+/** React list key for a roster row. Names alone are NOT unique in a
+ *  multi-source roster (two connections can both expose 'default'); duplicate
+ *  keys make React reconciliation repeat whole blocks of the list on every
+ *  poll repaint. Annotated ACTIVE-source rows keep the plain-name key so
+ *  existing rows don't remount when a desktop gains the union roster. */
+function botRowKey(bot) {
+  return `${bot.remoteSource ? bot.connectionId ?? '' : ''}:${bot.name}`
 }
 
 /** The @handle users tag a bot with. Multi-source rosters precompute the
@@ -2225,13 +2291,18 @@ function createCanonicalChat(name) {
 async function openBotCanonicalChat(name, pinned) {
   let id = pinned
 
-  if (!id) {
-    return createCanonicalChat(name)
-  }
-
   try {
     const res = await host.request('session.list', { profile: name, limit: 100 })
     const rows = res?.sessions ?? []
+
+    if (!id && rows.length) {
+      // A CLI/A2A exchange may have created the canonical Bot Chat before the
+      // desktop saved ui_meta.chat. Reuse its explicit title first; for older
+      // bot installs retain the documented grandfathering behavior and adopt
+      // the most recent existing session rather than minting another one.
+      id = rows.find(session => session.title === 'Bot Chat')?.id || rows[0].id
+      saveBotMeta(name, { chat: id })
+    }
 
     if (!rows.length) {
       saveBotMeta(name, { chat: null })
@@ -2243,7 +2314,12 @@ async function openBotCanonicalChat(name, pinned) {
       saveBotMeta(name, { chat: id })
     }
   } catch {
-    // Gateway hiccup — try the stored pin as-is.
+    // Gateway hiccup — try the stored pin as-is. Without a pin we cannot
+    // safely discover a pre-existing canonical chat, so create one as the
+    // fallback rather than leaving the click inert.
+    if (!id) {
+      return createCanonicalChat(name)
+    }
   }
 
   try {
@@ -5933,7 +6009,7 @@ function ActiveNowStrip({ roster, activeProfile, gatewayState, metaByName, onOpe
               children: label
             })
           ]
-        }, bot.name)
+        }, botRowKey(bot))
       })
     ]
   })
@@ -6105,7 +6181,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
                   title: 'Remove from selection',
                   onClick: () => setChecked(prev => ({ ...prev, [bot.name]: false })),
                   children: [displayName(bot, allMeta[bot.name]), jsx(Codicon, { name: 'close', className: 'text-[0.6rem]' })]
-                }, bot.name)
+                }, botRowKey(bot))
               )
             })
           : null,
@@ -6150,7 +6226,7 @@ function CreateGroupChatDialog({ open, roster, onClose, onCreated }) {
                         onCheckedChange: value => setChecked(prev => ({ ...prev, [bot.name]: Boolean(value) }))
                       })
                     ]
-                  }, bot.name)
+                  }, botRowKey(bot))
                 })
               : jsx('div', {
                   className: 'px-1.5 py-3 text-center text-xs text-(--ui-text-tertiary)',
@@ -6577,7 +6653,7 @@ function BotsPane() {
                           }, `group:${section.group}`)
                         : null,
                       ...section.bots.map(bot =>
-                        jsx(BotRow, { bot, onDelete: setDeleting, onEdit: setEditing, onGroup: setGrouping }, bot.name)
+                        jsx(BotRow, { bot, onDelete: setDeleting, onEdit: setEditing, onGroup: setGrouping }, botRowKey(bot))
                       )
                     ])
                   })
