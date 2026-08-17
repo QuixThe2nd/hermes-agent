@@ -761,6 +761,129 @@ class TestLifecycleGuardModule:
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("daily ops", str(script))
 
+    # -- Non-shell payload false-positive regressions ---------------------
+
+    def test_python_heredoc_proc_scan_not_blocked(self):
+        """A read-only ``python3 - <<'PY'`` heredoc whose body scans /proc
+        must not be blocked: the heredoc body is stdin data for python, not
+        shell, so its path tokens (``/proc`` — an existing DIRECTORY, which
+        the referenced-script reader fails closed on) must never be walked
+        as script references. Blocked a real process-tree inspection."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        command = (
+            "pstree -ap 1234 2>&1 || true\n"
+            "python3 - <<'PY'\n"
+            "import os\n"
+            "for e in os.scandir('/proc'):\n"
+            "    if e.name.isdigit():\n"
+            "        print(open(f'/proc/{e.name}/cmdline','rb').read())\n"
+            "PY\n"
+        )
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd="/tmp"
+        ) is False
+
+    def test_quoted_multiline_interpreter_payload_not_walked(self, tmp_path):
+        """A quoted multi-line ``python3 -c \"...\"`` payload is ONE argv word
+        to the shell. Splitting it on raw newlines exposed inner payload
+        lines as phantom commands; a path literal inside (here a real text
+        file containing a lifecycle-looking string) was then read and
+        regex-scanned as if it were a referenced script."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        bait = tmp_path / "notes.txt"
+        # Content that MUST trip the regex if it is ever scanned as a
+        # referenced script — proving the payload path is no longer walked.
+        bait.write_text("systemctl --user restart hermes-gateway\n", encoding="utf-8")
+        command = (
+            'python3 -c "\n'
+            "from pathlib import Path\n"
+            f"print(Path({str(bait)!r}).read_text())\n"
+            '"\n'
+        )
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd="/tmp"
+        ) is False
+
+    def test_non_shell_shebang_script_content_not_walked(self, tmp_path):
+        """A directly executed shim with a non-shell shebang
+        (``#!/usr/bin/env node``) is interpreted by node, never shell-parsed.
+        Walking its content as shell used to recurse into require() paths
+        until the depth cap failed closed (``npm uninstall -g`` was blocked).
+        The content is still regex-scanned for literal lifecycle commands."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        shim = tmp_path / "shim"
+        # A deep shell-looking reference chain no real shell would parse.
+        shim.write_text(
+            "#!/usr/bin/env node\n"
+            f"require('{tmp_path}/lib/a.js')\n",
+            encoding="utf-8",
+        )
+        lib = tmp_path / "lib"
+        lib.mkdir()
+        # Chain of .js files referencing each other deeper than the depth cap.
+        for i in range(12):
+            nxt = f"b{i + 1}.js"
+            (lib / ("a.js" if i == 0 else f"b{i}.js")).write_text(
+                f"require('./{nxt}');\n", encoding="utf-8"
+            )
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            f"{shim} uninstall -g somepkg", cwd="/tmp"
+        ) is False
+
+    def test_non_shell_shebang_script_with_lifecycle_literal_still_blocked(
+        self, tmp_path
+    ):
+        """Skipping the walk for non-shell content must NOT weaken the
+        guard: a lifecycle command embedded in a node/python script is still
+        caught by the direct regex on the content."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        shim = tmp_path / "evilshim"
+        shim.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "os.system('systemctl --user restart hermes-gateway')\n",
+            encoding="utf-8",
+        )
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            str(shim), cwd="/tmp"
+        ) is True
+
+    def test_shell_heredoc_body_still_walked(self, tmp_path):
+        """``bash <<EOF`` feeds its body to a shell: the body IS shell and
+        must still be scanned/walked. Only non-shell receivers are masked."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "bash <<'EOF'\nsystemctl --user restart hermes-gateway\nEOF\n",
+            cwd="/tmp",
+        ) is True
+
+    def test_heredoc_masking_does_not_hide_following_script_walk(self, tmp_path):
+        """A masked non-shell heredoc must not swallow later lines: a real
+        script reference AFTER the heredoc is still walked and blocked."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        evil = tmp_path / "evil.sh"
+        evil.write_text("hermes gateway stop\n", encoding="utf-8")
+        command = (
+            "python3 - <<'PY'\nprint('/proc self inspect')\nPY\n"
+            f"bash {evil}\n"
+        )
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd="/tmp"
+        ) is True
+
+
     # -- Whole-class regression tests (tilllt's T1-T4 on PR #79454) --------
 
     def test_tilde_nul_candidate_does_not_crash_terminal_walk(self):
