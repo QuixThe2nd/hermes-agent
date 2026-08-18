@@ -371,6 +371,18 @@ def _background_review_write_guard(
                 ),
             }
         if skill_usage.is_bundled(name):
+            # curator.prune_builtins (default on) explicitly authorizes the
+            # background review pass to ARCHIVE stale bundled skills: the
+            # curator candidate list includes them in that mode, the delete
+            # path below routes background deletes through the recoverable
+            # archive_skill() primitive (never rmtree), and the suppression
+            # list keeps them archived across `hermes update` re-seeds.
+            # Everything else stays off-limits — built-ins are
+            # upstream-owned content, so autonomous EDITs are never a local
+            # decision. (pc_b10b956ddcc8: the guard used to refuse the very
+            # archives the prune-builtins mode told the curator to perform.)
+            if action == "delete" and skill_usage.is_curation_eligible(name, skill_dir):
+                return None
             return {
                 "success": False,
                 "error": (

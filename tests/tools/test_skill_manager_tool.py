@@ -434,34 +434,68 @@ class TestSkillManageDispatcher:
         bump_patch.assert_not_called()
 
 
-    def test_background_review_delete_refuses_bundled_even_with_absorbed_into(self, tmp_path):
-        from tools.skill_provenance import (
-            BACKGROUND_REVIEW,
-            reset_current_write_origin,
-            set_current_write_origin,
-        )
+    def test_background_review_delete_bundled_allowed_when_prune_builtins_on(self, tmp_path, monkeypatch):
+        """pc_b10b956ddcc8: prune-builtins mode authorizes bundled archives.
 
-        token = set_current_write_origin(BACKGROUND_REVIEW)
-        try:
-            with _skill_dir(tmp_path), \
-                 patch("tools.skill_usage.is_protected_builtin", return_value=False), \
-                 patch("tools.skill_usage.is_hub_installed", return_value=False), \
-                 patch("tools.skill_usage.is_bundled",
-                       side_effect=lambda skill_name: skill_name == "bundled"):
-                skill_manage(action="create", name="umbrella", content=VALID_SKILL_CONTENT)
-                skill_manage(action="create", name="bundled", content=VALID_SKILL_CONTENT)
-                raw = skill_manage(
-                    action="delete",
-                    name="bundled",
-                    absorbed_into="umbrella",
-                )
-        finally:
-            reset_current_write_origin(token)
+        The curator's PRUNE-BUILTINS prompt tells the review pass it MAY
+        archive stale bundled skills, but the background write guard used to
+        refuse every bundled delete anyway — the mode could never act. With
+        curator.prune_builtins on, a background delete of a bundled skill is
+        routed through the recoverable archive path.
+        """
+        from tools.skill_manager_tool import _delete_skill
 
-        result = json.loads(raw)
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch) as skills_root, \
+             patch("tools.skill_usage.is_protected_builtin", return_value=False), \
+             patch("tools.skill_usage.is_hub_installed", return_value=False), \
+             patch("tools.skill_usage.is_bundled",
+                   side_effect=lambda skill_name: skill_name == "bundled"), \
+             patch("tools.skill_usage._prune_builtins_enabled", return_value=True):
+            _create_curator_skill("umbrella", _skill_content("umbrella"))
+            _create_curator_skill("bundled", _skill_content("bundled"))
+            result = _delete_skill("bundled", absorbed_into="umbrella")
+
+        assert result["success"] is True, result
+        assert result.get("_archived") is True
+        # Recoverable archive, not rmtree: the skill lives under .archive/.
+        assert not (skills_root / "bundled" / "SKILL.md").exists()
+        assert (skills_root / ".archive" / "bundled" / "SKILL.md").exists()
+
+    def test_background_review_delete_bundled_refused_when_prune_builtins_off(self, tmp_path, monkeypatch):
+        """With curator.prune_builtins off, bundled skills stay off-limits."""
+        from tools.skill_manager_tool import _delete_skill
+
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch) as skills_root, \
+             patch("tools.skill_usage.is_protected_builtin", return_value=False), \
+             patch("tools.skill_usage.is_hub_installed", return_value=False), \
+             patch("tools.skill_usage.is_bundled",
+                   side_effect=lambda skill_name: skill_name == "bundled"), \
+             patch("tools.skill_usage._prune_builtins_enabled", return_value=False):
+            _create_curator_skill("umbrella", _skill_content("umbrella"))
+            _create_curator_skill("bundled", _skill_content("bundled"))
+            result = _delete_skill("bundled", absorbed_into="umbrella")
+
         assert result["success"] is False
         assert "bundled" in result["error"].lower()
-        assert (tmp_path / "bundled" / "SKILL.md").exists()
+        assert (skills_root / "bundled" / "SKILL.md").exists()
+
+    def test_background_review_edit_bundled_refused_even_when_prune_builtins_on(self, tmp_path, monkeypatch):
+        """Prune-builtins authorizes ARCHIVAL only, never autonomous edits."""
+        from tools.skill_manager_tool import _background_review_write_guard
+
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch) as skills_root, \
+             patch("tools.skill_usage.is_protected_builtin", return_value=False), \
+             patch("tools.skill_usage.is_hub_installed", return_value=False), \
+             patch("tools.skill_usage.is_bundled", return_value=True), \
+             patch("tools.skill_usage._prune_builtins_enabled", return_value=True):
+            _create_curator_skill("bundled", _skill_content("bundled"))
+            guard = _background_review_write_guard(
+                "bundled", skills_root / "bundled", "edit",
+            )
+
+        assert guard is not None
+        assert guard["success"] is False
+        assert "bundled" in guard["error"].lower()
 
 
 class TestSecurityScanGate:
