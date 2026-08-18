@@ -123,7 +123,7 @@ def test_schema_registration():
 
     props = schema["parameters"]["properties"]
     assert props["model"]["default"] == "glm-5.2"
-    assert props["timeout_seconds"]["default"] == 1800
+    assert props["timeout_seconds"]["default"] == 0
     assert props["allowed_tools"]["default"] == "Read,Write,Edit,Glob,Grep,Bash"
     assert props["permission_mode"]["default"] == "acceptEdits"
     assert set(props["permission_mode"]["enum"]) == {"acceptEdits", "plan"}
@@ -226,6 +226,8 @@ def test_clamp_timeout_seconds():
     assert _clamp_timeout_seconds(3601) == MAX_TIMEOUT_SECONDS
     assert _clamp_timeout_seconds("garbage") == DEFAULT_TIMEOUT_SECONDS
     assert _clamp_timeout_seconds(None) == DEFAULT_TIMEOUT_SECONDS
+    assert _clamp_timeout_seconds(0) == 0
+    assert _clamp_timeout_seconds(-5) == 0
 
 
 # ---------------------------------------------------------------------------

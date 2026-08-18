@@ -215,6 +215,60 @@ def test_sequential_tool_timeout_suppresses_late_terminal_event(tmp_path, monkey
     ]
 
 
+def _delegate_call(call_id: str = "delegate-1"):
+    return SimpleNamespace(
+        id=call_id,
+        type="function",
+        function=SimpleNamespace(name="delegate_cursor_agent", arguments="{}"),
+    )
+
+
+def test_sequential_timeout_skips_unbounded_delegate_tools(tmp_path, monkeypatch):
+    """Delegate agent tools outrun the generic deadline by design.
+
+    The batch/sequential deadline guards against wedged tool threads; a
+    healthy external coding agent may legitimately run for hours. Its own
+    stall watchdog is the dead-man switch, so the generic deadline must not
+    fire for tools in timeouts.tools.unbounded_tools (fork default includes
+    delegate_cursor_agent / delegate_claude_agent).
+    """
+    agent = _make_agent(tmp_path)
+    terminal_events: list[dict] = []
+
+    def _dispatch(_name, _args, _task_id, *, tool_call_id, **_kwargs):
+        if tool_call_id == "delegate-1":
+            # Outlasts the 1.0s generic deadline; must still return normally.
+            time.sleep(1.3)
+            return "delegate finished"
+        return "second result"
+
+    def _capture_terminal_event(*_args, **kwargs):
+        terminal_events.append(kwargs)
+
+    calls = [_delegate_call(), _tool_call("next")]
+    messages: list[dict] = []
+    monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "1.0")
+    monkeypatch.setattr("agent.deadline._timeouts_section", lambda: {})
+
+    started = time.monotonic()
+    with (
+        patch("run_agent.handle_function_call", side_effect=_dispatch),
+        patch(
+            "agent.tool_executor._emit_terminal_post_tool_call",
+            side_effect=_capture_terminal_event,
+        ),
+    ):
+        execute_tool_calls_sequential(
+            agent, SimpleNamespace(tool_calls=calls), messages, "task"
+        )
+
+    assert time.monotonic() - started < 10.0
+    assert [message["tool_call_id"] for message in messages] == ["delegate-1", "next"]
+    assert messages[0]["content"] == "delegate finished"
+    assert messages[1]["content"] == "second result"
+    assert not any(event.get("error_type") == "tool_timeout" for event in terminal_events)
+
+
 @pytest.mark.parametrize(
     "clarify_timeout",
     [resolve_clarify_timeout({}), 0],
