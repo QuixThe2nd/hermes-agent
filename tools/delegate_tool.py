@@ -484,22 +484,48 @@ def _handle_control_action(
             if not _owns_subagent_record(r, parent_agent):
                 continue
             started = r.get("started_at")
-            entries.append(
-                {
-                    "subagent_id": r.get("subagent_id"),
-                    "parent_id": r.get("parent_id"),
-                    "goal": r.get("goal"),
-                    "model": r.get("model"),
-                    "status": r.get("status"),
-                    "running_seconds": (
-                        round(time.time() - started, 1)
-                        if isinstance(started, (int, float))
-                        else None
-                    ),
-                    "accepting_steer": bool(r.get("accepting_steer", False)),
-                    "live_transcript": getattr(agent, "_live_transcript_path", None),
-                }
-            )
+            entry: Dict[str, Any] = {
+                "subagent_id": r.get("subagent_id"),
+                "parent_id": r.get("parent_id"),
+                "goal": r.get("goal"),
+                "model": r.get("model"),
+                "status": r.get("status"),
+                "running_seconds": (
+                    round(time.time() - started, 1)
+                    if isinstance(started, (int, float))
+                    else None
+                ),
+                "accepting_steer": bool(r.get("accepting_steer", False)),
+                "live_transcript": getattr(agent, "_live_transcript_path", None),
+            }
+            # Liveness surface: expose the child's own activity summary so a
+            # wedged subagent (frozen activity timestamp, no current tool) is
+            # distinguishable from a merely slow one without tailing the
+            # transcript file. `stalled` uses the same idle/in-tool ceilings
+            # as the heartbeat staleness monitor.
+            get_summary = getattr(agent, "get_activity_summary", None)
+            if callable(get_summary):
+                try:
+                    summary = get_summary()
+                except Exception:
+                    summary = None
+                if isinstance(summary, dict):
+                    current_tool = summary.get("current_tool")
+                    idle_seconds = summary.get("seconds_since_activity")
+                    entry["current_tool"] = current_tool
+                    entry["iteration"] = summary.get("api_call_count")
+                    entry["max_iterations"] = summary.get("max_iterations")
+                    entry["seconds_since_activity"] = idle_seconds
+                    if isinstance(idle_seconds, (int, float)):
+                        ceiling_cycles = (
+                            _HEARTBEAT_STALE_CYCLES_IN_TOOL
+                            if current_tool
+                            else _HEARTBEAT_STALE_CYCLES_IDLE
+                        )
+                        entry["stalled"] = (
+                            idle_seconds > ceiling_cycles * _HEARTBEAT_INTERVAL
+                        )
+            entries.append(entry)
         payload: Dict[str, Any] = {
             "action": "list",
             "count": len(entries),
@@ -4829,7 +4855,10 @@ DELEGATE_TASK_SCHEMA = {
                     "Default 'spawn' (omit for normal delegation). Live "
                     "orchestration of running subagents: 'list' shows this "
                     "conversation's live children (ids, goals, status, "
-                    "transcript paths); 'steer' queues course-correction text "
+                    "transcript paths, per-child liveness: current_tool, "
+                    "iteration, seconds_since_activity, stalled — a wedged "
+                    "child is distinguishable from a slow one); 'steer' "
+                    "queues course-correction text "
                     "into one child (requires subagent_id + message) without "
                     "stopping it; 'stop' ends one child early (requires "
                     "subagent_id) — its partial result still returns as a "
