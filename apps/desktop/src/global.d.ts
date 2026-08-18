@@ -359,17 +359,27 @@ declare global {
         callback: (payload: { kind: string; name: string; params: Record<string, string> }) => void
       ) => () => void
       signalDeepLinkReady?: () => Promise<{ ok: boolean }>
+      probePluginRepo?: (payload: { identifier?: string; repo?: string }) => Promise<{
+        ok: boolean
+        agent: boolean
+        desktop: boolean
+        agentName?: string | null
+        desktopName?: string | null
+        warnings?: string[]
+        insecure?: boolean
+        error?: string
+      }>
+      installDesktopPlugin?: (payload: {
+        identifier?: string
+        repo?: string
+        force?: boolean
+      }) => Promise<{ ok: boolean; pluginName?: string; path?: string; error?: string }>
       onWindowStateChanged?: (callback: (payload: HermesWindowState) => void) => () => void
       onFocusSession?: (callback: (sessionId: string) => void) => () => void
       onNotificationAction?: (callback: (payload: { actionId: string; sessionId?: string }) => void) => () => void
       /** Plugin (and other session-less) notification body/action activation. */
       onNotificationActivate?: (
-        callback: (payload: {
-          actionId?: string
-          activate?: string
-          notifyId?: string
-          tag?: string
-        }) => void
+        callback: (payload: { actionId?: string; activate?: string; notifyId?: string; tag?: string }) => void
       ) => () => void
       onPreviewFileChanged: (callback: (payload: HermesPreviewFileChanged) => void) => () => void
       onBackendExit: (callback: (payload: BackendExit) => void) => () => void
