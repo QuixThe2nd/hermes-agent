@@ -134,7 +134,7 @@ def test_planning_fail_closed_block_kinds(kanban_home, block_kind, planning_retu
     conn.close()
 
 
-def test_routing_lane_unavailable(kanban_home):
+def test_routing_broad_lane_persists_claude_endurance(kanban_home):
     kb.create_board("dev")
     conn = kb.connect(board="dev")
     task_id = kb.create_task(
@@ -178,7 +178,9 @@ def test_routing_lane_unavailable(kanban_home):
         },
     )
     executor._phase_routing(conn, task_id, run.id, meta, ex.pipeline_state(meta))
-    assert "lane_unavailable" in _dev_block_kinds(conn, task_id)
+    saved = ex.pipeline_state(ex.load_run_metadata(conn, run.id))
+    assert saved.get("lane") == "claude-endurance"
+    assert saved.get("phase") == ex.PHASE_PREPARING
     conn.close()
 
 

@@ -1,9 +1,9 @@
-"""Dev-pipeline executor service — durable Cursor lane (slice 1).
+"""Dev-pipeline executor service — Cursor and Claude endurance lanes.
 
 Entry points::
 
     python -m plugins.dev_pipeline.executor run
-    python -m plugins.dev_pipeline.executor attempt <task_id> <run_id> --lane cursor-bounded
+    python -m plugins.dev_pipeline.executor attempt <task_id> <run_id> --lane cursor-bounded|claude-endurance
     python -m plugins.dev_pipeline.executor reconcile
 
 Pipeline state lives in ``task_runs.metadata`` under ``dev_pipeline``; phase
@@ -37,6 +37,7 @@ from plugins.dev_pipeline.pipeline import (
     scan_diff_for_secrets,
     validate_plan_contract,
 )
+from tools.claude_agent_tool import resolve_claude_binary
 from tools.cursor_agent_tool import resolve_cursor_agent_binary
 from tools.moa_tool import consult_moa
 
@@ -928,15 +929,27 @@ def build_attempt_prompt(
     contract: Mapping[str, Any],
     *,
     repair_context: Optional[str] = None,
+    lane: str = "cursor-bounded",
 ) -> str:
-    rules = (
-        "Rules:\n"
-        "- Delegate implementation to the `implementer` subagent.\n"
-        "- Delegate review to the `reviewer` subagent.\n"
-        "- Fix blocking findings via implementer.\n"
-        "- Commit with conventional messages; do not push; do not create PRs.\n"
-        "- Report a structured final summary at the end.\n"
-    )
+    if lane == "claude-endurance":
+        rules = (
+            "Rules:\n"
+            "- Implement changes directly in this session.\n"
+            "- Make small checkpoint commits with conventional commit messages "
+            "as you complete milestones.\n"
+            "- Run the acceptance_commands from the plan contract and fix any failures.\n"
+            "- Do not push; do not create PRs.\n"
+            "- Report a structured final summary at the end.\n"
+        )
+    else:
+        rules = (
+            "Rules:\n"
+            "- Delegate implementation to the `implementer` subagent.\n"
+            "- Delegate review to the `reviewer` subagent.\n"
+            "- Fix blocking findings via implementer.\n"
+            "- Commit with conventional messages; do not push; do not create PRs.\n"
+            "- Report a structured final summary at the end.\n"
+        )
     parts = [
         f"Task:\n{task_text}\n",
         f"Plan contract JSON:\n{json.dumps(dict(contract), indent=2)}\n",
@@ -1059,6 +1072,8 @@ def build_repair_prompt(
     contract: Mapping[str, Any],
     candidate_results: Sequence[CommandResult],
     diff_summary: str,
+    *,
+    lane: str = "cursor-bounded",
 ) -> str:
     failures = [
         f"Command: {r.command}\nExit: {r.exit_code}\nOutput preview:\n{r.output_preview}"
@@ -1070,7 +1085,7 @@ def build_repair_prompt(
         + "\n\n".join(failures)
         + f"\n\nDiff summary:\n{diff_summary[:8000]}"
     )
-    return build_attempt_prompt(task_text, contract, repair_context=ctx)
+    return build_attempt_prompt(task_text, contract, repair_context=ctx, lane=lane)
 
 
 # ---------------------------------------------------------------------------
@@ -1828,6 +1843,8 @@ class DevExecutor:
             )
             self._active.pop(task_id, None)
             return
+        lane = "cursor-bounded" if decision == "cursor" else "claude-endurance"
+        meta = merge_pipeline_state(meta, {"lane": lane})
         self._set_phase(conn, task_id, run_id, meta, PHASE_PREPARING)
 
     def _phase_preparing(
@@ -1885,6 +1902,7 @@ class DevExecutor:
         persisted_prompt = st_before.get("attempt_prompt") if spawn_pending else None
         meta = clear_attempt_ephemeral(meta)
         st = pipeline_state(meta)
+        lane = str(st.get("lane") or "cursor-bounded")
         repo_dir = Path(str(st.get("repo_path") or ""))
         logs_root = Path(str(st.get("logs_root") or ""))
         contract = st.get("contract") or {}
@@ -1897,7 +1915,7 @@ class DevExecutor:
         elif persisted_prompt:
             prompt = str(persisted_prompt)
         else:
-            prompt = build_attempt_prompt(task_text, contract)
+            prompt = build_attempt_prompt(task_text, contract, lane=lane)
 
         any_active, active_unit = any_task_unit_active(conn, task_id, self._is_active)
         unit = unit_name(task_id, run_id)
@@ -1924,8 +1942,11 @@ class DevExecutor:
 
         logs_root.mkdir(parents=True, exist_ok=True)
         jsonl_path = logs_root / f"attempt-{run_id}.jsonl"
-        runtime = int(self.cfg.get("cursor_timeout_seconds") or 1800)
-        env = build_attempt_env(os.environ, lane="cursor-bounded")
+        if lane == "claude-endurance":
+            runtime = int(self.cfg.get("claude_timeout_seconds") or 7200)
+        else:
+            runtime = int(self.cfg.get("cursor_timeout_seconds") or 1800)
+        env = build_attempt_env(os.environ, lane=lane)
         # Plugin module path: plugins/ is importable only from the repo
         # root, and attempt units run with the *workspace* cwd — hand the
         # child an explicit PYTHONPATH so `-m plugins.dev_pipeline.executor`
@@ -1939,7 +1960,7 @@ class DevExecutor:
             task_id,
             str(run_id),
             "--lane",
-            "cursor-bounded",
+            lane,
         ]
         meta = merge_pipeline_state(
             meta,
@@ -2214,7 +2235,8 @@ class DevExecutor:
         git_command(["checkout", str(candidate)], cwd=verify_dir)
 
         timeout = int(self.cfg.get("verify_command_timeout") or 600)
-        env = build_attempt_env(os.environ, lane="cursor-bounded")
+        lane = str(st.get("lane") or "cursor-bounded")
+        env = build_attempt_env(os.environ, lane=lane)
         cand_evidence = logs_root / "verify-candidate"
         with self._heartbeat_scope(conn, task_id):
             try:
@@ -2312,6 +2334,7 @@ class DevExecutor:
                     contract,
                     cand_results,
                     diff,
+                    lane=lane,
                 )
                 meta = merge_pipeline_state(
                     meta, {"repair_used": True, "repair_pending": True}
@@ -2489,6 +2512,7 @@ class DevExecutor:
         if needs_repair and not st.get("repair_used"):
             attempts = count_attempt_runs(conn, task_id)
             if attempts < int(self.cfg.get("max_attempts") or 2):
+                lane = str(st.get("lane") or "cursor-bounded")
                 findings = (kimi_verdict.get("blocking_findings") or []) + (
                     grok_verdict.get("blocking_findings") or []
                 )
@@ -2496,6 +2520,7 @@ class DevExecutor:
                     task_text,
                     contract,
                     repair_context="Review findings:\n" + json.dumps(findings),
+                    lane=lane,
                 )
                 meta = merge_pipeline_state(
                     meta, {"repair_used": True, "repair_pending": True}
@@ -2604,7 +2629,7 @@ def reconcile_once(
 
 
 def run_attempt_cli(task_id: str, run_id: int, *, lane: str = "cursor-bounded") -> None:
-    """Exec Cursor agent for a single attempt (systemd unit entrypoint)."""
+    """Exec agent CLI for a single attempt (systemd unit entrypoint)."""
     cfg = get_dev_pipeline_config()
     board = str(cfg.get("board") or "dev")
     conn = kb.connect(board=board)
@@ -2618,19 +2643,39 @@ def run_attempt_cli(task_id: str, run_id: int, *, lane: str = "cursor-bounded") 
         jsonl_path = logs_root / f"attempt-{run_id}.jsonl"
         logs_root.mkdir(parents=True, exist_ok=True)
         prompt = st.get("attempt_prompt") or ""
-        agent_bin = resolve_cursor_agent_binary()
-        if not agent_bin:
-            sys.exit(127)
         env = build_attempt_env(os.environ, lane=lane)
-        cmd = [
-            agent_bin,
-            "-p",
-            "--trust",
-            "--force",
-            "--output-format",
-            "stream-json",
-            prompt,
-        ]
+        if lane == "claude-endurance":
+            agent_bin = resolve_claude_binary()
+            if not agent_bin:
+                sys.exit(127)
+            # No --model flag: the claude-glm wrapper pins every Claude role
+            # itself (ANTHROPIC_MODEL + defaults); a hardcoded flag here would
+            # silently override wrapper upgrades (same rationale as PR #19).
+            cmd = [
+                agent_bin,
+                "-p",
+                "--permission-mode",
+                "acceptEdits",
+                "--allowedTools",
+                "Read,Write,Edit,Glob,Grep,Bash",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                prompt,
+            ]
+        else:
+            agent_bin = resolve_cursor_agent_binary()
+            if not agent_bin:
+                sys.exit(127)
+            cmd = [
+                agent_bin,
+                "-p",
+                "--trust",
+                "--force",
+                "--output-format",
+                "stream-json",
+                prompt,
+            ]
         with jsonl_path.open("w", encoding="utf-8") as out_fh:
             proc = subprocess.Popen(
                 cmd,
@@ -2657,7 +2702,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     sub.add_parser("run", help="Long-running executor tick loop")
     sub.add_parser("reconcile", help="One-shot startup reconciliation")
 
-    attempt_p = sub.add_parser("attempt", help="Run one Cursor attempt")
+    attempt_p = sub.add_parser(
+        "attempt", help="Run one agent attempt (cursor-bounded or claude-endurance)"
+    )
     attempt_p.add_argument("task_id")
     attempt_p.add_argument("run_id", type=int)
     attempt_p.add_argument("--lane", default="cursor-bounded")

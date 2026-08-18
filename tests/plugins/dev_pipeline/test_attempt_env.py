@@ -39,6 +39,20 @@ def test_preserves_lc_and_cursor_vars():
     assert "RANDOM_SECRET" not in env
 
 
-def test_glm_endurance_raises_not_implemented():
-    with pytest.raises(NotImplementedError, match="glm-endurance"):
+def test_claude_endurance_sanitizes_like_cursor_bounded():
+    base = {
+        "HOME": "/root",
+        "PATH": "/usr/bin",
+        "OPENAI_API_KEY": "secret",
+        "LANG": "C.UTF-8",
+    }
+    env = build_attempt_env(base, lane="claude-endurance")
+    assert env["HOME"] == "/root"
+    assert env["PATH"] == "/usr/bin"
+    assert env["LANG"] == "C.UTF-8"
+    assert "OPENAI_API_KEY" not in env
+
+
+def test_unknown_lane_raises_value_error():
+    with pytest.raises(ValueError, match="unknown dev-pipeline lane"):
         build_attempt_env({}, lane="glm-endurance")
