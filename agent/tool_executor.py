@@ -98,6 +98,20 @@ _DEFAULT_IMAGE_PARALLEL_REQUESTS = 4
 # Keep this above the stock auxiliary.web_extract timeout (360s) so the batch
 # guard does not preempt a slow-but-valid summarization attempt.
 _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
+# Tools exempt from the batch/sequential execution deadline. The deadline
+# exists to catch wedged tool threads, not to kill healthy long-running
+# external coding agents — those carry their own stall watchdogs as the
+# dead-man switch. Override with ``timeouts.tools.unbounded_tools`` in
+# config.yaml (a list of tool names; an explicit empty list disables the
+# exemption entirely).
+_DEFAULT_UNBOUNDED_TOOLS = frozenset(
+    {"delegate_cursor_agent", "delegate_claude_agent"}
+)
+
+def _resolve_unbounded_tools() -> frozenset[str]:
+    from agent.deadline import resolve_name_list
+
+    return resolve_name_list("tools.unbounded_tools", default=_DEFAULT_UNBOUNDED_TOOLS)
 # Upper bound a concurrent worker will wait at the start-order gate for all
 # earlier-ordered tools to advance before proceeding out of order. Long enough
 # to cover slow-but-legitimate authorization (e.g. an approval round-trip),
@@ -794,6 +808,11 @@ def _run_sequential_tool_execution_middleware(
     return ``tool_timeout`` while the prompt and worker stay active.
     """
     timeout_s = _resolve_sequential_tool_timeout()
+    if function_name in _resolve_unbounded_tools():
+        # Long-running external agents (delegate_cursor_agent /
+        # delegate_claude_agent): the generic deadline would kill healthy
+        # multi-hour runs; their own stall watchdog is the dead-man switch.
+        timeout_s = None
     kwargs = {
         "function_name": function_name,
         "function_args": function_args,
@@ -1551,10 +1570,33 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         and time.monotonic()
                         >= deadline + authorization_gate.excluded_seconds()
                     ):
-                        abandon_executor = True
+                        # Exempt tools (long-running external agents) keep
+                        # running past the batch deadline; the deadline only
+                        # abandons bounded stragglers. When every straggler is
+                        # exempt the deadline simply goes away.
+                        _exempt_names = _resolve_unbounded_tools()
+                        exempt_futures = {
+                            f
+                            for f in not_done
+                            if f in future_to_index
+                            and parsed_calls[future_to_index[f]][1] in _exempt_names
+                        }
+                        bounded_not_done = not_done - exempt_futures
+                        if not bounded_not_done:
+                            logger.info(
+                                "concurrent tool batch past %.1fs deadline with "
+                                "only exempt tool(s) running (%s); dropping deadline",
+                                timeout_s,
+                                ", ".join(
+                                    parsed_calls[future_to_index[f]][1]
+                                    for f in exempt_futures
+                                ),
+                            )
+                            deadline = None
+                            continue
                         timed_out_indices = {
                             future_to_index[f]
-                            for f in not_done
+                            for f in bounded_not_done
                             if f in future_to_index
                         }
                         _still_running = [
@@ -1568,20 +1610,39 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                             len(timed_out_indices),
                             ", ".join(_still_running[:5]),
                         )
-                        for f in not_done:
+                        for f in bounded_not_done:
                             f.cancel()
                         # Release gate-parked workers before the interrupt
                         # fan-out so none of them wakes up later and dispatches
                         # a tool this loop just reported as timed out.
                         _abandon_batch()
-                        with agent._tool_worker_threads_lock:
-                            worker_tids = list(agent._tool_worker_threads)
-                        for tid in worker_tids:
-                            try:
-                                _ra()._set_interrupt(True, tid)
-                            except Exception:
-                                pass
-                        break
+                        if not exempt_futures:
+                            abandon_executor = True
+                            with agent._tool_worker_threads_lock:
+                                worker_tids = list(agent._tool_worker_threads)
+                            for tid in worker_tids:
+                                try:
+                                    _ra()._set_interrupt(True, tid)
+                                except Exception:
+                                    pass
+                            break
+                        # Mixed batch: bounded stragglers are reported timed
+                        # out and left detached (same tradeoff as the abandon
+                        # path — a per-thread interrupt here would also kill
+                        # the exempt runs). Keep waiting on the exempt
+                        # futures with no deadline.
+                        logger.info(
+                            "keeping %d exempt tool(s) running past batch "
+                            "deadline: %s",
+                            len(exempt_futures),
+                            ", ".join(
+                                parsed_calls[future_to_index[f]][1]
+                                for f in exempt_futures
+                            ),
+                        )
+                        futures = [f for f in futures if f in exempt_futures]
+                        deadline = None
+                        continue
 
                     # Check for interrupt — the per-thread interrupt signal
                     # already causes individual tools (terminal, execute_code)

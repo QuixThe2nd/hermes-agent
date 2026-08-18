@@ -42,10 +42,10 @@ _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TIMEOUT_SECONDS = 900
+DEFAULT_TIMEOUT_SECONDS = 0  # 0 = no wall-clock limit; stall watchdog still applies
 MIN_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 1800
-STALL_WATCHDOG_SECONDS = 180
+STALL_WATCHDOG_SECONDS = 600
 
 _MONITOR_POLL_SECONDS = 0.1
 _TERMINATE_GRACE_SECONDS = 2.0
@@ -333,6 +333,8 @@ def _clamp_timeout_seconds(timeout_seconds: int) -> int:
         value = int(timeout_seconds)
     except (TypeError, ValueError):
         value = DEFAULT_TIMEOUT_SECONDS
+    if value <= 0:
+        return 0  # unbounded; stall watchdog remains the dead-man switch
     return max(MIN_TIMEOUT_SECONDS, min(MAX_TIMEOUT_SECONDS, value))
 
 
@@ -524,7 +526,7 @@ def _run_and_stream(
 
         now = time.monotonic()
         elapsed = now - start_mono
-        if elapsed >= timeout_seconds:
+        if timeout_seconds > 0 and elapsed >= timeout_seconds:
             error_code = "timeout"
             break
         if now - last_byte_mono >= STALL_WATCHDOG_SECONDS:
@@ -715,8 +717,11 @@ CURSOR_AGENT_SCHEMA = {
             "timeout_seconds": {
                 "type": "integer",
                 "description": (
-                    f"Maximum wall-clock seconds before the run is terminated "
-                    f"({MIN_TIMEOUT_SECONDS}–{MAX_TIMEOUT_SECONDS})."
+                    f"Maximum wall-clock seconds before the run is terminated. "
+                    f"0 (default) means no wall-clock limit; the stall watchdog "
+                    f"still terminates runs with no output for "
+                    f"{STALL_WATCHDOG_SECONDS}s. Positive values clamp to "
+                    f"{MIN_TIMEOUT_SECONDS}–{MAX_TIMEOUT_SECONDS}."
                 ),
                 "default": DEFAULT_TIMEOUT_SECONDS,
             },

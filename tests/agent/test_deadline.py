@@ -519,3 +519,67 @@ class TestSequentialToolTimeoutResolver:
             lambda: {"tools": {"concurrent_batch": 0}},
         )
         assert self._resolver()() is None
+
+
+class TestResolveNameList:
+    """resolve_name_list: list-of-names values under timeouts.* keys."""
+
+    def _resolve(self, key="tools.unbounded_tools", default=frozenset({"a", "b"})):
+        from agent.deadline import resolve_name_list
+
+        return resolve_name_list(key, default=default)
+
+    def test_absent_key_returns_default(self, monkeypatch):
+        monkeypatch.setattr("agent.deadline._timeouts_section", lambda: {})
+        assert self._resolve() == frozenset({"a", "b"})
+
+    def test_config_list_wins(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.deadline._timeouts_section",
+            lambda: {"tools": {"unbounded_tools": ["x", "y"]}},
+        )
+        assert self._resolve() == frozenset({"x", "y"})
+
+    def test_empty_list_disables(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.deadline._timeouts_section",
+            lambda: {"tools": {"unbounded_tools": []}},
+        )
+        assert self._resolve() == frozenset()
+
+    def test_non_list_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.deadline._timeouts_section",
+            lambda: {"tools": {"unbounded_tools": "delegate_cursor_agent"}},
+        )
+        assert self._resolve() == frozenset({"a", "b"})
+
+    def test_blank_items_dropped(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.deadline._timeouts_section",
+            lambda: {"tools": {"unbounded_tools": ["x", "", "  "]}},
+        )
+        assert self._resolve() == frozenset({"x"})
+
+
+class TestUnboundedToolsResolver:
+    """_resolve_unbounded_tools: fork default covers both delegate tools."""
+
+    def test_default_contains_delegate_tools(self, monkeypatch):
+        from agent import tool_executor
+
+        monkeypatch.setattr("agent.deadline._timeouts_section", lambda: {})
+        names = tool_executor._resolve_unbounded_tools()
+        assert "delegate_cursor_agent" in names
+        assert "delegate_claude_agent" in names
+
+    def test_config_override_replaces_default(self, monkeypatch):
+        from agent import tool_executor
+
+        monkeypatch.setattr(
+            "agent.deadline._timeouts_section",
+            lambda: {"tools": {"unbounded_tools": ["delegate_cursor_agent"]}},
+        )
+        assert tool_executor._resolve_unbounded_tools() == frozenset(
+            {"delegate_cursor_agent"}
+        )

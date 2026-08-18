@@ -6,6 +6,7 @@ An edition of [Hermes Agent](https://github.com/NousResearch/hermes-agent) with 
 - **Tools**
   - Delegation — send coding tasks to the Cursor Agent CLI, straight from chat
   - Delegation — send coding tasks to the Claude Code CLI, straight from chat
+  - Delegation — delegate coding tools run unbounded by default; stall watchdog is the only kill switch
   - MoA — `consult_moa` and `moa_debate`, restored from the archive
   - Memory (Honcho) — memory tools surface backend failures (dead API keys, auth 401s, timeouts) as explicit errors instead of silently looking like "nothing stored"
 - **Plugins**

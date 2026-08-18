@@ -245,6 +245,26 @@ def resolve_timeout(
 
     return clamp_timeout(default)
 
+def resolve_name_list(key: str, *, default: frozenset[str]) -> frozenset[str]:
+    """Resolve a list-of-names config value for a dotted ``timeouts.`` key.
+
+    Same config read path as :func:`resolve_timeout` (``timeouts.<key>`` in
+    config.yaml). A present but non-list value falls back to ``default`` with
+    a warning; an explicit empty list means "no names" (overrides default).
+    Items are coerced with ``str()`` and blank items dropped.
+    """
+    raw = _lookup_dotted(_timeouts_section(), key)
+    if raw is None:
+        return default
+    if not isinstance(raw, list):
+        logger.warning(
+            "timeouts.%s: expected a list in config.yaml, got %r; using default",
+            key,
+            raw,
+        )
+        return default
+    return frozenset(str(item) for item in raw if str(item).strip())
+
 
 # ---------------------------------------------------------------------------
 # Bounded execution — async flavor.

@@ -197,7 +197,7 @@ def test_schema_registration():
 
     props = schema["parameters"]["properties"]
     assert "default" not in props["model"]
-    assert props["timeout_seconds"]["default"] == 900
+    assert props["timeout_seconds"]["default"] == 0
     assert props["force"]["default"] is True
 
 
@@ -233,6 +233,8 @@ def test_clamp_timeout_seconds():
     assert _clamp_timeout_seconds(1801) == MAX_TIMEOUT_SECONDS
     assert _clamp_timeout_seconds("garbage") == DEFAULT_TIMEOUT_SECONDS
     assert _clamp_timeout_seconds(None) == DEFAULT_TIMEOUT_SECONDS
+    assert _clamp_timeout_seconds(0) == 0
+    assert _clamp_timeout_seconds(-5) == 0
 
 
 def test_parse_stream_json_log():
