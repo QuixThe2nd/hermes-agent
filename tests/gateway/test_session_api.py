@@ -450,6 +450,14 @@ async def test_session_chat_stream_treats_pre_existing_poisoned_row_as_no_model(
                 json={"message": "hi"},
             )
             assert resp.status == 200
+            # Drain the SSE body so the background run completes before we
+            # assert: the stream endpoint schedules _run_agent on a task and
+            # returns headers immediately, so checking call_args without
+            # consuming the body races the scheduler (flakes under CI load,
+            # where the client disconnect can interrupt the run before the
+            # agent is ever invoked). Sibling stream tests already drain via
+            # resp.text(); this one must too.
+            await resp.text()
 
     _, kwargs = mock_run.call_args
     assert kwargs["session_model"] is None
