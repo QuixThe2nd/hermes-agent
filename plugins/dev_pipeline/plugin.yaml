@@ -6,3 +6,4 @@ author: QuixThe2nd
 kind: backend
 provides_tools:
   - delegate_development
+  - dev_pipeline_status
