@@ -29,6 +29,7 @@ import {
   ContextMenuSeparator,
   ContextMenuTrigger,
   ConfirmDialog,
+  CopyButton,
   Dialog,
   DialogContent,
   DialogDescription,
@@ -2903,6 +2904,26 @@ function showsHandle(name, meta, bot) {
 // In-flight creations, keyed by bot name — double-clicking a row must not
 // mint two canonical chats.
 const canonicalCreations = new Map()
+let botOpenGeneration = 0
+
+async function openStoredBotChat(name, storedId, summary) {
+  if (!storedId || typeof host.openSession !== 'function') {
+    throw new Error('This Hermes Desktop version cannot open stored sessions')
+  }
+
+  const hasAuthoritativeCount =
+    typeof summary?.message_count === 'number' && Number.isFinite(summary.message_count)
+  const expectHistory = hasAuthoritativeCount ? summary.message_count > 0 : true
+
+  await host.openSession(storedId, {
+    profile: name,
+    intent: 'main',
+    awaitHydration: true,
+    expectHistory
+  })
+
+  return storedId
+}
 
 /** Create the bot's ONE forever chat: a real session opened with a kickoff
  *  message (the gateway prunes zero-message sessions, so the chat is born
@@ -2938,7 +2959,7 @@ function createCanonicalChat(name) {
 
     if (sid && typeof host.openSession === 'function') {
       try {
-        await host.openSession(sid, { profile: name })
+        await host.openSession(sid, { profile: name, intent: 'main' })
         opened = true
       } catch {
         // The stored row may not exist until the kickoff persists it. Retry
@@ -2953,7 +2974,7 @@ function createCanonicalChat(name) {
         await host.request('prompt.submit', { session_id: runtime, text: 'Hey, tell me about yourself!' })
 
         if (!opened && sid && typeof host.openSession === 'function') {
-          await host.openSession(sid, { profile: name })
+          await host.openSession(sid, { profile: name, intent: 'main' })
         }
       } catch {
         // The chat already exists. Keep the pin so the next click
@@ -2987,13 +3008,9 @@ async function openBotCanonicalChat(name, pinned, history) {
     // Grandfather: adopt the conversation the row already previews.
     const adoptId = history?.id
     if (adoptId && typeof host.openSession === 'function') {
-      try {
-        await host.openSession(adoptId, { profile: name })
-        saveBotMeta(name, { chat: adoptId })
-        return adoptId
-      } catch {
-        // Adoption raced a vanishing session — fall through to creation.
-      }
+      await openStoredBotChat(name, adoptId, history)
+      saveBotMeta(name, { chat: adoptId })
+      return adoptId
     }
     return createCanonicalChat(name)
   }
@@ -3019,27 +3036,22 @@ async function openBotCanonicalChat(name, pinned, history) {
 
   if (lookupFailed) {
     // Transient gateway state (or an older backend): the pin is innocent
-    // until proven guilty — try it as-is, and only a rejected open clears.
-    try {
-      await host.openSession(pinned, { profile: name })
-      return pinned
-    } catch {
-      saveBotMeta(name, { chat: null })
-      return createCanonicalChat(name)
-    }
+    // until proven guilty — try it as-is. A rejected open is still ambiguous:
+    // it can be the same reconnect/hydration outage that broke this lookup, so
+    // preserve the forever-chat pin and surface Retry instead of forking it.
+    return openStoredBotChat(name, pinned, history)
   }
 
   if (preferred) {
     try {
-      await host.openSession(preferred.resolved_id || preferred.id, { profile: name })
+      await openStoredBotChat(name, preferred.resolved_id || preferred.id, preferred)
       return pinned
     } catch (error) {
       // The precise lookup JUST confirmed this session exists, so a failed
       // open is transient (reconnect, backend restart). Clearing the pin or
       // minting a replacement here would fork the bot's forever-chat on
       // every hiccup — report and keep everything as it is.
-      host.notifyError?.(error, `Could not open ${name}'s chat — try again`)
-      return pinned
+      throw error
     }
   }
 
@@ -3047,13 +3059,9 @@ async function openBotCanonicalChat(name, pinned, history) {
   // recovery): re-anchor on the previewed session when there is one.
   const recoveryId = history?.id
   if (recoveryId && typeof host.openSession === 'function') {
-    try {
-      await host.openSession(recoveryId, { profile: name })
-      saveBotMeta(name, { chat: recoveryId })
-      return recoveryId
-    } catch {
-      // Fall through to a fresh chat.
-    }
+    await openStoredBotChat(name, recoveryId, history)
+    saveBotMeta(name, { chat: recoveryId })
+    return recoveryId
   }
   saveBotMeta(name, { chat: null })
   return createCanonicalChat(name)
@@ -4358,6 +4366,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
   }
 
   const open = async () => {
+    const generation = ++botOpenGeneration
     haptic('tap')
     $selectedBot.set(bot.name)
 
@@ -4389,14 +4398,26 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
       return
     }
 
-    try {
-      const id = await openBotCanonicalChat(bot.name, pinnedChat, bot.last_session)
+    if (generation !== botOpenGeneration) {
+      return
+    }
 
-      if (id) {
+    try {
+      const id = await openBotCanonicalChat(bot.name, pinnedChat, previewSession)
+
+      if (generation === botOpenGeneration && id) {
         return
       }
-    } catch {
-      // Fall through to the older-gateway draft below.
+    } catch (error) {
+      if (generation === botOpenGeneration) {
+        host.notifyError?.(error, `Could not open ${displayName(bot, meta)}'s chat — try again`)
+      }
+
+      return
+    }
+
+    if (generation !== botOpenGeneration) {
+      return
     }
 
     if (typeof host.newChat === 'function') {
@@ -7269,14 +7290,23 @@ function useProfileSessions(botName, gatewayGeneration) {
   })
 }
 
-async function openProfileSession(botName, storedId, gatewayGeneration) {
+async function openProfileSession(botName, session, gatewayGeneration) {
   const profile = String(botName || '')
-  const id = String(storedId || '')
+  const id = String(session?.id || '')
   if (!NAME_RE.test(profile) || !id || gatewayGeneration !== $sessionsGatewayGeneration.get()) return
   if (typeof host.openSession !== 'function') {
     throw new Error('This Hermes Desktop version cannot open stored sessions')
   }
-  await host.openSession(id, { profile })
+
+  // Same hydration contract as canonical Bot Chats (#89206): a bare open can
+  // focus a main surface whose runtime/transcript silently vanished, leaving a
+  // blank pane while the row preview still shows the conversation. Waiting on
+  // hydration lets the SDK issue the explicit resume when the surface is stale.
+  const hasAuthoritativeCount =
+    typeof session?.message_count === 'number' && Number.isFinite(session.message_count)
+  const expectHistory = hasAuthoritativeCount ? session.message_count > 0 : Boolean(session?.preview)
+
+  await host.openSession(id, { profile, awaitHydration: true, expectHistory })
   if (gatewayGeneration !== $sessionsGatewayGeneration.get()) return
   $botSelectedSessions.set({ ...$botSelectedSessions.get(), [profile]: id })
 }
@@ -7285,7 +7315,7 @@ function ProfileSessionRow({ session, botName, active, gatewayGeneration }) {
   return jsxs('button', {
     type: 'button',
     'aria-current': active ? 'page' : undefined,
-    onClick: () => void openProfileSession(botName, session.id, gatewayGeneration).catch(err => host.notifyError(err, 'Could not open session')),
+    onClick: () => void openProfileSession(botName, session, gatewayGeneration).catch(err => host.notifyError(err, 'Could not open session')),
     className: cn(
       'flex w-full flex-col gap-0.5 overflow-hidden rounded-md px-2 py-1.5 text-left transition-colors',
       'hover:bg-(--chrome-action-hover)',
@@ -8271,7 +8301,7 @@ function GroupChatWorkspace({ group, members, onBack }) {
 
                   return jsxs('div', {
                     className: cn(
-                      'flex items-start gap-2',
+                      'group flex items-start gap-2',
                       isUser ? 'rounded-md bg-(--chrome-action-hover) px-2 py-1.5' : 'px-2 py-1'
                     ),
                     children: [
@@ -8291,7 +8321,7 @@ function GroupChatWorkspace({ group, members, onBack }) {
                         className: 'min-w-0 flex-1',
                         children: [
                           jsxs('div', {
-                            className: 'flex items-baseline gap-2',
+                            className: 'flex items-center gap-2',
                             children: [
                               isUser
                                 ? jsx('span', {
@@ -8309,12 +8339,27 @@ function GroupChatWorkspace({ group, members, onBack }) {
                               jsx('span', {
                                 className: 'text-[0.625rem] text-(--ui-text-quaternary)',
                                 children: relativeTime(entry.at)
-                              })
+                              }),
+                              entry.text.trim()
+                                ? jsx('div', {
+                                    className:
+                                      'ml-auto shrink-0 opacity-0 pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100',
+                                    children: jsx(CopyButton, {
+                                      appearance: 'icon',
+                                      buttonSize: 'icon',
+                                      stopPropagation: true,
+                                      text: entry.text
+                                    })
+                                  })
+                                : null
                             ]
                           }),
                           jsx('div', {
                             className:
                               'text-xs text-(--ui-text-secondary) [&_p]:mb-1 [&_p:last-child]:mb-0 [&_ul]:mb-1 [&_ul]:list-disc [&_ul]:pl-4 [&_ol]:mb-1 [&_ol]:list-decimal [&_ol]:pl-4 [&_pre]:overflow-x-auto',
+                            // The app shell sets user-select: none globally; message bodies opt
+                            // back in so drag-select and ⌘C work in group chat logs.
+                            'data-selectable-text': 'true',
                             children: Streamdown ? jsx(Streamdown, { children: entry.text }) : entry.text
                           })
                         ]
@@ -8896,6 +8941,7 @@ function BotsPane() {
         gatewayState,
         metaByName: allMeta,
         onOpen: bot => {
+          const generation = ++botOpenGeneration
           haptic('tap')
           $selectedBot.set(bot.name)
 
@@ -8926,14 +8972,30 @@ function BotsPane() {
               return
             }
 
-            try {
-              const id = await openBotCanonicalChat(bot.name, pinnedChat, bot.last_session)
+            if (generation !== botOpenGeneration) {
+              return
+            }
 
-              if (id) {
+            try {
+              const id = await openBotCanonicalChat(
+                bot.name,
+                pinnedChat,
+                bot.preferred_session || bot.last_session
+              )
+
+              if (generation === botOpenGeneration && id) {
                 return
               }
-            } catch {
-              // Fall through to the older-gateway draft below.
+            } catch (error) {
+              if (generation === botOpenGeneration) {
+                host.notifyError?.(error, `Could not open ${displayName(bot)}'s chat — try again`)
+              }
+
+              return
+            }
+
+            if (generation !== botOpenGeneration) {
+              return
             }
 
             if (typeof host.newChat === 'function') {
