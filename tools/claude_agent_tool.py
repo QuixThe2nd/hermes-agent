@@ -33,28 +33,18 @@ import json
 import logging
 import os
 import shutil
-import signal
 import subprocess
-import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home
-from tools.environments.local import build_subprocess_env
+from tools.agent_cli_runner import run_agent_cli
 from tools.registry import registry
-
-# Process-group signalling is POSIX-only. On Windows we degrade to
-# proc.terminate()/proc.kill() (see _terminate_process), so keep the
-# killpg paths behind a capability flag and use a SIGKILL fallback that
-# exists at import time on every platform.
-_KILLPG_SUPPORTED = hasattr(os, "killpg")
-_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CLAUDE_MODEL = "glm-5.2"
 DEFAULT_TIMEOUT_SECONDS = 0  # 0 = no wall-clock limit; stall watchdog still applies
 MIN_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 3600
@@ -63,9 +53,6 @@ STALL_WATCHDOG_SECONDS = 600
 DEFAULT_ALLOWED_TOOLS = "Read,Write,Edit,Glob,Grep,Bash"
 DEFAULT_PERMISSION_MODE = "acceptEdits"
 _ALLOWED_PERMISSION_MODES = ("acceptEdits", "plan")
-
-_MONITOR_POLL_SECONDS = 0.1
-_TERMINATE_GRACE_SECONDS = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -177,206 +164,6 @@ def _clamp_timeout_seconds(timeout_seconds: int) -> int:
     return max(MIN_TIMEOUT_SECONDS, min(MAX_TIMEOUT_SECONDS, value))
 
 
-def _check_interrupted() -> bool:
-    try:
-        from tools.interrupt import is_interrupted
-
-        return is_interrupted()
-    except Exception:
-        return False
-
-
-def _signal_process_group(proc: subprocess.Popen, sig: signal.Signals) -> bool:
-    if not _KILLPG_SUPPORTED:
-        return False
-    try:
-        os.killpg(os.getpgid(proc.pid), sig)  # windows-footgun: ok — guarded by _KILLPG_SUPPORTED
-        return True
-    except (OSError, ProcessLookupError, AttributeError):
-        return False
-
-
-def _signal_pgid(pgid: int, sig: signal.Signals) -> bool:
-    if not _KILLPG_SUPPORTED:
-        return False
-    try:
-        os.killpg(pgid, sig)  # windows-footgun: ok — guarded by _KILLPG_SUPPORTED
-        return True
-    except (OSError, ProcessLookupError):
-        return False
-
-
-def _wait_pgid_reap(pgid: int, timeout: float) -> None:
-    if not _KILLPG_SUPPORTED:
-        return
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            os.killpg(pgid, 0)  # windows-footgun: ok — guarded by _KILLPG_SUPPORTED
-        except ProcessLookupError:
-            return
-        except OSError as exc:
-            if getattr(exc, "errno", None) == 3:
-                return
-            return
-        time.sleep(0.05)
-
-
-def _terminate_process(proc: subprocess.Popen, pgid: Optional[int] = None) -> None:
-    if pgid is not None:
-        if not _signal_pgid(pgid, signal.SIGTERM):
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-    elif not _signal_process_group(proc, signal.SIGTERM):
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-
-    try:
-        proc.wait(timeout=_TERMINATE_GRACE_SECONDS)
-    except Exception:
-        pass
-
-    if pgid is not None:
-        _signal_pgid(pgid, _SIGKILL)
-        _wait_pgid_reap(pgid, _TERMINATE_GRACE_SECONDS)
-    elif not _signal_process_group(proc, _SIGKILL):
-        try:
-            proc.kill()
-        except Exception:
-            pass
-
-    try:
-        proc.wait(timeout=_TERMINATE_GRACE_SECONDS)
-    except Exception:
-        pass
-
-
-def _read_log_text(log_path: Path) -> str:
-    if not log_path.is_file():
-        return ""
-    return log_path.read_text(encoding="utf-8", errors="replace")
-
-
-def _run_and_stream(
-    cmd: List[str],
-    *,
-    workdir: str,
-    timeout_seconds: int,
-    log_dir: Path,
-    run_timestamp: str,
-) -> Tuple[Optional[str], str, str, float, Optional[int]]:
-    """Spawn the agent, stream stdout to a log file, enforce watchdogs.
-
-    Returns ``(error_code, log_path, log_text, duration_seconds, returncode)``.
-    """
-    start_mono = time.monotonic()
-    last_byte_mono = start_mono
-
-    # The wrapper runs with `set -u` and dies on an unbound $HOME in bare
-    # environments (transient systemd units, cron). Guarantee HOME so any
-    # sparse-env caller works, and prepend ~/.local/bin so binary resolution
-    # stays consistent when PATH is minimal. NO credentials are injected here
-    # — the wrapper pulls them from <HERMES_HOME>/.env at runtime.
-    # scrub_secrets=False + inherit_profile_home=False preserves exact legacy
-    # os.environ.copy() behavior while routing through the single env factory.
-    env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
-    if not env.get("HOME"):
-        env["HOME"] = str(Path.home())
-    local_bin = str(Path.home() / ".local" / "bin")
-    env["PATH"] = local_bin + os.pathsep + env.get("PATH", "")
-
-    proc = subprocess.Popen(
-        cmd,
-        cwd=workdir,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-        env=env,
-    )
-
-    try:
-        pgid = os.getpgid(proc.pid)
-    except (OSError, ProcessLookupError):
-        pgid = None
-
-    log_path = log_dir / f"{run_timestamp}-{proc.pid}.jsonl"
-    reader_done = threading.Event()
-
-    def _reader() -> None:
-        nonlocal last_byte_mono
-        try:
-            assert proc.stdout is not None
-            with open(log_path, "wb") as log_file:
-                while True:
-                    try:
-                        chunk = proc.stdout.read1(4096)
-                    except (OSError, ValueError):
-                        break
-                    if not chunk:
-                        break
-                    log_file.write(chunk)
-                    log_file.flush()
-                    last_byte_mono = time.monotonic()
-        finally:
-            try:
-                if proc.stdout is not None:
-                    proc.stdout.close()
-            except Exception:
-                pass
-            reader_done.set()
-
-    reader_thread = threading.Thread(target=_reader, daemon=True)
-    reader_thread.start()
-
-    error_code: Optional[str] = None
-    while proc.poll() is None:
-        if _check_interrupted():
-            error_code = "interrupted"
-            break
-
-        now = time.monotonic()
-        elapsed = now - start_mono
-        if timeout_seconds > 0 and elapsed >= timeout_seconds:
-            error_code = "timeout"
-            break
-        if now - last_byte_mono >= STALL_WATCHDOG_SECONDS:
-            error_code = "stalled"
-            break
-        time.sleep(_MONITOR_POLL_SECONDS)
-
-    if error_code is not None:
-        _terminate_process(proc, pgid)
-
-    reader_thread.join(timeout=_TERMINATE_GRACE_SECONDS + 1.0)
-    duration = time.monotonic() - start_mono
-
-    if reader_thread.is_alive():
-        _terminate_process(proc, pgid)
-        return (
-            "incomplete_output",
-            str(log_path),
-            _read_log_text(log_path),
-            duration,
-            proc.poll() if proc.poll() is not None else -1,
-        )
-
-    log_text = _read_log_text(log_path)
-
-    returncode = proc.poll()
-    if returncode is None:
-        try:
-            returncode = proc.wait(timeout=_TERMINATE_GRACE_SECONDS)
-        except Exception:
-            returncode = -1
-
-    return error_code, str(log_path), log_text, duration, returncode
-
-
 def _make_result(
     *,
     success: bool,
@@ -407,6 +194,28 @@ def _make_result(
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _run_and_stream(
+    cmd: List[str],
+    *,
+    workdir: str,
+    timeout_seconds: int,
+    log_dir: Path,
+    run_timestamp: str,
+) -> Tuple[Optional[str], str, str, float, Optional[int]]:
+    """Spawn the agent, stream stdout to a log file, enforce watchdogs.
+
+    Returns ``(error_code, log_path, log_text, duration_seconds, returncode)``.
+    """
+    return run_agent_cli(
+        cmd,
+        workdir=workdir,
+        timeout_seconds=timeout_seconds,
+        stall_watchdog_seconds=STALL_WATCHDOG_SECONDS,
+        log_dir=log_dir,
+        run_timestamp=run_timestamp,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tool implementation
 # ---------------------------------------------------------------------------
@@ -414,7 +223,7 @@ def _make_result(
 def delegate_claude_agent(
     task: str,
     workdir: str,
-    model: str = DEFAULT_CLAUDE_MODEL,
+    model: str | None = None,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     allowed_tools: str = DEFAULT_ALLOWED_TOOLS,
     permission_mode: str = DEFAULT_PERMISSION_MODE,
@@ -462,7 +271,7 @@ def delegate_claude_agent(
         )
 
     clamped_timeout = _clamp_timeout_seconds(timeout_seconds)
-    model_name = str(model or "").strip() or DEFAULT_CLAUDE_MODEL
+    model_name = str(model or "").strip()
     tools_arg = str(allowed_tools or "").strip() or DEFAULT_ALLOWED_TOOLS
 
     log_dir = get_hermes_home() / "claude-runs"
@@ -474,16 +283,20 @@ def delegate_claude_agent(
     cmd = [
         binary,
         "-p",
-        "--model",
-        model_name,
-        "--permission-mode",
-        mode,
-        "--allowedTools",
-        tools_arg,
-        "--output-format",
-        "json",
-        str(task).strip(),
     ]
+    if model_name:
+        cmd.extend(["--model", model_name])
+    cmd.extend(
+        [
+            "--permission-mode",
+            mode,
+            "--allowedTools",
+            tools_arg,
+            "--output-format",
+            "json",
+            str(task).strip(),
+        ]
+    )
 
     try:
         watchdog_error, log_path, log_text, duration, returncode = _run_and_stream(
@@ -582,8 +395,10 @@ DELEGATE_CLAUDE_AGENT_SCHEMA = {
             },
             "model": {
                 "type": "string",
-                "description": "Model to use for the run (via the claude-glm wrapper).",
-                "default": DEFAULT_CLAUDE_MODEL,
+                "description": (
+                    "Model to use for the run (via the claude-glm wrapper). "
+                    "Omit to use the claude-glm wrapper's pinned model."
+                ),
             },
             "timeout_seconds": {
                 "type": "integer",
@@ -622,7 +437,7 @@ def _handle_delegate_claude_agent(args, **kw):
     return delegate_claude_agent(
         task=args.get("task", ""),
         workdir=args.get("workdir", ""),
-        model=args.get("model", DEFAULT_CLAUDE_MODEL),
+        model=args.get("model"),
         timeout_seconds=args.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
         allowed_tools=args.get("allowed_tools", DEFAULT_ALLOWED_TOOLS),
         permission_mode=args.get("permission_mode", DEFAULT_PERMISSION_MODE),
