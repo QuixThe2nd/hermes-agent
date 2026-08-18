@@ -72,6 +72,7 @@ _MAX_CURSOR_TIMEOUT_SECONDS = 2400
 _DEFAULT_DEV_EXECUTOR_TICK_SECONDS = 15
 _DEFAULT_MAX_ATTEMPTS = 2
 _DEFAULT_VERIFY_COMMAND_TIMEOUT = 600
+_DEFAULT_PROGRESS_NOTIFICATIONS = True
 
 
 def validate_plan_contract(data: Any) -> tuple[dict[str, Any] | None, list[str]]:
@@ -481,6 +482,14 @@ def get_dev_pipeline_config() -> dict[str, Any]:
         "tick_seconds": tick_seconds,
         "max_attempts": max_attempts,
         "verify_command_timeout": verify_timeout,
+        "progress_notifications": bool(
+            cfg_get(
+                cfg,
+                "dev_pipeline",
+                "progress_notifications",
+                default=_DEFAULT_PROGRESS_NOTIFICATIONS,
+            )
+        ),
     }
 
 

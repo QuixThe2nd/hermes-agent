@@ -16,7 +16,9 @@ def register(ctx) -> None:
     """Register the delegate_development tool. Called once by the plugin loader."""
     from plugins.dev_pipeline.tool import (
         DELEGATE_DEVELOPMENT_SCHEMA,
+        DEV_PIPELINE_STATUS_SCHEMA,
         _handle_delegate_development,
+        _handle_dev_pipeline_status,
         check_dev_pipeline_requirements,
     )
 
@@ -27,4 +29,12 @@ def register(ctx) -> None:
         handler=_handle_delegate_development,
         check_fn=check_dev_pipeline_requirements,
         emoji="🏗️",
+    )
+    ctx.register_tool(
+        name="dev_pipeline_status",
+        toolset="dev-pipeline",
+        schema=DEV_PIPELINE_STATUS_SCHEMA,
+        handler=_handle_dev_pipeline_status,
+        check_fn=check_dev_pipeline_requirements,
+        emoji="📊",
     )

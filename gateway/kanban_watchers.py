@@ -438,10 +438,30 @@ class GatewayKanbanWatchersMixin:
                                         platform=sub["platform"],
                                         chat_id=sub["chat_id"],
                                         thread_id=sub.get("thread_id") or "",
-                                        kinds=TERMINAL_KINDS,
+                                        kinds=TERMINAL_KINDS + ("dev_phase",),
                                     )
                                     if not events:
                                         continue
+                                    prev_phase = None
+                                    if any(ev.kind == "dev_phase" for ev in events):
+                                        prior = conn.execute(
+                                            """
+                                            SELECT payload FROM task_events
+                                             WHERE task_id = ? AND kind = 'dev_phase'
+                                               AND id <= ?
+                                             ORDER BY id DESC LIMIT 1
+                                            """,
+                                            (sub["task_id"], old_cursor),
+                                        ).fetchone()
+                                        if prior and prior["payload"]:
+                                            try:
+                                                import json as _json
+
+                                                _payload = _json.loads(prior["payload"])
+                                                if isinstance(_payload, dict):
+                                                    prev_phase = _payload.get("phase")
+                                            except Exception:
+                                                pass
                                     task = _kb.get_task(conn, sub["task_id"])
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
@@ -454,6 +474,7 @@ class GatewayKanbanWatchersMixin:
                                         "events": events,
                                         "task": task,
                                         "board": slug,
+                                        "prev_phase": prev_phase,
                                     })
                                 except Exception as sub_exc:
                                     # Isolate per-subscription failures so one
@@ -468,6 +489,14 @@ class GatewayKanbanWatchersMixin:
                     return deliveries
 
                 deliveries = await asyncio.to_thread(_collect)
+                try:
+                    from plugins.dev_pipeline.pipeline import get_dev_pipeline_config
+
+                    _progress_enabled = bool(
+                        get_dev_pipeline_config().get("progress_notifications", True)
+                    )
+                except Exception:
+                    _progress_enabled = True
                 for d in deliveries:
                     sub = d["sub"]
                     task = d["task"]
@@ -524,6 +553,7 @@ class GatewayKanbanWatchersMixin:
                     # "Task X completed" and re-decomposes work that already
                     # exists on the board.
                     wake_handoff = ""
+                    prev_phase = d.get("prev_phase")
                     for ev in d["events"]:
                         kind = ev.kind
                         # Identity prefix: attribute terminal pings to the
@@ -615,6 +645,26 @@ class GatewayKanbanWatchersMixin:
                                 f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
                                 f" — needs a human decision{rc}{reason}"
                             )
+                        elif kind == "dev_phase":
+                            phase = ""
+                            if ev.payload and ev.payload.get("phase"):
+                                phase = str(ev.payload["phase"])
+                            extra = ""
+                            if ev.payload:
+                                attempt = ev.payload.get("attempt")
+                                if attempt is not None:
+                                    extra = f" (attempt {attempt})"
+                            if prev_phase and phase:
+                                msg = (
+                                    f"dev job {sub['task_id']}: "
+                                    f"{prev_phase} → {phase}{extra}"
+                                )
+                            else:
+                                msg = f"dev job {sub['task_id']}: {phase}{extra}"
+                            if phase:
+                                prev_phase = phase
+                            if not _progress_enabled:
+                                continue
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
                             # (so the cursor advances past them and they can't
@@ -633,6 +683,8 @@ class GatewayKanbanWatchersMixin:
 
                         if sub.get("thread_id") and not metadata.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
+                        if kind == "dev_phase":
+                            metadata.pop("telegram_reply_to_message_id", None)
                         # Adapters with no push channel (the API server —
                         # ``supports_async_delivery = False``) can NEVER
                         # satisfy a text-send: ``send()`` always reports
