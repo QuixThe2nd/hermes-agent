@@ -41,30 +41,32 @@ def test_happy_path_routes_to_cursor():
         "long_verification",
     ],
 )
-def test_broad_flag_routes_lane_unavailable(flag_key):
+def test_broad_flag_routes_to_claude(flag_key):
     contract = _routable_contract()
     contract["broad_flags"] = copy.deepcopy(contract["broad_flags"])
     contract["broad_flags"][flag_key] = True
     decision, block_kind, reason = route_plan_contract(contract)
-    assert decision == "block"
-    assert block_kind == "lane_unavailable"
-    assert reason and "GLM endurance lane" in reason
+    assert decision == "claude"
+    assert block_kind is None
+    assert reason is None
 
 
-def test_estimated_minutes_over_30_routes_lane_unavailable():
+def test_estimated_minutes_over_30_routes_to_claude():
     contract = _routable_contract()
     contract["estimated_minutes"] = 31
-    decision, block_kind, _reason = route_plan_contract(contract)
-    assert decision == "block"
-    assert block_kind == "lane_unavailable"
+    decision, block_kind, reason = route_plan_contract(contract)
+    assert decision == "claude"
+    assert block_kind is None
+    assert reason is None
 
 
-def test_lane_hint_broad_routes_lane_unavailable():
+def test_lane_hint_broad_routes_to_claude():
     contract = _routable_contract()
     contract["lane_hint"] = "broad"
-    decision, block_kind, _reason = route_plan_contract(contract)
-    assert decision == "block"
-    assert block_kind == "lane_unavailable"
+    decision, block_kind, reason = route_plan_contract(contract)
+    assert decision == "claude"
+    assert block_kind is None
+    assert reason is None
 
 
 @pytest.mark.parametrize(

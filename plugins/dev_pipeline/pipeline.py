@@ -69,6 +69,8 @@ _DEFAULT_DEV_PIPELINE_ENABLED = False
 _DEFAULT_DEV_PIPELINE_BOARD = "dev"
 _DEFAULT_CURSOR_TIMEOUT_SECONDS = 1800
 _MAX_CURSOR_TIMEOUT_SECONDS = 2400
+_DEFAULT_CLAUDE_TIMEOUT_SECONDS = 7200
+_MAX_CLAUDE_TIMEOUT_SECONDS = 21600
 _DEFAULT_DEV_EXECUTOR_TICK_SECONDS = 15
 _DEFAULT_MAX_ATTEMPTS = 2
 _DEFAULT_VERIFY_COMMAND_TIMEOUT = 600
@@ -277,8 +279,8 @@ def route_plan_contract(
 
     Returns:
         ``(decision, block_kind, reason_text)`` where *decision* is
-        ``"block"`` or ``"cursor"``. For ``"cursor"``, *block_kind* and
-        *reason_text* are ``None``.
+        ``"block"``, ``"cursor"``, or ``"claude"``. For non-block decisions,
+        *block_kind* and *reason_text* are ``None``.
     """
     blocked_reasons = contract.get("blocked_reasons") or []
     if blocked_reasons:
@@ -295,12 +297,7 @@ def route_plan_contract(
         or broad_active
         or (isinstance(estimated, int) and estimated > CURSOR_LANE_MAX_MINUTES)
     ):
-        reason = (
-            "The GLM endurance lane is not built yet. "
-            "This task requires the broad/endurance lane "
-            "(lane_hint='broad', broad-change flags, or estimated_minutes > 30)."
-        )
-        return "block", "lane_unavailable", reason
+        return "claude", None, None
 
     return "cursor", None, None
 
@@ -411,16 +408,10 @@ def build_attempt_env(
 ) -> dict[str, str]:
     """Build a sanitized subprocess environment for a dev-pipeline attempt.
 
-    Slice 1 implements only ``cursor-bounded``. Slice 2 adds ``glm-endurance``,
-    which is the only lane permitted to inject ``CURSOR_LOCAL_AGENT_BASE_URL``
-    and ``CURSOR_LOCAL_AGENT_API_KEY`` (see dev-pipeline slice-2 spec).
+    Supports ``cursor-bounded`` and ``claude-endurance``. Both lanes use the
+    same allowlist/strip rules; neither injects credentials into the child env.
     """
-    if lane == "glm-endurance":
-        raise NotImplementedError(
-            "glm-endurance lane is not implemented in slice 1; "
-            "see docs/dev-pipeline-slice1-spec.md slice 2"
-        )
-    if lane != "cursor-bounded":
+    if lane not in {"cursor-bounded", "claude-endurance"}:
         raise ValueError(f"unknown dev-pipeline lane: {lane!r}")
 
     sanitized: dict[str, str] = {}
@@ -455,6 +446,15 @@ def get_dev_pipeline_config() -> dict[str, Any]:
         cursor_timeout = _DEFAULT_CURSOR_TIMEOUT_SECONDS
     cursor_timeout = min(max(cursor_timeout, 1), _MAX_CURSOR_TIMEOUT_SECONDS)
 
+    raw_claude_timeout = cfg_get(
+        cfg, "dev_pipeline", "claude_timeout_seconds", default=_DEFAULT_CLAUDE_TIMEOUT_SECONDS
+    )
+    try:
+        claude_timeout = int(raw_claude_timeout)
+    except (TypeError, ValueError):
+        claude_timeout = _DEFAULT_CLAUDE_TIMEOUT_SECONDS
+    claude_timeout = min(max(claude_timeout, 60), _MAX_CLAUDE_TIMEOUT_SECONDS)
+
     raw_tick = cfg_get(cfg, "dev_executor", "tick_seconds", default=_DEFAULT_DEV_EXECUTOR_TICK_SECONDS)
     try:
         tick_seconds = int(raw_tick)
@@ -479,6 +479,7 @@ def get_dev_pipeline_config() -> dict[str, Any]:
         "enabled": bool(cfg_get(cfg, "dev_pipeline", "enabled", default=_DEFAULT_DEV_PIPELINE_ENABLED)),
         "board": str(cfg_get(cfg, "dev_pipeline", "board", default=_DEFAULT_DEV_PIPELINE_BOARD) or _DEFAULT_DEV_PIPELINE_BOARD),
         "cursor_timeout_seconds": cursor_timeout,
+        "claude_timeout_seconds": claude_timeout,
         "tick_seconds": tick_seconds,
         "max_attempts": max_attempts,
         "verify_command_timeout": verify_timeout,

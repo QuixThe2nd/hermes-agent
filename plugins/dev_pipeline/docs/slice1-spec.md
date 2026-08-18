@@ -1,6 +1,9 @@
 # Dev Pipeline — Slice 1: durable Cursor lane (implementation spec)
 
 Status: approved architecture, ready for implementation.
+
+**2026-08-19 user directive:** the endurance lane is Claude Code via the claude-glm wrapper (lane `claude-endurance`), superseding the slice-2 glm-endurance design and the Claude-Code-is-out note below. Routing returns `claude` instead of blocking `lane_unavailable`.
+
 Architecture decision record: `/root/.hermes/second-brain/2026-08-10-automated-development-pipeline-moa-debate.md` (MoA debate, 4 configured models, 3 rounds, independently verified).
 
 ## Goal
