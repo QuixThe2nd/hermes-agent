@@ -31,7 +31,7 @@ import re
 import inspect
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set
 
 from agent.memory_provider import MemoryProvider
 from agent.skill_commands import extract_user_instruction_from_skill_message
@@ -359,6 +359,103 @@ def build_memory_context_block(raw_context: str) -> str:
         f"{clean}\n"
         "</memory-context>"
     )
+
+
+def extract_injected_memory_lines(messages: Iterable[Mapping[str, Any]]) -> Set[str]:
+    """Collect payload lines already delivered inside <memory-context> blocks.
+
+    Historical user rows replay their per-turn injection from the
+    ``api_content`` sidecar (byte-stable prompt-cache prefix), so that is
+    where earlier turns' blocks live; plain ``content`` is scanned too for
+    callers that persist injected bytes directly. Non-string (multimodal)
+    fields are skipped.
+    """
+    seen: Set[str] = set()
+    for msg in messages:
+        if not isinstance(msg, Mapping):
+            continue
+        for field in (msg.get("api_content"), msg.get("content")):
+            if not isinstance(field, str) or "<memory-context" not in field:
+                continue
+            for block in _INTERNAL_CONTEXT_RE.findall(field):
+                for line in block.splitlines():
+                    stripped = line.strip()
+                    if stripped:
+                        seen.add(stripped)
+    return seen
+
+
+def dedup_memory_context_lines(
+    raw_context: str, messages: Iterable[Mapping[str, Any]]
+) -> str:
+    """Drop payload lines already injected on earlier turns of this session.
+
+    Providers re-return the full memory profile every turn, while history
+    replays earlier injections byte-for-byte — without this filter the same
+    lines accumulate once per turn. Comparison is line-level and exact after
+    whitespace stripping, so timestamp-prefixed observation lines compare
+    cleanly. Order is preserved; a kept line joins ``seen``, collapsing
+    within-payload duplicates as well. Section headers left with no surviving
+    payload lines are pruned, blank runs collapse to one. Returns ``""`` when
+    nothing is new so the caller skips injection (and the recall indicator)
+    entirely.
+    """
+    if not raw_context or not raw_context.strip():
+        return ""
+    seen = extract_injected_memory_lines(messages)
+    lines = raw_context.splitlines()
+    keep: List[bool] = []
+    dropped_any = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            keep.append(True)
+            continue
+        if stripped in seen:
+            keep.append(False)
+            dropped_any = True
+            continue
+        seen.add(stripped)
+        keep.append(True)
+    if not dropped_any:
+        return raw_context.strip()
+    # Prune section headers that OWNED payload lines and lost every one of
+    # them (owned = non-blank, non-header lines up to the next header).
+    # Container headers that own no lines directly (e.g. a "## Profile"
+    # above "## Observations") survive; a one-line dangling container is
+    # acceptable noise against mis-pruning a nested structure.
+    pruned: List[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.strip().startswith("#") and keep[i]:
+            j = i + 1
+            owned_kept = owned_dropped = 0
+            while j < len(lines) and not lines[j].strip().startswith("#"):
+                if lines[j].strip():
+                    if keep[j]:
+                        owned_kept += 1
+                    else:
+                        owned_dropped += 1
+                j += 1
+            if owned_dropped and not owned_kept:
+                i += 1
+                continue
+        if keep[i]:
+            pruned.append(line)
+        i += 1
+    # Collapse blank runs to a single blank and strip outer blanks.
+    out: List[str] = []
+    for line in pruned:
+        if line.strip() or (out and out[-1].strip()):
+            out.append(line)
+    while out and not out[-1].strip():
+        out.pop()
+    # Every payload line was a duplicate: surviving container headers are
+    # noise, return empty so the caller skips injection entirely.
+    if not any(l.strip() and not l.strip().startswith("#") for l in out):
+        return ""
+    return "\n".join(out)
 
 
 class MemoryManager:

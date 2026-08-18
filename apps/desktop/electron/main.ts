@@ -86,6 +86,7 @@ import {
   profileSshOverride,
   remoteRequestMatchesBaseUrl,
   resolveAuthMode,
+  resolveProfileApiRequest,
   resolveProfileBackendRoute,
   resolveRemoteSshDashboardProfile,
   resolveTestWsUrl,
@@ -235,6 +236,7 @@ import {
   undialedSshRouteSeeds
 } from './plugin-profile-routes'
 import { selectPoolEvictions } from './pool-eviction'
+import { createPoolStopper } from './pool-stop'
 import { poolTouchKeys } from './pool-touch-scope'
 import { createKeepAwake } from './power-save'
 import { FirstRunSetupResetError, runPrimaryBackendStartup } from './primary-backend-startup'
@@ -247,6 +249,7 @@ import {
   profileNameFromDeleteRequest,
   resolveRouteProfile
 } from './profile-delete-routing'
+import { prepareProfileRenameLifecycle, profileRenameFromRequest } from './profile-rename-routing'
 import {
   buildSidebarSessionSliceParams,
   fetchPrimaryProfileSessions,
@@ -8197,11 +8200,16 @@ function writeDesktopConnectionsRegistry(registry) {
 function sanitizeRegistryConnection(entry) {
   const { token, headers, ...rest } = entry
   const decrypted = decryptDesktopSecret(token)
+  // Last-known stable backend identity (from roster enumeration / Test) so
+  // Settings can hint "Same backend as <label>" on connections that are two
+  // addresses for one box. Display-only; absent until a probe has seen it.
+  const knownInstallId = connectionInstallIds.get(entry.id)?.id
 
   return {
     ...rest,
     tokenSet: Boolean(decrypted),
     tokenPreview: tokenPreview(decrypted),
+    ...(knownInstallId ? { installId: knownInstallId } : {}),
     // Header VALUES are secrets (Cloudflare Access client secrets etc.) and
     // never cross the IPC boundary — the renderer only needs the names to
     // render the edit form.
@@ -9484,7 +9492,7 @@ function primaryProfileKey() {
 }
 
 // Options describing the current connection setup for `resolveProfileBackendRoute`.
-function profileRouteOptions(profile) {
+function profileRouteOptions(profile, request?) {
   const config = readDesktopConnectionConfig()
   const sshOverride = profileSshOverride(config, profile)
   const key = connectionScopeKey(profile) || primaryProfileKey()
@@ -9502,7 +9510,9 @@ function profileRouteOptions(profile) {
     primaryRemoteActive: primaryBackendIsRemote(),
     // A stored per-profile entry (local or remote) — pins this profile to
     // its own backend; absent entries inherit the primary's remote.
-    ownEntry: Boolean((readDesktopConnectionConfig().profiles || {})[key])
+    ownEntry: Boolean((config.profiles || {})[key]),
+    requestMethod: request?.method,
+    requestPath: request?.path
   }
 }
 
@@ -9526,6 +9536,15 @@ async function ensureBackend(profile) {
     return route.descriptorProfile
       ? { ...connection, profile: route.descriptorProfile, sharedPrimary: true }
       : connection
+  }
+
+  // A backend for this key may still be dying (idle reap, LRU eviction, a
+  // just-finished delete). Wait for its bounded exit before reusing or
+  // spawning, so two children never share one profile's HERMES_HOME.
+  const stopping = poolStopper.inFlight(key)
+
+  if (stopping) {
+    await stopping
   }
 
   const existing = backendPool.get(key)
@@ -9599,6 +9618,12 @@ async function ensureRegistryBackend(connectionId, profile) {
 
     if (localRoute.delegate) {
       return ensureBackend(profile)
+    }
+
+    const stoppingLocal = poolStopper.inFlight(localRoute.poolKey)
+
+    if (stoppingLocal) {
+      await stoppingLocal
     }
 
     const existingLocal = backendPool.get(localRoute.poolKey)
@@ -10020,49 +10045,42 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   }
 }
 
+// Bounded, deduplicated pool teardown (see pool-stop.ts): every stop path —
+// idle reaper, LRU eviction, profile delete/rename, quit — shares one
+// in-flight stop per key and retains the process handle until the bounded
+// SIGTERM -> SIGKILL escalation in waitForBackendExit() resolves. Previously
+// SIGTERM + immediate entry delete dropped the handle and a slow child
+// survived detached under PID 1.
+const poolStopper = createPoolStopper({
+  pool: backendPool,
+  stopChild: child => stopBackendChild(child),
+  waitForExit: child => waitForBackendExit(child)
+})
+
 function stopPoolBackend(profile) {
-  const entry = backendPool.get(profile)
-
-  if (!entry) {
-    return
-  }
-
-  backendPool.delete(profile)
-  stopBackendChild(entry.process)
+  return poolStopper.stop(profile)
 }
 
 async function teardownPoolBackendAndWait(profile) {
-  const entries = localProfilePoolKeys(profile)
-    .map(key => ({ entry: backendPool.get(key), key }))
-    .filter(item => item.entry)
-
-  for (const { entry, key } of entries) {
-    backendPool.delete(key)
-    stopBackendChild(entry.process)
-  }
-
-  await Promise.all(entries.map(({ entry }) => waitForBackendExit(entry.process)))
+  await Promise.all(localProfilePoolKeys(profile).map(key => poolStopper.stop(key)))
 }
 
 function stopAllPoolBackends() {
-  for (const profile of [...backendPool.keys()]) {
-    stopPoolBackend(profile)
-  }
+  return poolStopper.stopAll()
 }
 
 const backendShutdown = createBackendShutdownCoordinator(async () => {
   const primary = backendConnectionState.invalidate()
-  const pooled = [...backendPool.values()].map(entry => entry.process).filter(Boolean)
 
   stopBackendChild(primary)
-  stopAllPoolBackends()
+  const pooledStops = stopAllPoolBackends()
 
   if (poolIdleReaper) {
     clearInterval(poolIdleReaper)
     poolIdleReaper = null
   }
 
-  await Promise.all([waitForBackendExit(primary), ...pooled.map(child => waitForBackendExit(child))])
+  await Promise.all([waitForBackendExit(primary), pooledStops])
 })
 
 async function exitAfterBackendShutdown(code) {
@@ -10102,6 +10120,24 @@ async function prepareProfileDeleteRequest(request) {
   await teardownPoolBackendAndWait(decision.profile)
 
   return decision.profile
+}
+
+async function prepareProfileRenameRequest(request) {
+  return prepareProfileRenameLifecycle(request, {
+    isValidProfileName: profile => PROFILE_NAME_RE.test(profile),
+    primaryProfileKey,
+    reloadPrimaryWindow: () => {
+      mainWindow?.reload()
+    },
+    restartPrimaryBackend: async () => {
+      await startHermes()
+    },
+    teardownPoolBackendAndWait,
+    teardownPrimaryBackendAndWait,
+    writeActiveDesktopProfile: profile => {
+      writeActiveDesktopProfile(profile)
+    }
+  })
 }
 
 async function startHermes() {
@@ -12273,7 +12309,7 @@ ipcMain.handle('hermes:plugin-profile-routes', async (_event, rawProfileNames) =
 
   const registry = readDesktopConnectionsRegistry()
   const enumerations = await enumerateRegistryAgentSources(registry)
-  let agents = buildAgentRoster(enumerations)
+  let agents = buildAgentRoster(enumerations, { primaryConnectionId: registry.primary })
 
   // Roster enumeration deliberately does not dial connect-on-demand SSH
   // sources. Publish one credential-free seed route so a plugin can be the
@@ -12463,6 +12499,10 @@ ipcMain.handle('hermes:connections:test', async (_event, id) => {
 
   const status = (await fetchJson(`${baseUrl}/api/status`, token, { timeoutMs: 8_000, headers: testHeaders })) as any
 
+  // The Test button is the cheapest moment to (re)learn this backend's stable
+  // identity for the same-backend roster collapse + Settings hint.
+  rememberConnectionInstallId(entry.id, status)
+
   // Same HTTP+WS two-leg check as testDesktopConnectionConfig: HTTP alone is
   // a false positive when the WebSocket leg is blocked.
   const wsUrl = await resolveTestWsUrl(baseUrl, authMode, token, {
@@ -12496,6 +12536,49 @@ ipcMain.handle('hermes:connections:test', async (_event, id) => {
 const sshRosterCache = new Map<string, string[]>()
 const sshInventoryAttemptedAt = new Map<string, number>()
 const SSH_INVENTORY_RETRY_MS = 60_000
+
+// Stable backend identity per registered connection: the `install_id` its
+// /api/status reports (absent on backends older than the field). Enumeration
+// runs on the ~5s Bot Mode roster poll and only hits /api/profiles, so the
+// status probe is cached per connection with a TTL to avoid doubling roster
+// traffic; the Test button refreshes it eagerly. A missing id simply bypasses
+// the same-backend roster collapse — fully backward compatible.
+const connectionInstallIds = new Map<string, { id?: string; ts: number }>()
+const INSTALL_ID_TTL_MS = 5 * 60_000
+const INSTALL_ID_NEGATIVE_TTL_MS = 60_000
+
+function rememberConnectionInstallId(connectionId: string, statusBody: any) {
+  const raw = statusBody && typeof statusBody === 'object' ? statusBody.install_id : undefined
+  const id = typeof raw === 'string' && raw.trim() ? raw.trim() : undefined
+  connectionInstallIds.set(connectionId, { id, ts: Date.now() })
+
+  return id
+}
+
+async function probeConnectionInstallId(connectionId: string, descriptor: any): Promise<string | undefined> {
+  const cached = connectionInstallIds.get(connectionId)
+
+  if (cached && Date.now() - cached.ts < (cached.id ? INSTALL_ID_TTL_MS : INSTALL_ID_NEGATIVE_TTL_MS)) {
+    return cached.id
+  }
+
+  try {
+    const status: any = await getJsonForBackend(descriptor, '/api/status', { timeoutMs: 8_000 })
+
+    return rememberConnectionInstallId(connectionId, status)
+  } catch {
+    // Keep any previously-known id (identity is stable; a transient fetch
+    // failure must not flap the roster collapse), but do not cache a MISS
+    // over it.
+    if (cached?.id) {
+      return cached.id
+    }
+
+    connectionInstallIds.set(connectionId, { id: undefined, ts: Date.now() })
+
+    return undefined
+  }
+}
 
 async function probeSshProfileInventory(connection) {
   if (
@@ -12550,7 +12633,7 @@ async function probeSshProfileInventory(connection) {
 async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRegistry()) {
   return Promise.all(
     registry.connections.map(async connection => {
-      let raw: { connection: typeof connection; error?: string; profiles: null | string[] }
+      let raw: { connection: typeof connection; error?: string; installId?: string; profiles: null | string[] }
 
       try {
         // SSH roster listing must never spawn a dashboard. A stale
@@ -12584,6 +12667,10 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
           const descriptor: any = await ensureRegistryBackend(connection.id, null)
           const body: any = await getJsonForBackend(descriptor, '/api/profiles', { timeoutMs: 8_000 })
 
+          // Cached with a TTL, so the 5s roster poll usually pays zero extra
+          // requests for the backend-identity probe.
+          const installId = await probeConnectionInstallId(connection.id, descriptor)
+
           const profiles = Array.isArray(body?.profiles)
             ? body.profiles.map(p => String(p?.name || '').trim()).filter(Boolean)
             : []
@@ -12594,7 +12681,7 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
             profiles.unshift('default')
           }
 
-          raw = { connection, profiles }
+          raw = { connection, profiles, ...(installId ? { installId } : {}) }
         }
       } catch (error: any) {
         raw = { connection, profiles: null, error: String(error?.message || error) }
@@ -12606,7 +12693,7 @@ async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRe
 
       const remembered = rememberSshEnumeration(raw, sshRosterCache.get(connection.id), connection.kind)
 
-      return { connection, ...remembered }
+      return { connection, ...remembered, ...(raw.installId ? { installId: raw.installId } : {}) }
     })
   )
 }
@@ -12616,18 +12703,19 @@ ipcMain.handle('hermes:agents:roster', async () => {
   const enumerations = await enumerateRegistryAgentSources(registry)
 
   return {
-    agents: buildAgentRoster(enumerations),
+    agents: buildAgentRoster(enumerations, { primaryConnectionId: registry.primary }),
     // The active gateway owns the renderer's profiles.list — union agents
     // that report THIS connection are the same identities, not extra rows.
     // Expose the primary id so the plugin merger can annotate them in place
     // instead of appending duplicates (remote-only desktops doubled every
     // bot otherwise; see #88344).
     primaryConnectionId: registry.primary,
-    sources: enumerations.map(({ connection, profiles, error }) => ({
+    sources: enumerations.map(({ connection, error, installId, profiles }) => ({
       connectionId: connection.id,
       label: connection.label,
       kind: connection.kind,
       reachable: profiles !== null,
+      ...(installId ? { installId } : {}),
       ...(error ? { error } : {})
     }))
   }
@@ -13221,6 +13309,7 @@ async function handleHermesApiRequest(request) {
     return rerouted
   }
 
+  const profileRename = await prepareProfileRenameRequest(request)
   const tornDownProfile = await prepareProfileDeleteRequest(request)
 
   const profile = request?.profile
@@ -13228,67 +13317,102 @@ async function handleHermesApiRequest(request) {
   // backend instead of spawning a fresh pool backend.  A freshly spawned
   // backend calls ensure_hermes_home() which recreates the profile directory,
   // defeating the deletion and leaving a zombie process.
-  const routeProfile = resolveRouteProfile(tornDownProfile, profile)
-  const connection = await ensureBackend(routeProfile)
-  const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+  //
+  // Safe local-profile REST calls also stay on the primary dashboard and carry
+  // ?profile=. Endpoints that cannot honor that scope retain their pooled
+  // backend so a destructive call can never fall through to the primary home.
+  //
+  // A profile rename tears down the old-name backend the same way; for a
+  // primary rename the lifecycle has already made `default` the temporary
+  // primary until the PATCH settles, so the request routes there.
+  const apiRoute = resolveProfileApiRequest(profile, request.path, profileRouteOptions(profile, request))
 
-  const requestPath = pathWithGlobalRemoteProfile(request.path, profile, profileRouteOptions(profile))
+  const routeProfile = profileRename
+    ? profileRename.routeProfile
+    : resolveRouteProfile(tornDownProfile, apiRoute.backendProfile)
 
-  const url = `${connection.baseUrl}${requestPath}`
+  let response
 
-  // OAuth gateways authenticate REST via EITHER a native bearer token
-  // (cookieless RFC 8252 flow) OR the HttpOnly session cookie held in the OAuth
-  // partition. Prefer the native bearer when present (mirroring
-  // mintGatewayWsTicket): the native flow never sets a cookie, so routing an
-  // oauth-mode REST call through the cookie-only path returns 401 no_cookie even
-  // though a valid bearer is held. Cookie mode rides Electron's net stack bound
-  // to the OAuth partition so the cookie attaches automatically. Token/local
-  // modes keep using the static session-token header.
-  if (connection.authMode === 'oauth') {
-    // The OAuth path rides electron.net with JSON headers; multipart isn't
-    // wired there. Fail loudly rather than corrupting the upload.
-    if (request?.upload) {
-      throw new Error('File uploads are not supported against OAuth-gated remote backends yet.')
-    }
+  try {
+    const connection = await ensureBackend(routeProfile)
+    const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
-    // Native bearer first (cookieless). ensureNativeAccessToken transparently
-    // refreshes a near-expiry AT via /auth/native/refresh; a null return means
-    // no native session (resolveOauthRestAuth then selects the cookie path).
-    const nativeAt = await ensureNativeAccessToken(connection.baseUrl).catch(() => null)
-    const restAuth = resolveOauthRestAuth(nativeAt)
+    const url = `${connection.baseUrl}${apiRoute.requestPath}`
 
-    if (restAuth.kind === 'bearer') {
-      return fetchJson(url, null, {
+    // OAuth gateways authenticate REST via EITHER a native bearer token
+    // (cookieless RFC 8252 flow) OR the HttpOnly session cookie held in the OAuth
+    // partition. Prefer the native bearer when present (mirroring
+    // mintGatewayWsTicket): the native flow never sets a cookie, so routing an
+    // oauth-mode REST call through the cookie-only path returns 401 no_cookie even
+    // though a valid bearer is held. Cookie mode rides Electron's net stack bound
+    // to the OAuth partition so the cookie attaches automatically. Token/local
+    // modes keep using the static session-token header.
+    if (connection.authMode === 'oauth') {
+      // The OAuth path rides electron.net with JSON headers; multipart isn't
+      // wired there. Fail loudly rather than corrupting the upload.
+      if (request?.upload) {
+        throw new Error('File uploads are not supported against OAuth-gated remote backends yet.')
+      }
+
+      // Native bearer first (cookieless). ensureNativeAccessToken transparently
+      // refreshes a near-expiry AT via /auth/native/refresh; a null return means
+      // no native session (resolveOauthRestAuth then selects the cookie path).
+      const nativeAt = await ensureNativeAccessToken(connection.baseUrl).catch(() => null)
+      const restAuth = resolveOauthRestAuth(nativeAt)
+
+      if (restAuth.kind === 'bearer') {
+        response = await fetchJson(url, null, {
+          method: request?.method,
+          body: request?.body,
+          timeoutMs,
+          bearer: restAuth.token
+        })
+      } else {
+        response = await fetchJsonViaOauthSession(url, {
+          method: request?.method,
+          body: request?.body,
+          timeoutMs
+        })
+      }
+    } else {
+      response = await fetchJson(url, connection.token, {
         method: request?.method,
         body: request?.body,
-        timeoutMs,
-        bearer: restAuth.token
+        upload: request?.upload,
+        timeoutMs
       })
     }
+  } catch (error) {
+    // A failed rename PATCH must not strand the app on the temporary primary:
+    // restore the original active profile and restart its backend.
+    if (profileRename) {
+      try {
+        await profileRename.rollback()
+      } catch (rollbackError) {
+        rememberLog(`Failed to restore primary profile after rename error: ${String(rollbackError)}`)
+      }
+    }
 
-    return fetchJsonViaOauthSession(url, {
-      method: request?.method,
-      body: request?.body,
-      timeoutMs
-    })
+    throw error
   }
 
-  return fetchJson(url, connection.token, {
-    method: request?.method,
-    body: request?.body,
-    upload: request?.upload,
-    timeoutMs
-  })
+  await profileRename?.complete()
+
+  return response
 }
 
 ipcMain.handle('hermes:api', async (_event, request) => {
+  // Hold the deletion gate for BOTH profile deletes and renames: a concurrent
+  // renderer reconnect entering ensureBackend() mid-mutation would otherwise
+  // respawn the old-name backend and recreate its HERMES_HOME (#45474).
   const deletingProfile = profileNameFromDeleteRequest(request)
+  const mutatingProfile = deletingProfile || profileRenameFromRequest(request)?.oldName || null
 
-  if (!deletingProfile) {
+  if (!mutatingProfile) {
     return handleHermesApiRequest(request)
   }
 
-  const releaseProfileDeletion = profileDeletionGate.acquire(deletingProfile)
+  const releaseProfileDeletion = profileDeletionGate.acquire(mutatingProfile)
 
   return handleHermesApiRequest(request).finally(releaseProfileDeletion)
 })
