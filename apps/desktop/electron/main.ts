@@ -14,6 +14,7 @@ import {
   clipboard,
   dialog,
   net as electronNet,
+  webContents as electronWebContents,
   globalShortcut,
   ipcMain,
   Menu,
@@ -5837,6 +5838,102 @@ function sendClosePreviewRequested() {
   webContents.send('hermes:close-preview-requested')
 }
 
+/**
+ * Run a browser gesture on the guest page the user is actually in, if any.
+ *
+ * A `<webview>` guest is its own out-of-process webContents: pointer and focus
+ * events inside the page never reach the host document, so NOTHING in the
+ * renderer — not `document.activeElement`, not the layout tree's hover/focus
+ * ladder — can see that the user is in there. Main can: Electron tracks the
+ * focused webContents across processes, which is the definition of a runtime
+ * fact it owns.
+ *
+ * Returns false when focus is in the app's own chrome, where the renderer is
+ * the one that knows which pane is active.
+ */
+function commandFocusedGuest(command: 'back' | 'forward' | 'reload'): boolean {
+  const focused = electronWebContents.getFocusedWebContents()
+
+  if (!focused || focused.isDestroyed() || focused.getType() !== 'webview') {
+    return false
+  }
+
+  const history = focused.navigationHistory
+
+  if (command === 'reload') {
+    focused.reload()
+  } else if (command === 'back') {
+    if (!history.canGoBack()) {
+      return true
+    }
+
+    history.goBack()
+  } else {
+    if (!history.canGoForward()) {
+      return true
+    }
+
+    history.goForward()
+  }
+
+  return true
+}
+
+/**
+ * Ask the renderer to run a browser-navigation gesture on its focused preview
+ * pane. `reload` also has an app-level fallback (reload the window); `back` and
+ * `forward` mean nothing outside the browser, so the renderer just ignores them.
+ */
+function sendPreviewNavCommand(command: 'back' | 'forward' | 'reload') {
+  // The user is inside the page itself — main is the only party that can see
+  // that, so act here and never round-trip.
+  if (commandFocusedGuest(command)) {
+    return
+  }
+
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return
+  }
+
+  const { webContents } = mainWindow
+
+  if (!webContents || webContents.isDestroyed()) {
+    return
+  }
+
+  webContents.send('hermes:preview-nav', command)
+}
+
+/**
+ * The native back/forward gestures, which never reach the renderer on their own.
+ *
+ * - macOS: a two/three-finger swipe. Chromium's own overscroll navigation is
+ *   off in an Electron window, so the OS gesture surfaces as this event and
+ *   nothing consumes it. Requires "Swipe between pages" in System Settings.
+ * - Windows/Linux: the dedicated back/forward buttons on a mouse, delivered as
+ *   `WM_APPCOMMAND`.
+ */
+function installBrowserNavGestures(window) {
+  window.on('swipe', (_event, direction) => {
+    if (direction === 'left' || direction === 'right') {
+      // Swipe LEFT moves the page left, revealing what's behind it — that's
+      // back. Matches Safari, Chrome, and Finder.
+      sendPreviewNavCommand(direction === 'left' ? 'back' : 'forward')
+    }
+  })
+
+  window.on('app-command', (event, command) => {
+    if (command !== 'browser-backward' && command !== 'browser-forward') {
+      return
+    }
+
+    // Claim it either way: unhandled, Chromium walks the HOST document's
+    // history, which would navigate the app shell itself.
+    event.preventDefault()
+    sendPreviewNavCommand(command === 'browser-backward' ? 'back' : 'forward')
+  })
+}
+
 function sendOpenFolderRequested() {
   if (!mainWindow || mainWindow.isDestroyed()) {
     return
@@ -6037,7 +6134,15 @@ function buildApplicationMenu() {
   template.push({
     label: 'View',
     submenu: [
-      { role: 'reload' },
+      // Not `role: 'reload'`: that hard-reloads the RENDERER (every pane, the
+      // whole shell) and a focused in-app browser needs ⌘R to mean "reload
+      // this page", the way it does in every other browser. ⇧⌘R
+      // (`forceReload`) below stays the unconditional escape hatch.
+      //
+      // No accelerator: ⌘R is claimed in `installPreviewShortcut`, which works
+      // on every platform (this menu exists only on macOS). Declaring it here
+      // too would fire the item and the input hook for one keypress.
+      { click: () => sendPreviewNavCommand('reload'), label: 'Reload' },
       { role: 'forceReload' },
       {
         label: 'Toggle Developer Tools',
@@ -6136,17 +6241,28 @@ function installDevToolsShortcut(window) {
 function installPreviewShortcut(window) {
   window.webContents.on('before-input-event', (event, input) => {
     const key = String(input.key || '').toLowerCase()
-    const isCloseTabShortcut = key === 'w' && (IS_MAC ? input.meta : input.control) && !input.alt && !input.shift
+    const accel = (IS_MAC ? input.meta : input.control) && !input.alt
+    const isCloseTabShortcut = key === 'w' && accel && !input.shift
 
     // Always claim ⌘W here (the File>Close item deliberately has no
     // accelerator, so nothing else does). The renderer decides tab-vs-window
     // — no `previewShortcutActive` gate, so it works for every closeable tab.
-    if (!isCloseTabShortcut) {
+    if (isCloseTabShortcut) {
+      event.preventDefault()
+      sendClosePreviewRequested()
+
       return
     }
 
-    event.preventDefault()
-    sendClosePreviewRequested()
+    // ⌘R rides here rather than on the View menu item for the same reason:
+    // the application menu only exists on macOS (it is set to null elsewhere,
+    // see #77845), so a menu accelerator would leave Windows and Linux with no
+    // way to reload a page at all. ⇧⌘R is left alone — that is `forceReload`,
+    // the unconditional whole-window escape hatch.
+    if (key === 'r' && accel && !input.shift) {
+      event.preventDefault()
+      sendPreviewNavCommand('reload')
+    }
   })
 }
 
@@ -10576,6 +10692,7 @@ async function startHermes() {
 function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {}) {
   installPreviewShortcut(win)
   installDevToolsShortcut(win)
+  installBrowserNavGestures(win)
 
   // Claim Ctrl/Cmd+F in the main process — on Pop!_OS / GNOME-based Linux
   // distros the Ctrl+F keydown does not reach the renderer's `view.findInPage`
