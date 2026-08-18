@@ -868,6 +868,10 @@ export const en: Translations = {
       failedLoad: 'API keys failed to load',
       empty: 'Nothing configured in this category yet.'
     },
+    search: {
+      placeholder: 'Search all settings…',
+      pill: 'Search'
+    },
     profileScope: {
       appliesTo: 'Applies to',
       editsProfile: profile => `Changes on this page apply to the “${profile}” profile.`
@@ -2875,6 +2879,8 @@ export const en: Translations = {
     web: {
       appFailedToBoot: 'Preview app failed to boot',
       serverNotFound: 'Server not found',
+      remoteLoopback:
+        'This address points at the machine running your agent, not this one. The browser pane loads pages locally, so a remote dev server needs a port forward or a reachable hostname.',
       failedToLoad: 'Preview failed to load',
       tryAgain: 'Try again',
       restarting: 'Hermes is restarting...',

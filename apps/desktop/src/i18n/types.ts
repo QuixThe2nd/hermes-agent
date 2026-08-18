@@ -738,6 +738,10 @@ export interface Translations {
       failedLoad: string
       empty: string
     }
+    search: {
+      placeholder: string
+      pill: string
+    }
     profileScope: {
       appliesTo: string
       editsProfile: (profile: string) => string
@@ -2451,6 +2455,7 @@ export interface Translations {
     web: {
       appFailedToBoot: string
       serverNotFound: string
+      remoteLoopback: string
       failedToLoad: string
       tryAgain: string
       restarting: string

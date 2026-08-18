@@ -854,6 +854,10 @@ export const ja = defineLocale({
       failedLoad: 'API キーの読み込みに失敗しました',
       empty: 'このカテゴリーにはまだ設定がありません。'
     },
+    search: {
+      placeholder: 'すべての設定を検索...',
+      pill: '検索'
+    },
     profileScope: {
       appliesTo: '適用対象',
       editsProfile: profile => `このページの変更は「${profile}」プロファイルに適用されます。`
@@ -2567,6 +2571,8 @@ export const ja = defineLocale({
     web: {
       appFailedToBoot: 'プレビューアプリの起動に失敗しました',
       serverNotFound: 'サーバーが見つかりません',
+      remoteLoopback:
+        'このアドレスはエージェントを実行しているマシンを指しており、このマシンではありません。ブラウザペインはページをローカルで読み込むため、リモートの開発サーバーにはポート転送か到達可能なホスト名が必要です。',
       failedToLoad: 'プレビューの読み込みに失敗しました',
       tryAgain: '再試行',
       restarting: 'Hermes を再起動中...',
