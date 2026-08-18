@@ -40,7 +40,7 @@ from agent.conversation_compression import (
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
-from agent.memory_manager import build_memory_context_block
+from agent.memory_manager import build_memory_context_block, dedup_memory_context_lines
 from agent.memory_provider import is_trivial_prompt
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.model_metadata import (
@@ -1288,6 +1288,21 @@ def build_turn_context(
                 ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
         except Exception:
             pass
+        # Line-level dedup against what this session already injected: the
+        # provider re-returns the full memory profile every turn and history
+        # replays earlier blocks byte-for-byte via api_content sidecars, so
+        # unfiltered re-injection accumulates the same lines once per turn.
+        # Runs before the recall indicator and the sidecar stamp so every
+        # downstream consumer (including conversation_loop's fallback
+        # composition, which reads this same TurnContext field) sees the
+        # filtered payload. Best-effort: on any failure, inject unfiltered.
+        if ext_prefetch_cache:
+            try:
+                ext_prefetch_cache = dedup_memory_context_lines(
+                    ext_prefetch_cache, messages[:current_turn_user_idx]
+                )
+            except Exception:
+                pass
         # Deterministic, model-independent recall indicator: when memory was
         # actually injected this turn, tell the user — don't rely on the model
         # to surface it. Rendered by Hermes (via _emit_status), so it always

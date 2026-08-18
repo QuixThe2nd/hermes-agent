@@ -19,6 +19,7 @@ An edition of [Hermes Agent](https://github.com/NousResearch/hermes-agent) with 
   - Discord — threads renamed once, after the first reply lands, never mid-turn
   - Discord — progress updates respect each platform's real message limits
   - Cron — lifecycle guard blocks cron-spawned commands that would restart the gateway or rewrite the live checkout (quote-aware)
+  - Memory — per-turn injection skips lines already delivered earlier in the session
   - Config — API retry backoff timing
   - Config — web search and extract fallback chains
 
