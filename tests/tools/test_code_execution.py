@@ -116,6 +116,15 @@ class TestHermesToolsGeneration(unittest.TestCase):
         self.assertIn("_seq_lock = threading.Lock()", src)
         self.assertIn("with _seq_lock:", src)
 
+    def test_terminal_stub_documents_truncation_contract(self):
+        """The sandbox terminal() docstring must surface the truncation
+        fields (truncation_note / output_total_chars / full_output_path) so
+        scripts check them before parsing 'output' as complete data."""
+        for transport in ("uds", "file"):
+            src = generate_hermes_tools_module(["terminal"], transport=transport)
+            self.assertIn("truncation_note", src)
+            self.assertIn("full_output_path", src)
+
 
 class TestExecuteCodeRemoteTempDir(unittest.TestCase):
     def test_execute_remote_uses_backend_temp_dir_for_sandbox(self):

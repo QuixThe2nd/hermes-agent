@@ -367,7 +367,11 @@ _TOOL_STUBS = {
     "terminal": (
         "terminal",
         "command: str, timeout: int = None, workdir: str = None",
-        '"""Run a shell command (foreground only). Returns dict with "output" and "exit_code"."""',
+        '"""Run a shell command (foreground only). Returns dict with "output" and "exit_code". '
+        'When output exceeds the capture window it is head+tail truncated: the dict then also '
+        'carries "truncation_note", "output_total_chars", and "full_output_path" (page that '
+        'file with read_file instead of re-running the command). Check "truncation_note" '
+        'before parsing "output" as complete data (e.g. JSON)."""',
         '{"command": command, "timeout": timeout, "workdir": workdir}',
     ),
 }
