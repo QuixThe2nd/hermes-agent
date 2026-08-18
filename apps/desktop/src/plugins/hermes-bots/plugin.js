@@ -75,6 +75,9 @@ const SkillsView = typeof sdk === 'undefined' ? undefined : sdk.SkillsView
 // so those builds keep the staged checklists for remote targets.
 const skillsViewRoutesConnections = Boolean(SkillsView && SkillsView.supportsFixedConnection)
 const Streamdown = typeof sdk === 'undefined' ? undefined : sdk.Streamdown
+// Deterministic blob avatars (name → face). Feature-detected: older SDKs
+// without the export fall back to the legacy math-face shapes below.
+const blobatarSvg = typeof sdk === 'undefined' ? undefined : sdk.blobatarSvg
 // Budgeted render loop (fps cap + observability pause + dormancy + teardown).
 // Feature-detected: older desktops fall back to the hand-rolled clock below.
 const createBudgetedLoop = typeof sdk === 'undefined' ? undefined : sdk.createBudgetedLoop
@@ -834,6 +837,62 @@ function defaultShapeFor(name) {
   return AVATAR_SHAPES[hash % AVATAR_SHAPES.length]
 }
 
+// ── blobatar shapes mode (default for new agents) ───────────────────────────
+// Deterministic soft-body faces drawn from a string. Shape strings:
+//   'blobatar'                — the face follows the bot's NAME (renaming the
+//                               bot re-rolls the face, live in the dialog)
+//   'blobatar:<seed>'         — seed locked (the 🔒 lock / 🎲 randomize picks)
+//   'blobatar:<seed>:<kind>'  — plus one of the six silhouettes pinned
+//   'blobatar::<kind>'        — silhouette pinned, seed still follows the name
+// Bot names are slugs (NAME_RE) and generated seeds are base36, so ':' never
+// appears inside a segment. Colors come from the library's own name-derived
+// palette (contrast-guaranteed) — the classic color swatches don't apply.
+
+const BLOB_KINDS = ['round', 'organic', 'boxy', 'nub', 'cloud', 'sun']
+
+// Trait positions at the center of each silhouette band. Band thresholds are
+// frozen per blobatar major (0.28 / 0.58 / 0.72 / 0.84 / 0.93).
+const BLOB_KIND_TRAIT = { round: 0.14, organic: 0.43, boxy: 0.65, nub: 0.78, cloud: 0.885, sun: 0.965 }
+
+function isBlobShape(shape) {
+  return shape === 'blobatar' || (typeof shape === 'string' && shape.startsWith('blobatar:'))
+}
+
+function parseBlobShape(shape, name) {
+  const parts = typeof shape === 'string' ? shape.split(':') : []
+  const seedPart = parts[1] || ''
+  const kind = BLOB_KINDS.includes(parts[2]) ? parts[2] : ''
+  return { seed: seedPart || name || 'agent', seedPart, kind }
+}
+
+function blobShapeString(seedPart, kind) {
+  if (kind) {
+    return `blobatar:${seedPart}:${kind}`
+  }
+  return seedPart ? `blobatar:${seedPart}` : 'blobatar'
+}
+
+/** Static SVG markup for a blob face, tagged data-bot-face so the roster's
+ *  PNG backfill (pushLocalAvatars → rasterizeSvgToPng) still finds it. */
+function blobMarkup(shape, name, size) {
+  if (!blobatarSvg) {
+    return null
+  }
+
+  const { seed, kind } = parseBlobShape(shape, name)
+  const opts = { size }
+
+  if (kind) {
+    opts.traits = { shape: BLOB_KIND_TRAIT[kind] }
+  }
+
+  try {
+    return blobatarSvg(seed, opts).replace('<svg ', '<svg data-bot-face=' + JSON.stringify(name) + ' ')
+  } catch {
+    return null
+  }
+}
+
 /** The colored body of the avatar (no eyes). Platonic solids are a filled
  *  silhouette + translucent internal edge lines (the projected wireframe);
  *  legacy flat shapes keep their old geometry so stored picks still render. */
@@ -1447,6 +1506,26 @@ function BotFace({ shape, color, image, size = 36, name = 'agent', mood = 'idle'
     })
   }
 
+  // Blobatar shapes: the library draws the whole face (body + eyes + its own
+  // name-derived palette). Inline SVG via innerHTML so the roster PNG
+  // backfill's `svg[data-bot-face=…]` query still finds it; the math clock
+  // ignores it (no data-hb-math). Falls back to the legacy math face when the
+  // SDK predates the export.
+  if (isBlobShape(shape)) {
+    const markup = blobMarkup(shape, name, size)
+
+    if (markup) {
+      return jsx('span', {
+        'aria-hidden': true,
+        style: { width: size, height: size, display: 'block', lineHeight: 0 },
+        dangerouslySetInnerHTML: { __html: markup }
+      })
+    }
+
+    // Older SDK without blobatar: legacy deterministic shape from the name.
+    shape = defaultShapeFor(name)
+  }
+
   // Sigils are line art (no filled body) — the math clock rebuilds filled
   // outlines, which would turn a stored sigil pick into a blank circle.
   // Keep the legacy static render for them so old picks still draw.
@@ -1850,20 +1929,35 @@ function pickImageFromDevice() {
   })
 }
 
-// ── group-chat attachments: pick + downscale images the room's members see ──
+// ── group-chat attachments: pick/paste/drop files the room's members see ────
 
-/** File objects → [{ name, data }] (data URLs), oversized files skipped with
- *  a toast. Shared by the picker button and the composer's paste handler. */
-async function filesToGroupImages(files) {
+/** Classify a picked file for the group-attachment pipeline. */
+function groupAttachmentKind(file) {
+  if (/^image\//.test(file.type || '')) {
+    return 'image'
+  }
+
+  if (file.type === 'application/pdf' || /\.pdf$/i.test(file.name || '')) {
+    return 'pdf'
+  }
+
+  return 'file'
+}
+
+/** File objects → [{ name, data, kind }] (data URLs), oversized files skipped
+ *  with a toast. Images are downscaled; PDFs and other files ride as raw data
+ *  URLs for the gateway's pdf.attach / file.attach staging. Shared by the
+ *  picker button, the composer paste handler, and room drag & drop. */
+async function filesToGroupAttachments(files) {
   const picked = []
 
   for (const file of [...(files || [])]) {
-    if (!file || !/^image\//.test(file.type || '')) {
+    if (!file) {
       continue
     }
 
     if (file.size > 15_000_000) {
-      host.notify({ kind: 'error', message: `${file.name || 'image'}: too large (max 15MB).` })
+      host.notify({ kind: 'error', message: `${file.name || 'attachment'}: too large (max 15MB).` })
       continue
     }
 
@@ -1874,23 +1968,29 @@ async function filesToGroupImages(files) {
       reader.readAsDataURL(file)
     })
 
-    if (data) {
-      picked.push({ name: file.name || 'pasted image', data: await normalizeGroupAttachment(data) })
+    if (!data) {
+      continue
     }
+
+    const kind = groupAttachmentKind(file)
+    picked.push({
+      name: file.name || (kind === 'image' ? 'pasted image' : 'attachment'),
+      data: kind === 'image' ? await normalizeGroupAttachment(data) : data,
+      kind
+    })
   }
 
   return picked
 }
 
-/** Multi-file variant of pickImageFromDevice for the group composer. Resolves
- *  to [{ name, data }] (data URLs); oversized files are skipped with a toast. */
-function pickGroupImages() {
+/** Multi-file picker for the group composer — any file type; kind decides
+ *  the staging RPC. Resolves to [{ name, data, kind }]. */
+function pickGroupAttachments() {
   return new Promise(resolve => {
     const input = document.createElement('input')
     input.type = 'file'
-    input.accept = 'image/png,image/jpeg,image/webp,image/gif'
     input.multiple = true
-    input.onchange = () => resolve(filesToGroupImages(input.files))
+    input.onchange = () => resolve(filesToGroupAttachments(input.files))
     input.click()
   })
 }
@@ -2071,7 +2171,88 @@ function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generate
         : null,
 
       tab === 'bot'
-        ? jsxs('div', {
+        ? isBlobShape(shape) && blobatarSvg
+          ? (() => {
+              const { seedPart, kind } = parseBlobShape(shape, pickerName)
+              const locked = Boolean(seedPart)
+              return jsxs('div', {
+                className: 'grid justify-items-center gap-3',
+                children: [
+                  // Silhouette pins: Auto (name decides) + the six blob kinds.
+                  jsx('div', {
+                    style: {
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
+                      gap: '6px',
+                      justifyItems: 'center'
+                    },
+                    children: ['', ...BLOB_KINDS].map(k =>
+                      jsx(
+                        'button',
+                        {
+                          type: 'button',
+                          title: k || 'Auto — the name decides',
+                          className: cn(
+                            'flex items-center justify-center rounded-md transition-colors hover:bg-(--chrome-action-hover)',
+                            k === kind && !image && 'ring-1 ring-(--ui-accent)'
+                          ),
+                          style: { width: 44, height: 44 },
+                          onClick: () => {
+                            onImage(null)
+                            onShape(blobShapeString(seedPart, k))
+                          },
+                          children: k
+                            ? jsx(BotFace, { shape: blobShapeString(seedPart, k), color, size: 32, name: pickerName })
+                            : jsx('span', { className: 'text-[0.6rem] text-(--ui-text-tertiary)', children: 'Auto' })
+                        },
+                        k || 'auto'
+                      )
+                    )
+                  }),
+                  jsxs('div', {
+                    className: 'flex items-center gap-1',
+                    children: [
+                      jsxs(Button, {
+                        type: 'button',
+                        variant: 'ghost',
+                        size: 'sm',
+                        onClick: () => {
+                          onImage(null)
+                          onShape(blobShapeString(Math.random().toString(36).slice(2, 10), kind))
+                        },
+                        children: [jsx(Codicon, { name: 'refresh', className: 'mr-1 text-[0.8rem]' }), 'Randomize']
+                      }),
+                      jsxs(Button, {
+                        type: 'button',
+                        variant: 'ghost',
+                        size: 'sm',
+                        title: locked
+                          ? 'Unlock — the face follows the agent\u2019s name again'
+                          : 'Keep this exact face even if the name changes',
+                        onClick: () => onShape(blobShapeString(locked ? '' : pickerName, kind)),
+                        children: [
+                          jsx(Codicon, { name: locked ? 'unlock' : 'lock', className: 'mr-1 text-[0.8rem]' }),
+                          locked ? 'Unlock' : 'Lock face'
+                        ]
+                      })
+                    ]
+                  }),
+                  jsx('div', {
+                    className: 'text-center text-[0.65rem] text-(--ui-text-quaternary)',
+                    children: locked ? 'Face locked — renaming won\u2019t change it.' : 'Face follows the name.'
+                  }),
+                  jsx(Button, {
+                    type: 'button',
+                    variant: 'ghost',
+                    size: 'sm',
+                    className: 'text-(--ui-text-tertiary)',
+                    onClick: () => onShape(defaultShapeFor(pickerName)),
+                    children: 'Classic shapes'
+                  })
+                ]
+              })
+            })()
+          : jsxs('div', {
             className: 'grid justify-items-center gap-3',
             children: [
               jsx('div', {
@@ -2081,11 +2262,12 @@ function AvatarPicker({ shape, color, image, onShape, onColor, onImage, generate
                   gap: '6px',
                   justifyItems: 'center'
                 },
-                children: AVATAR_PICKER_SHAPES.map(s =>
+                children: (blobatarSvg ? ['blobatar', ...AVATAR_PICKER_SHAPES] : AVATAR_PICKER_SHAPES).map(s =>
                   jsx(
                     'button',
                     {
                       type: 'button',
+                      title: s === 'blobatar' ? 'Blob face — drawn from the agent\u2019s name' : undefined,
                       className: cn(
                         'flex items-center justify-center rounded-md transition-colors hover:bg-(--chrome-action-hover)',
                         s === shape && !image && 'ring-1 ring-(--ui-accent)'
@@ -3514,10 +3696,15 @@ function groupSpeakerLabel(name) {
 /** Room-log line as a member sees it: `Name (user): …` / `Name: …` /
  *  `Name (you): …`. */
 function formatGroupChatLine(entry, viewerName) {
-  // Attachments are staged into each member's session as real images; the
-  // transcript line names them so the delta text and the pixels line up.
+  // Attachments are staged into each member's session as real payloads; the
+  // transcript line names them so the delta text and the bytes line up.
   const attached = Array.isArray(entry.images) && entry.images.length
-    ? ` ${entry.images.map(img => `[attached image: ${img.name || 'image'}]`).join(' ')}`
+    ? ` ${entry.images
+        .map(img => {
+          const label = img.kind === 'pdf' ? 'attached PDF' : img.kind === 'file' ? 'attached file' : 'attached image'
+          return `[${label}: ${img.name || 'image'}]`
+        })
+        .join(' ')}`
     : ''
 
   if (entry.from.kind === 'user') {
@@ -3884,28 +4071,55 @@ async function runGroupChatMemberTurn(group, member, prompt, thread, images) {
   }
 
   // Stage this delta's attachments into the member's session so the model
-  // receives the actual pixels with the prompt (the same image.attach_bytes
-  // path the 1:1 chat uses — it also works cross-connection, where the
-  // member's gateway can't see this machine's files). A failed attach
-  // degrades that member to text-only; the transcript line still names the
-  // image so the member knows something was shared.
+  // receives the actual payload with the prompt — the same attach RPCs the
+  // 1:1 chat uses (they also work cross-connection, where the member's
+  // gateway can't see this machine's files). Images queue as vision tiles,
+  // PDFs render per-page via pdf.attach, and other files materialize in the
+  // session workspace (their @file: refs are appended to the prompt so the
+  // member's file tools can read them). A failed attach degrades that
+  // member to text-only; the transcript line still names the attachment so
+  // the member knows something was shared.
+  const fileRefs = []
+
   for (const img of Array.isArray(images) ? images : []) {
     if (!img || typeof img.data !== 'string' || !img.data) {
       continue
     }
 
     try {
-      await requestForBot(member, 'image.attach_bytes', {
-        session_id: runtime,
-        content_base64: img.data,
-        filename: img.name || 'attachment.png'
-      })
+      if (img.kind === 'pdf') {
+        await requestForBot(member, 'pdf.attach', {
+          session_id: runtime,
+          content_base64: img.data,
+          filename: img.name || 'attachment.pdf'
+        })
+      } else if (img.kind === 'file') {
+        const res = await requestForBot(member, 'file.attach', {
+          session_id: runtime,
+          data_url: img.data,
+          name: img.name || 'attachment'
+        })
+
+        if (res?.ref_text) {
+          fileRefs.push(`${img.name || 'attachment'} → ${res.ref_text}`)
+        }
+      } else {
+        await requestForBot(member, 'image.attach_bytes', {
+          session_id: runtime,
+          content_base64: img.data,
+          filename: img.name || 'attachment.png'
+        })
+      }
     } catch {
       /* text-only fallback for this member */
     }
   }
 
-  await requestForBot(member, 'prompt.submit', { session_id: runtime, text: prompt })
+  const turnText = fileRefs.length
+    ? `${prompt}\n\nAttached files staged in your session workspace:\n${fileRefs.join('\n')}`
+    : prompt
+
+  await requestForBot(member, 'prompt.submit', { session_id: runtime, text: turnText })
 
   const started = Date.now()
   let deadline = started + GROUP_TURN_TIMEOUT_MS
@@ -5764,7 +5978,9 @@ function CreateAgentDialog({ open, onClose, roster }) {
   const flightRef = useRef(null)
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
-  const [shape, setShape] = useState('circle')
+  // Default shapes mode: deterministic blob face drawn from the agent's name
+  // (falls back to the legacy shape vocabulary on older SDKs).
+  const [shape, setShape] = useState(blobatarSvg ? 'blobatar' : 'circle')
   const [color, setColor] = useState(AVATAR_COLORS[3])
   const [image, setImage] = useState(null)
   const [advanced, setAdvanced] = useState(false)
@@ -5861,7 +6077,7 @@ function CreateAgentDialog({ open, onClose, roster }) {
     setName('')
     setTitle('')
     setDescription('')
-    setShape('circle')
+    setShape(blobatarSvg ? 'blobatar' : 'circle')
     setColor(AVATAR_COLORS[3])
     setImage(null)
     setAdvanced(false)
@@ -8307,16 +8523,34 @@ function GroupChatWorkspace({ group, members, onBack }) {
     setPendingImages(prev => ({ ...prev, [key]: (prev[key] || []).filter((_, i) => i !== index) }))
   }
 
-  // Ctrl/⌘-V a screenshot into any composer in this room.
+  // Ctrl/⌘-V a screenshot (or any file) into any composer in this room.
   const pasteImages = (thread, event) => {
-    const files = [...(event.clipboardData?.files || [])].filter(f => /^image\//.test(f.type || ''))
+    const files = [...(event.clipboardData?.files || [])]
 
     if (!files.length) {
       return
     }
 
     event.preventDefault()
-    void filesToGroupImages(files).then(picked => addImages(thread, picked))
+    void filesToGroupAttachments(files).then(picked => addImages(thread, picked))
+  }
+
+  // Drag & drop anywhere on the room drops into the ACTIVE composer — the
+  // open reply box when one owns the composer, else the main (new-thread)
+  // composer. Matches the 1:1 chat's drop affordance.
+  const [dragOver, setDragOver] = useState(false)
+
+  const dropFiles = event => {
+    const files = [...(event.dataTransfer?.files || [])]
+
+    setDragOver(false)
+
+    if (!files.length) {
+      return
+    }
+
+    event.preventDefault()
+    void filesToGroupAttachments(files).then(picked => addImages(replyThread, picked))
   }
 
   const header = jsxs('div', {
@@ -8421,8 +8655,9 @@ function GroupChatWorkspace({ group, members, onBack }) {
     setOpenThreads(prev => ({ ...prev, [thread]: true }))
   }
 
-  /** Pending-attachment chips + the paperclip picker for one composer
-   *  (thread = null → main). Chips preview the image and X removes it. */
+  /** Pending-attachment chips + the picker for one composer (thread = null →
+   *  main). Image chips preview the pixels; PDFs/files show a type icon.
+   *  X removes it. */
   const attachmentRow = thread => {
     const images = imagesFor(thread)
 
@@ -8437,7 +8672,12 @@ function GroupChatWorkspace({ group, members, onBack }) {
           className:
             'flex items-center gap-1 rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-secondary,#181818) px-1 py-0.5',
           children: [
-            jsx('img', { src: img.data, alt: '', className: 'size-6 rounded object-cover' }),
+            img.kind === 'pdf' || img.kind === 'file'
+              ? jsx(Codicon, {
+                  name: img.kind === 'pdf' ? 'file-pdf' : 'file',
+                  className: 'text-[0.9rem] text-(--ui-text-tertiary)'
+                })
+              : jsx('img', { src: img.data, alt: '', className: 'size-6 rounded object-cover' }),
             jsx('span', {
               className: 'max-w-32 truncate text-[0.65rem] text-(--ui-text-tertiary)',
               children: img.name || 'image'
@@ -8461,9 +8701,9 @@ function GroupChatWorkspace({ group, members, onBack }) {
       variant: 'ghost',
       size: 'sm',
       className: 'shrink-0 text-(--ui-text-tertiary) hover:text-foreground',
-      title: 'Attach images — every responding bot sees them',
-      onClick: () => void pickGroupImages().then(picked => addImages(thread, picked)),
-      children: jsx(Codicon, { name: 'device-camera' })
+      title: 'Attach files — every responding bot sees them',
+      onClick: () => void pickGroupAttachments().then(picked => addImages(thread, picked)),
+      children: jsx(Codicon, { name: 'attach' })
     })
 
   // One log entry, rendered exactly as before conversation folding existed.
@@ -8564,18 +8804,30 @@ function GroupChatWorkspace({ group, members, onBack }) {
                             'data-selectable-text': 'true',
                             children: Streamdown ? jsx(Streamdown, { children: entry.text }) : entry.text
                           }),
-                          // User attachments: the images every responding bot was shown.
+                          // User attachments: what every responding bot was
+                          // shown — image previews, or a named chip for
+                          // PDFs/files.
                           Array.isArray(entry.images) && entry.images.length
                             ? jsx('div', {
-                                className: 'mt-1 flex flex-wrap gap-1.5',
+                                className: 'mt-1 flex flex-wrap items-center gap-1.5',
                                 children: entry.images.map((img, imgIndex) =>
-                                  jsx('img', {
-                                    src: img.data,
-                                    alt: img.name || 'attached image',
-                                    title: img.name || 'attached image',
-                                    className:
-                                      'max-h-40 max-w-60 rounded-md border border-(--ui-stroke-secondary) object-contain'
-                                  }, `${entryKey}:img:${imgIndex}`)
+                                  img.kind === 'pdf' || img.kind === 'file'
+                                    ? jsxs('div', {
+                                        className:
+                                          'flex items-center gap-1 rounded-md border border-(--ui-stroke-secondary) px-1.5 py-1 text-[0.65rem] text-(--ui-text-tertiary)',
+                                        title: img.name || 'attached file',
+                                        children: [
+                                          jsx(Codicon, { name: img.kind === 'pdf' ? 'file-pdf' : 'file', className: 'text-[0.8rem]' }),
+                                          jsx('span', { className: 'max-w-48 truncate', children: img.name || 'attached file' })
+                                        ]
+                                      }, `${entryKey}:img:${imgIndex}`)
+                                    : jsx('img', {
+                                        src: img.data,
+                                        alt: img.name || 'attached image',
+                                        title: img.name || 'attached image',
+                                        className:
+                                          'max-h-40 max-w-60 rounded-md border border-(--ui-stroke-secondary) object-contain'
+                                      }, `${entryKey}:img:${imgIndex}`)
                                 )
                               })
                             : null
@@ -8717,8 +8969,29 @@ function GroupChatWorkspace({ group, members, onBack }) {
   })
 
   return jsxs('div', {
-    className: 'flex h-full flex-col',
+    className: 'relative flex h-full flex-col',
+    onDragOver: event => {
+      if ([...(event.dataTransfer?.types || [])].includes('Files')) {
+        event.preventDefault()
+        setDragOver(true)
+      }
+    },
+    onDragLeave: event => {
+      // Only clear when leaving the room container itself, not when the
+      // cursor moves between its children.
+      if (!event.currentTarget.contains(event.relatedTarget)) {
+        setDragOver(false)
+      }
+    },
+    onDrop: dropFiles,
     children: [
+      dragOver
+        ? jsx('div', {
+            className:
+              'pointer-events-none absolute inset-0 z-40 flex items-center justify-center border-2 border-dashed border-(--ui-accent,#4f9cf9) text-sm font-medium text-(--ui-accent,#4f9cf9)',
+            children: replyThread ? 'Drop to attach to this thread reply' : 'Drop to attach — every responding bot sees it'
+          }, 'dropzone')
+        : null,
       header,
       jsx(ScrollArea, {
         className: 'min-h-0 flex-1',
