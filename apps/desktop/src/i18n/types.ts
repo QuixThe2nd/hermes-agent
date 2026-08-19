@@ -2530,6 +2530,11 @@ export interface Translations {
   zones: {
     showHeader: string
     hideHeader: string
+    showStripTab: (title: string) => string
+    hideStripTab: (title: string) => string
+    lastTabKeptTitle: string
+    lastTabKeptBody: string
+    toggleStripTab: (title: string) => string
     minimize: string
     restore: string
     closeRunningTitle: string
@@ -2633,6 +2638,9 @@ export interface Translations {
       skip: string
       skipped: string
       continueLabel: string
+      confirmAndContinueLabel: string
+      answeredBadge: string
+      questionProgress: (answered: number, total: number) => string
       lateAnswer: (question: string, choice: string) => string
       lateAnswerTip: string
       lateAnswerHint: string
