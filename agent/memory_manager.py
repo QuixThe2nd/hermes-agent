@@ -34,6 +34,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
+from agent.memory_provider import strip_gateway_scaffolding
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.registry import tool_error
 
@@ -511,16 +512,20 @@ class MemoryManager:
         When a user invokes a /skill or /bundle, Hermes expands the turn into
         a model-facing message that embeds the entire skill body. Feeding that
         verbatim to memory providers pollutes their stores/embeddings with
-        prompt scaffolding instead of what the user actually asked. We recover
-        just the user's instruction here, once, for every provider — so this
-        is fixed for the whole provider fan-out, not per backend.
+        prompt scaffolding instead of what the user actually asked. Gateway
+        sessions may also prepend Discord metadata and shared-session sender
+        prefixes; those are stripped first via ``strip_gateway_scaffolding``,
+        then skill scaffolding is recovered here — once, for every provider.
 
-        - Non-skill messages pass through unchanged.
+        - Non-skill messages pass through unchanged (after gateway stripping).
         - Skill turns with a user instruction return that instruction.
         - Bare skill invocations (no instruction) return None → callers skip
           the turn, since there is no user content worth remembering.
         """
-        return extract_user_instruction_from_skill_message(text)
+        if not isinstance(text, str):
+            return extract_user_instruction_from_skill_message(text)
+        cleaned = strip_gateway_scaffolding(text)
+        return extract_user_instruction_from_skill_message(cleaned)
 
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
         """Collect prefetch context from all providers.

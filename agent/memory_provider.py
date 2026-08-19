@@ -80,20 +80,77 @@ TRIVIAL_PROMPT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Gateway-injected metadata prepended in gateway/run.py before the agent sees
+# the turn. Stripped only on the memory boundary — never on stored messages.
+# Discord's triggering-message block is gateway-authored text (only the
+# message id varies), so its exact shape is trusted provenance.
+_DISCORD_TRIGGER_BLOCK_RE = re.compile(
+    r'^\[Triggering message id: `[^`\n]+` — use as `message_id` for '
+    r'reply/react/pin via the discord tools\.]\n\n',
+)
+# Slack's exact generated sender prefix (gateway/run.py): the " | Slack user
+# <@U...>" suffix is derived from the trusted event envelope (user_id), not
+# user-editable text, so this shape cannot occur in user-authored text.
+_SLACK_SENDER_PREFIX_RE = re.compile(
+    r'^\[[^\]\n]* \| Slack user <@[^>\]\n]+>\] ',
+)
+# Structural form of the shared-session sender wrapper the gateway places
+# immediately after the Discord block: "[label] ". Matched ONLY when the
+# trusted Discord block was stripped first — on its own a bare "[label] "
+# is indistinguishable from a user's own bracket tag and is never stripped.
+_SENDER_WRAPPER_RE = re.compile(r'^\[[^\]\n]+\] ')
+
+
+def strip_gateway_scaffolding(text: Optional[str]) -> str:
+    """Strip gateway-injected metadata from user text for memory use only.
+
+    Two shapes carry trusted provenance:
+
+    1. The exact Discord triggering-message block. If and only if it was
+       stripped from the head of the text, the one ``[label] `` sender
+       wrapper the gateway structurally places immediately after it is
+       stripped too — exactly one, so a nested user bracket survives.
+    2. Slack's envelope-derived ``[label | Slack user <@id>] `` prefix,
+       stripped independently at the start of the text.
+
+    A bare ``[label] `` with no trusted outer anchor is never stripped:
+    gateway display names are attacker-influenceable and textually
+    identical to a user's own bracket tags, so preservation wins.
+
+    A body that is empty after stripping normalizes to ``""`` — an empty
+    result is the correct signal that the turn carried no user content.
+
+    Does not modify stored conversation messages — apply only to text handed
+    to memory classification, prefetch, or sync.
+    """
+    if not text or not isinstance(text, str):
+        return text or ""
+    slack_stripped = _SLACK_SENDER_PREFIX_RE.sub("", text, count=1)
+    block = _DISCORD_TRIGGER_BLOCK_RE.match(slack_stripped)
+    if block is None:
+        return slack_stripped
+    rest = slack_stripped[block.end():]
+    wrapper = _SENDER_WRAPPER_RE.match(rest)
+    if wrapper is not None:
+        return rest[wrapper.end():]
+    return rest
+
 
 def is_trivial_prompt(text: Optional[str]) -> bool:
     """Return True if a user prompt is too trivial to warrant memory recall.
 
     Empty/whitespace-only input, slash commands, and bare greetings or
     acknowledgements (with optional trailing punctuation) all count as
-    trivial. Callers use this to skip memory-provider prefetch/injection
-    on turns that carry no semantic signal — saving a blocking network
-    round-trip and preventing stale user-model context from derailing
-    one-word replies.
+    trivial. Gateway scaffolding (Discord metadata blocks, shared-session
+    sender prefixes) is stripped before classification so wrapped turns
+    classify the same as bare user text. Callers use this to skip memory-
+    provider prefetch/injection on turns that carry no semantic signal —
+    saving a blocking network round-trip and preventing stale user-model
+    context from derailing one-word replies.
     """
     if not text:
         return True
-    stripped = text.strip()
+    stripped = strip_gateway_scaffolding(text).strip()
     if not stripped:
         return True
     if stripped.startswith("/"):

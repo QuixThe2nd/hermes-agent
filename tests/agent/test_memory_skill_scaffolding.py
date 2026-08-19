@@ -125,3 +125,52 @@ class TestMemoryManagerStripsScaffolding:
         mgr.flush_pending(timeout=5.0)
         assert provider.synced == []
 
+
+_DISCORD_BLOCK = (
+    "[Triggering message id: `{msg_id}` — use as "
+    "`message_id` for reply/react/pin via the discord tools.]\n\n"
+)
+
+
+def _discord_sender_wrap(body: str, msg_id: str = "123456", name: str = "parsayazdani") -> str:
+    return _DISCORD_BLOCK.format(msg_id=msg_id) + f"[{name}] {body}"
+
+
+class TestMemoryManagerGatewayThenSkillComposition:
+    """Gateway scaffolding is stripped before skill extraction; the two
+    normalizations compose at the shared MemoryManager boundary."""
+
+    def test_prefetch_all_strips_gateway_then_extracts_skill(self):
+        mgr, provider = _manager_with_recorder()
+        wrapped = _discord_sender_wrap(_SINGLE_SKILL_TURN)
+        mgr.prefetch_all(wrapped)
+        assert provider.prefetched == ["make a skill for release triage"]
+
+    def test_queue_prefetch_all_strips_gateway_before_provider(self):
+        mgr, provider = _manager_with_recorder()
+        query = "what did we decide about the postgres migration?"
+        mgr.queue_prefetch_all(_discord_sender_wrap(query))
+        mgr.flush_pending(timeout=5.0)
+        assert provider.queued == [query]
+
+    def test_sync_all_strips_gateway_before_provider(self):
+        mgr, provider = _manager_with_recorder()
+        query = "what did we decide about the postgres migration?"
+        mgr.sync_all(_discord_sender_wrap(query), "We decided to defer.")
+        mgr.flush_pending(timeout=5.0)
+        assert provider.synced == [query]
+
+    def test_standalone_bare_label_skill_turn_preserves_label(self):
+        # No trusted anchor: the bare label is preserved byte-for-byte, and
+        # because it now leads the text, the skill extractor's startswith
+        # match no longer fires — the turn passes through verbatim. That is
+        # the accepted preserve-direction trade-off; every real gateway
+        # flow (Discord block anchor, Slack envelope form) still strips
+        # first, so extraction works where the scaffolding is provenance-
+        # trusted.
+        mgr, provider = _manager_with_recorder()
+        text = "[parsayazdani] " + _SINGLE_SKILL_TURN
+        mgr.sync_all(text, "Done.")
+        mgr.flush_pending(timeout=5.0)
+        assert provider.synced == [text]
+
