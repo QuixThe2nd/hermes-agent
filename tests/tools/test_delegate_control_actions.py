@@ -134,6 +134,78 @@ def test_list_empty_registry_has_note():
     assert "note" in out
 
 
+class _StubChildWithActivity(_StubChild):
+    """Child stub exposing the AIAgent activity-summary contract."""
+
+    def __init__(self, parent=None, *, current_tool=None, idle_seconds=5.0):
+        super().__init__(parent)
+        self._summary = {
+            "current_tool": current_tool,
+            "api_call_count": 3,
+            "max_iterations": 40,
+            "seconds_since_activity": idle_seconds,
+        }
+
+    def get_activity_summary(self):
+        return dict(self._summary)
+
+
+def test_list_surfaces_child_liveness():
+    import time
+
+    from tools.delegate_tool import (
+        _HEARTBEAT_INTERVAL,
+        _HEARTBEAT_STALE_CYCLES_IDLE,
+        _HEARTBEAT_STALE_CYCLES_IN_TOOL,
+    )
+
+    parent = _StubParent()
+    busy = _StubChildWithActivity(parent, current_tool="terminal", idle_seconds=12.0)
+    wedged = _StubChildWithActivity(
+        parent, current_tool=None, idle_seconds=_HEARTBEAT_STALE_CYCLES_IDLE * _HEARTBEAT_INTERVAL + 60
+    )
+    slow_tool = _StubChildWithActivity(
+        parent, current_tool="webfetch", idle_seconds=_HEARTBEAT_STALE_CYCLES_IDLE * _HEARTBEAT_INTERVAL + 60
+    )
+    very_stuck_tool = _StubChildWithActivity(
+        parent, current_tool="terminal", idle_seconds=_HEARTBEAT_STALE_CYCLES_IN_TOOL * _HEARTBEAT_INTERVAL + 60
+    )
+    _register("sid-ctl-live-1", busy, started_at=time.time() - 30)
+    _register("sid-ctl-live-2", wedged, started_at=time.time() - 900)
+    _register("sid-ctl-live-3", slow_tool, started_at=time.time() - 900)
+    _register("sid-ctl-live-4", very_stuck_tool, started_at=time.time() - 2000)
+    try:
+        out = json.loads(_handle_control_action("list", None, None, parent))
+        by_id = {e["subagent_id"]: e for e in out["subagents"]}
+        assert by_id["sid-ctl-live-1"]["current_tool"] == "terminal"
+        assert by_id["sid-ctl-live-1"]["iteration"] == 3
+        assert by_id["sid-ctl-live-1"]["max_iterations"] == 40
+        assert by_id["sid-ctl-live-1"]["seconds_since_activity"] == 12.0
+        assert by_id["sid-ctl-live-1"]["stalled"] is False
+        # Idle child past the idle ceiling reads as stalled...
+        assert by_id["sid-ctl-live-2"]["stalled"] is True
+        # ...but the same idle time inside a tool does not (higher ceiling).
+        assert by_id["sid-ctl-live-3"]["stalled"] is False
+        # Past the in-tool ceiling it flips.
+        assert by_id["sid-ctl-live-4"]["stalled"] is True
+    finally:
+        for sid in ("sid-ctl-live-1", "sid-ctl-live-2", "sid-ctl-live-3", "sid-ctl-live-4"):
+            _unregister_subagent(sid)
+
+
+def test_list_without_activity_summary_omits_liveness_fields():
+    parent = _StubParent()
+    child = _StubChild(parent)  # no get_activity_summary
+    _register("sid-ctl-live-5", child)
+    try:
+        out = json.loads(_handle_control_action("list", None, None, parent))
+        entry = out["subagents"][0]
+        assert "stalled" not in entry
+        assert "seconds_since_activity" not in entry
+    finally:
+        _unregister_subagent("sid-ctl-live-5")
+
+
 # ---------------------------------------------------------------------------
 # action='steer'
 # ---------------------------------------------------------------------------
