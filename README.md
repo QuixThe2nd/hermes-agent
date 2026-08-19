@@ -1,6 +1,6 @@
-# Hermes — Quix Edition ☤
+# Hermes IDE ☤
 
-An edition of [Hermes Agent](https://github.com/NousResearch/hermes-agent) with extra tooling and gateway behavior, kept current with upstream (auto-synced hourly). Everything lands via PR with full CI.
+A developer edition of [Hermes Agent](https://github.com/NousResearch/hermes-agent): a Hermes that can maintain codebases, with extra tooling and gateway behavior, kept current with upstream (auto-synced hourly). Everything lands via PR with full CI.
 
 **What's different here:**
 - **Tools**
