@@ -169,12 +169,22 @@ def delegate_development(
     task: str,
     branch: str | None = None,
     *,
+    plan_mode: str | None = None,
     task_id: str | None = None,
 ) -> str:
     del task_id  # reserved for future correlation
 
     repo = (repo or "").strip()
     task = (task or "").strip()
+    mode_raw = (plan_mode or "").strip().lower() or "consult"
+    if mode_raw not in ("consult", "debate"):
+        return _make_result(
+            success=False,
+            task_id=None,
+            board=None,
+            deduplicated=False,
+            message="plan_mode must be 'consult' or 'debate'",
+        )
     if not task:
         return _make_result(
             success=False,
@@ -224,15 +234,15 @@ def delegate_development(
 
             _archive_terminal_tasks_for_resubmit(conn, idempotency_key)
 
-            body = json.dumps(
-                {
-                    "repo": repo,
-                    "branch": resolved_branch,
-                    "task": task,
-                    "submitted_at": datetime.now(timezone.utc).isoformat(),
-                },
-                ensure_ascii=False,
-            )
+            body_obj: dict[str, Any] = {
+                "repo": repo,
+                "branch": resolved_branch,
+                "task": task,
+                "submitted_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if mode_raw != "consult":
+                body_obj["plan_mode"] = mode_raw
+            body = json.dumps(body_obj, ensure_ascii=False)
             title = task if len(task) <= 120 else task[:117] + "..."
 
             new_task_id = kb.create_task(
@@ -304,6 +314,15 @@ DELEGATE_DEVELOPMENT_SCHEMA = {
                     "default branch."
                 ),
             },
+            "plan_mode": {
+                "type": "string",
+                "enum": ["consult", "debate"],
+                "description": (
+                    "consult = single-round council plan (default, cheaper); "
+                    "debate = multi-round adversarial council plan for "
+                    "big/ambiguous tasks."
+                ),
+            },
         },
         "required": ["repo", "task"],
     },
@@ -315,6 +334,7 @@ def _handle_delegate_development(args: dict, **kw: Any) -> str:
         repo=args.get("repo", ""),
         task=args.get("task", ""),
         branch=args.get("branch"),
+        plan_mode=args.get("plan_mode"),
         task_id=kw.get("task_id"),
     )
 
