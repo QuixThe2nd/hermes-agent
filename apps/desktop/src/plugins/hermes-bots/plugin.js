@@ -852,17 +852,21 @@ function defaultShapeFor(name) {
 //   'blobatar'                — the face follows the bot's NAME (renaming the
 //                               bot re-rolls the face, live in the dialog)
 //   'blobatar:<seed>'         — seed locked (the 🔒 lock / 🎲 randomize picks)
-//   'blobatar:<seed>:<kind>'  — plus one of the six silhouettes pinned
+//   'blobatar:<seed>:<kind>'  — plus one of the ten silhouettes pinned
 //   'blobatar::<kind>'        — silhouette pinned, seed still follows the name
 // Bot names are slugs (NAME_RE) and generated seeds are base36, so ':' never
 // appears inside a segment. Colors come from the library's own name-derived
 // palette (contrast-guaranteed) — the classic color swatches don't apply.
 
-const BLOB_KINDS = ['round', 'organic', 'boxy', 'nub', 'cloud', 'sun']
+const BLOB_KINDS = ['round', 'organic', 'boxy', 'capsule', 'nub', 'cloud', 'droplet', 'hexagon', 'sun', 'triangle']
 
 // Trait positions at the center of each silhouette band. Band thresholds are
-// frozen per blobatar major (0.28 / 0.58 / 0.72 / 0.84 / 0.93).
-const BLOB_KIND_TRAIT = { round: 0.14, organic: 0.43, boxy: 0.65, nub: 0.78, cloud: 0.885, sun: 0.965 }
+// frozen per blobatar major (gen2: 0.22 / 0.48 / 0.60 / 0.70 / 0.79 / 0.86 /
+// 0.915 / 0.95 / 0.98).
+const BLOB_KIND_TRAIT = {
+  round: 0.11, organic: 0.35, boxy: 0.54, capsule: 0.65, nub: 0.745,
+  cloud: 0.825, droplet: 0.8875, hexagon: 0.9325, sun: 0.965, triangle: 0.99
+}
 
 function isBlobShape(shape) {
   return shape === 'blobatar' || (typeof shape === 'string' && shape.startsWith('blobatar:'))
@@ -4596,7 +4600,11 @@ function previewKind(preview) {
   }
   const match = text.match(A2A_RE)
   if (match) {
-    return { fromBot: (match[1] || match[2] || '').trim().toLowerCase() || null }
+    // The captured name is whatever the delivery prefix carried — a raw
+    // profile name. Map it the way every other surface does so the primary
+    // profile reads @hermes, never @default (#89484).
+    const sender = (match[1] || match[2] || '').trim().toLowerCase()
+    return { fromBot: sender ? botHandle(sender) : null }
   }
   return { fromBot: null }
 }
@@ -7462,6 +7470,24 @@ function CreateRoutineDialog({ bot, open, onClose }) {
   })
 }
 
+/** Keeps $selectedBot in sync with the focused chat's owner profile.
+ *  nanostores' `.listen()` never replays the current value the way
+ *  `.subscribe()` does, so a disable → profile switch → re-enable sequence
+ *  would otherwise leave $selectedBot pointed at whichever bot was active
+ *  before the plugin was disabled — reseeding here on every register() call
+ *  closes that gap. Returns the unbind function for ctx.onDispose. */
+function bindProfileSync(profileStore) {
+  const current = profileStore.get?.()
+  if (current && typeof current === 'string') {
+    $selectedBot.set(current)
+  }
+  return profileStore.listen(profile => {
+    if (profile && typeof profile === 'string') {
+      $selectedBot.set(profile)
+    }
+  })
+}
+
 function RoutinesPane() {
   const selected = useValue($selectedBot)
   const focusedProfile = useValue($focusedBotProfile)
@@ -9171,8 +9197,12 @@ function GroupRow({ group, members, needsYou, onOpen }) {
   const log = Array.isArray(room.log) ? room.log : []
   const last = log.length ? log[log.length - 1] : null
   const lastAt = groupLastActivity(room)
+  // Room previews speak the same handle vocabulary as the roster, mentions
+  // and the group prompt: the primary profile is @hermes, not @default.
+  const lastFrom = last?.from?.name || ''
+  const lastHandle = botHandle(lastFrom || 'bot', members.find(member => member?.name === lastFrom))
   const preview = last
-    ? `${last.from?.kind === 'user' ? 'You' : `@${last.from?.name || 'bot'}`}: ${stripPreviewMarkdown(last.text) || '…'}`
+    ? `${last.from?.kind === 'user' ? 'You' : `@${lastHandle}`}: ${stripPreviewMarkdown(last.text) || '…'}`
     : 'No messages yet — say hi to the room'
   const faces = members.slice(0, 3)
 
@@ -9846,11 +9876,7 @@ export default {
     // Capture the unbinds: without them a disable → re-enable cycle stacks a
     // duplicate listener per cycle (same survives-disable class as the face
     // clock before its onDispose hook — these kept firing until app restart).
-    const unbindProfileListener = $focusedBotProfile.listen(profile => {
-      if (profile && typeof profile === 'string') {
-        $selectedBot.set(profile)
-      }
-    })
+    const unbindProfileListener = bindProfileSync($focusedBotProfile)
     const unbindGatewayListener = host.state.gateway.listen(handleSessionsGatewayTransition)
 
     if (typeof ctx.onDispose === 'function') {
@@ -9932,7 +9958,8 @@ export default {
         title: 'Cronjobs',
         data: {
           placement: 'main',
-          dock: { pane: 'workspace', pos: 'right' },
+          // Repair persisted layouts that stranded Cronjobs in the Bots tab strip.
+          dock: { pane: 'workspace', pos: 'right', enforce: true },
           width: '250px'
         },
         render: () => jsx(RoutinesPane, {})
