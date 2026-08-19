@@ -188,6 +188,58 @@ def test_notify_sub_registration_is_best_effort(kanban_home, git_repo, monkeypat
     assert result["success"] is True
 
 
+def test_plan_mode_none_defaults_to_consult_body(kanban_home, git_repo, monkeypatch):
+    monkeypatch.setattr(dpt, "check_dev_pipeline_requirements", lambda: True)
+    with patch.object(dpt, "_maybe_register_notify_sub"):
+        raw = dpt.delegate_development(
+            repo=str(git_repo),
+            task="Add widget",
+            plan_mode=None,
+        )
+    result = _parse_result(raw)
+    assert result["success"] is True
+
+    conn = kb.connect(board="dev")
+    try:
+        task = kb.get_task(conn, result["task_id"])
+        body = json.loads(task.body)
+        assert "plan_mode" not in body
+    finally:
+        conn.close()
+
+
+def test_plan_mode_debate_normalized_and_stored(kanban_home, git_repo, monkeypatch):
+    monkeypatch.setattr(dpt, "check_dev_pipeline_requirements", lambda: True)
+    with patch.object(dpt, "_maybe_register_notify_sub"):
+        raw = dpt.delegate_development(
+            repo=str(git_repo),
+            task="Big refactor",
+            plan_mode="DEBATE",
+        )
+    result = _parse_result(raw)
+    assert result["success"] is True
+
+    conn = kb.connect(board="dev")
+    try:
+        task = kb.get_task(conn, result["task_id"])
+        body = json.loads(task.body)
+        assert body["plan_mode"] == "debate"
+    finally:
+        conn.close()
+
+
+def test_plan_mode_garbage_rejected(kanban_home, git_repo, monkeypatch):
+    monkeypatch.setattr(dpt, "check_dev_pipeline_requirements", lambda: True)
+    raw = dpt.delegate_development(
+        repo=str(git_repo),
+        task="Add widget",
+        plan_mode="roundtable",
+    )
+    result = _parse_result(raw)
+    assert result["success"] is False
+    assert result["message"] == "plan_mode must be 'consult' or 'debate'"
+
+
 class TestRepoUrlCredentialGuard:
     def test_https_url_with_userinfo_rejected(self):
         from plugins.dev_pipeline.pipeline import validate_repo_input

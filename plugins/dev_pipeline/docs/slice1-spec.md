@@ -6,6 +6,10 @@ Status: approved architecture, ready for implementation.
 
 Architecture decision record: `/root/.hermes/second-brain/2026-08-10-automated-development-pipeline-moa-debate.md` (MoA debate, 4 configured models, 3 rounds, independently verified).
 
+### Addendum: `plan_mode` (2026-08-19)
+
+`delegate_development` accepts an optional `plan_mode` parameter: `consult` (default) uses `tools.moa_tool.consult_moa`; `debate` uses `tools.moa_debate.moa_debate` directly for multi-round adversarial planning on big or ambiguous tasks. The executor adapts debate output into the same synthesis path as consult — no reimplementation of either tool.
+
 ## Goal
 
 One user entrypoint: `delegate_development(repo, task)`. Hermes plans via the configured MoA council, executes bounded work through Cursor, verifies mechanically, reviews with Kimi K3 + Grok 4.5, and opens a draft PR on pass. The job survives gateway restart, executor restart, and host reboot. The user never chooses a lane.

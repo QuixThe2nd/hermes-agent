@@ -201,3 +201,107 @@ def test_heartbeat_scope_fires_during_slow_planning(kanban_home):
         t.name.startswith("dev-hb-") and t.is_alive() for t in threading.enumerate()
     )
     conn.close()
+
+
+def _valid_contract(*, task_summary: str = "fix bug") -> dict:
+    return {
+        "task_summary": task_summary,
+        "lane_hint": "cursor",
+        "estimated_minutes": 10,
+        "allowed_paths": ["src/"],
+        "acceptance_commands": ["true"],
+        "broad_flags": {
+            "migration": False,
+            "repo_wide_change": False,
+            "toolchain_change": False,
+            "multi_subsystem": False,
+            "long_verification": False,
+        },
+        "blocked_reasons": [],
+        "step_plan": [{"id": "s1", "description": "fix it", "verifiable": True}],
+        "assumptions": [],
+    }
+
+
+def test_run_planning_debate_orders_advisors_by_would_adopt_tally():
+    contract_a = _valid_contract(task_summary="from low tally")
+    contract_b = _valid_contract(task_summary="from high tally")
+
+    def fake_debate(**_kwargs):
+        return json.dumps({
+            "success": True,
+            "partial": False,
+            "advisors": [
+                {
+                    "label": "low",
+                    "status": "ok",
+                    "answer": json.dumps(contract_a),
+                },
+                {
+                    "label": "high",
+                    "status": "ok",
+                    "answer": json.dumps(contract_b),
+                },
+            ],
+            "revisions": [],
+            "agreement": {"would_adopt_tally": {"low": 1, "high": 3}},
+        })
+
+    contract, block_kind, _advisors = ex.run_planning(
+        "fix bug",
+        "summary",
+        plan_mode="debate",
+        debate_fn=fake_debate,
+    )
+    assert block_kind == ""
+    assert contract is not None
+    assert contract["task_summary"] == "from high tally"
+
+
+def test_run_planning_debate_prefers_revision_over_round_one_answer():
+    contract = _valid_contract(task_summary="from revision")
+
+    def fake_debate(**_kwargs):
+        return json.dumps({
+            "success": True,
+            "partial": False,
+            "advisors": [
+                {
+                    "label": "a1",
+                    "status": "ok",
+                    "answer": "not valid json",
+                },
+            ],
+            "revisions": [
+                {
+                    "label": "a1",
+                    "status": "ok",
+                    "final_position": json.dumps(contract),
+                },
+            ],
+            "agreement": {"would_adopt_tally": {"a1": 2}},
+        })
+
+    contract_out, block_kind, _advisors = ex.run_planning(
+        "fix bug",
+        "summary",
+        plan_mode="debate",
+        debate_fn=fake_debate,
+    )
+    assert block_kind == ""
+    assert contract_out is not None
+    assert contract_out["task_summary"] == "from revision"
+
+
+def test_run_planning_debate_failure_returns_planning_unavailable():
+    def failing_debate(**_kwargs):
+        return json.dumps({"success": False, "error": "council unavailable"})
+
+    contract, block_kind, _advisors = ex.run_planning(
+        "fix bug",
+        "summary",
+        plan_mode="debate",
+        debate_fn=failing_debate,
+    )
+    assert contract is None
+    assert block_kind == "planning_unavailable"

@@ -40,6 +40,7 @@ from plugins.dev_pipeline.pipeline import (
 from tools.agent_cli_runner import run_agent_cli
 from tools.claude_agent_tool import resolve_claude_binary
 from tools.cursor_agent_tool import resolve_cursor_agent_binary
+from tools.moa_debate import moa_debate
 from tools.moa_tool import consult_moa
 
 # Repo root = two levels up from plugins/dev_pipeline/executor.py.
@@ -620,6 +621,56 @@ def extract_json_object(text: str) -> Any:
     return None
 
 
+def _debate_result_as_moa(debate: dict[str, Any]) -> dict[str, Any]:
+    """Adapt moa_debate output to the shape synthesize_plan_from_moa expects."""
+    advisors = debate.get("advisors") or []
+    revisions = debate.get("revisions") or []
+    agreement = debate.get("agreement") or {}
+    tally = agreement.get("would_adopt_tally") or {}
+
+    revision_by_label: dict[str, str] = {}
+    for rev in revisions:
+        if not isinstance(rev, dict):
+            continue
+        label = rev.get("label")
+        if label:
+            revision_by_label[str(label)] = str(rev.get("final_position") or "")
+
+    moa_advisors: list[dict[str, Any]] = []
+    for adv in advisors:
+        if not isinstance(adv, dict):
+            continue
+        label = adv.get("label")
+        label_s = str(label) if label is not None else ""
+        if label_s in revision_by_label:
+            advice = revision_by_label[label_s]
+        else:
+            advice = adv.get("answer") or ""
+        moa_advisors.append({
+            "label": label,
+            "status": adv.get("status"),
+            "advice": advice,
+        })
+
+    if tally:
+        moa_advisors.sort(
+            key=lambda a: tally.get(str(a.get("label") or ""), 0),
+            reverse=True,
+        )
+
+    partial = any(
+        (adv.get("status") or "") != "ok"
+        for adv in advisors
+        if isinstance(adv, dict)
+    )
+
+    return {
+        "success": debate.get("success", True),
+        "partial": partial,
+        "advisors": moa_advisors,
+    }
+
+
 def synthesize_plan_from_moa(
     moa_result: dict[str, Any],
 ) -> tuple[Optional[dict[str, Any]], list[str], list[dict[str, Any]]]:
@@ -657,7 +708,9 @@ def run_planning(
     task_text: str,
     repo_summary: str,
     *,
+    plan_mode: str = "consult",
     consult_fn: Callable[..., str] = consult_moa,
+    debate_fn: Callable[..., str] = moa_debate,
 ) -> tuple[Optional[dict[str, Any]], str, list[dict[str, Any]]]:
     """Run MoA planning with one validation retry."""
     prompt = build_planning_prompt(task_text, repo_summary)
@@ -670,17 +723,25 @@ def run_planning(
             question += "\n\nPrevious attempt failed validation:\n" + "\n".join(
                 f"- {e}" for e in last_errors
             )
-        raw = consult_fn(
-            question=question, decision_needed="Return the plan contract JSON."
-        )
+        if plan_mode == "debate":
+            raw = debate_fn(
+                question=question, decision_needed="Return the plan contract JSON."
+            )
+        else:
+            raw = consult_fn(
+                question=question, decision_needed="Return the plan contract JSON."
+            )
         try:
-            moa = json.loads(raw)
+            parsed = json.loads(raw)
         except json.JSONDecodeError:
             return None, "planning_unavailable", advisor_log
 
-        if not moa.get("success"):
+        if not parsed.get("success"):
             return None, "planning_unavailable", advisor_log
 
+        moa = (
+            _debate_result_as_moa(parsed) if plan_mode == "debate" else parsed
+        )
         contract, errors, statuses = synthesize_plan_from_moa(moa)
         advisor_log = statuses
         if contract:
@@ -1747,6 +1808,7 @@ class DevExecutor:
         task_text = str(body.get("task") or "")
         repo = str(body.get("repo") or "")
         branch = str(body.get("branch") or "main")
+        plan_mode = str(body.get("plan_mode") or "consult")
         ws_root, _logs = workspace_paths(task_id, self.board)
         repo_dir = ws_root / "repo"
         if not repo_dir.is_dir():
@@ -1761,7 +1823,9 @@ class DevExecutor:
 
         def _planning_target() -> None:
             try:
-                outcome["result"] = run_planning(task_text, summary)
+                outcome["result"] = run_planning(
+                    task_text, summary, plan_mode=plan_mode
+                )
             except Exception as exc:
                 outcome["error"] = exc
 
@@ -1805,7 +1869,7 @@ class DevExecutor:
             task_id,
             run_id,
             PHASE_PLANNING,
-            {"advisors": advisors},
+            {"advisors": advisors, "plan_mode": plan_mode},
         )
         if not contract:
             block_dev_task(
