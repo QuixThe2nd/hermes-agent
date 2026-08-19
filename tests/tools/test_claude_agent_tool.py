@@ -122,7 +122,7 @@ def test_schema_registration():
     assert required == {"task", "workdir"}
 
     props = schema["parameters"]["properties"]
-    assert props["model"]["default"] == "glm-5.2"
+    assert "default" not in props["model"]
     assert props["timeout_seconds"]["default"] == 0
     assert props["allowed_tools"]["default"] == "Read,Write,Edit,Glob,Grep,Bash"
     assert props["permission_mode"]["default"] == "acceptEdits"
@@ -383,8 +383,7 @@ def test_happy_path_e2e(monkeypatch, repo, fake_binary, tmp_path):
     argv = json.loads(argv_out.read_text(encoding="utf-8"))
     assert argv[0] == str(fake_binary)
     assert "-p" in argv
-    assert "--model" in argv
-    assert argv[argv.index("--model") + 1] == "glm-5.2"
+    assert "--model" not in argv
     assert "--permission-mode" in argv
     assert argv[argv.index("--permission-mode") + 1] == "acceptEdits"
     assert "--allowedTools" in argv
@@ -477,7 +476,7 @@ def test_timeout_kills_process_group(monkeypatch, repo, fake_binary):
 
     monkeypatch.setattr("tools.claude_agent_tool.time.monotonic", _fake_monotonic)
     monkeypatch.setattr(claude_agent_tool, "STALL_WATCHDOG_SECONDS", 9999)
-    monkeypatch.setattr(claude_agent_tool, "_MONITOR_POLL_SECONDS", 0.001)
+    monkeypatch.setattr("tools.agent_cli_runner._MONITOR_POLL_SECONDS", 0.001)
 
     result = json.loads(
         claude_agent_tool.delegate_claude_agent(
