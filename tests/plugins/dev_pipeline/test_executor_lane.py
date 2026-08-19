@@ -138,18 +138,17 @@ def test_run_attempt_cli_claude_branch(kanban_home, tmp_path):
     ex.save_run_metadata(conn, run.id, meta)
     conn.close()
 
-    mock_proc = MagicMock()
-    mock_proc.stdout = iter(['{"type":"result"}\n'])
-    mock_proc.wait.return_value = 0
-
     with patch.object(ex, "resolve_claude_binary", return_value="/bin/claude-glm"):
-        with patch("plugins.dev_pipeline.executor.subprocess.Popen", return_value=mock_proc) as popen:
+        with patch(
+            "plugins.dev_pipeline.executor.run_agent_cli",
+            return_value=(None, str(logs / f"attempt-{run.id}.jsonl"), "", 0.0, 0),
+        ) as run_cli:
             with pytest.raises(SystemExit) as exc:
                 ex.run_attempt_cli(task_id, run.id, lane="claude-endurance")
             assert exc.value.code == 0
 
-    popen.assert_called_once()
-    cmd = popen.call_args[0][0]
+    run_cli.assert_called_once()
+    cmd = run_cli.call_args[0][0]
     assert cmd[0] == "/bin/claude-glm"
     assert "-p" in cmd
     assert "--model" not in cmd  # wrapper pins the model itself

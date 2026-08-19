@@ -37,6 +37,7 @@ from plugins.dev_pipeline.pipeline import (
     scan_diff_for_secrets,
     validate_plan_contract,
 )
+from tools.agent_cli_runner import run_agent_cli
 from tools.claude_agent_tool import resolve_claude_binary
 from tools.cursor_agent_tool import resolve_cursor_agent_binary
 from tools.moa_tool import consult_moa
@@ -2676,21 +2677,19 @@ def run_attempt_cli(task_id: str, run_id: int, *, lane: str = "cursor-bounded") 
                 "stream-json",
                 prompt,
             ]
-        with jsonl_path.open("w", encoding="utf-8") as out_fh:
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(repo_dir),
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                out_fh.write(line)
-                out_fh.flush()
-            rc = proc.wait()
-        sys.exit(rc)
+        error_code, _log_path, _log_text, _duration, returncode = run_agent_cli(
+            cmd,
+            workdir=str(repo_dir),
+            timeout_seconds=0,
+            stall_watchdog_seconds=600,
+            log_path=jsonl_path,
+            env=env,
+        )
+        if error_code in ("stalled", "timeout"):
+            sys.exit(124)
+        if error_code == "interrupted":
+            sys.exit(130)
+        sys.exit(returncode if returncode is not None else 1)
     finally:
         conn.close()
 

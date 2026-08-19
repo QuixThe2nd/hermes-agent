@@ -422,7 +422,7 @@ def test_stall_path_terminates_process(monkeypatch, tmp_path):
     monkeypatch.setattr("tools.cursor_agent_tool.resolve_cursor_agent_binary", lambda: "/usr/bin/agent")
     monkeypatch.setattr("tools.cursor_agent_tool.subprocess.Popen", _StalledFakePopen)
     monkeypatch.setattr(cursor_agent_tool, "STALL_WATCHDOG_SECONDS", 0.01)
-    monkeypatch.setattr(cursor_agent_tool, "_MONITOR_POLL_SECONDS", 0.005)
+    monkeypatch.setattr("tools.agent_cli_runner._MONITOR_POLL_SECONDS", 0.005)
 
     workdir = tmp_path / "repo"
     workdir.mkdir()
@@ -455,7 +455,7 @@ def test_timeout_path_terminates_process(monkeypatch, tmp_path):
     monkeypatch.setattr("tools.cursor_agent_tool.subprocess.Popen", _TimeoutFakePopen)
     monkeypatch.setattr("tools.cursor_agent_tool.time.monotonic", _fake_monotonic)
     monkeypatch.setattr(cursor_agent_tool, "STALL_WATCHDOG_SECONDS", 9999)
-    monkeypatch.setattr(cursor_agent_tool, "_MONITOR_POLL_SECONDS", 0.001)
+    monkeypatch.setattr("tools.agent_cli_runner._MONITOR_POLL_SECONDS", 0.001)
 
     workdir = tmp_path / "repo"
     workdir.mkdir()
@@ -480,8 +480,8 @@ def test_interrupt_path_terminates_process(monkeypatch, tmp_path):
     monkeypatch.setattr("tools.cursor_agent_tool.resolve_cursor_agent_binary", lambda: "/usr/bin/agent")
     monkeypatch.setattr("tools.cursor_agent_tool.subprocess.Popen", _StalledFakePopen)
     monkeypatch.setattr(cursor_agent_tool, "STALL_WATCHDOG_SECONDS", 9999)
-    monkeypatch.setattr(cursor_agent_tool, "_MONITOR_POLL_SECONDS", 0.001)
-    monkeypatch.setattr("tools.cursor_agent_tool._check_interrupted", lambda: True)
+    monkeypatch.setattr("tools.agent_cli_runner._MONITOR_POLL_SECONDS", 0.001)
+    monkeypatch.setattr("tools.agent_cli_runner._check_interrupted", lambda: True)
 
     workdir = tmp_path / "repo"
     workdir.mkdir()
@@ -1002,7 +1002,7 @@ def test_incremental_stdout_updates_log_before_child_exit(monkeypatch, tmp_path)
     from tools import cursor_agent_tool
 
     monkeypatch.setattr(cursor_agent_tool, "STALL_WATCHDOG_SECONDS", 5)
-    monkeypatch.setattr(cursor_agent_tool, "_MONITOR_POLL_SECONDS", 0.05)
+    monkeypatch.setattr("tools.agent_cli_runner._MONITOR_POLL_SECONDS", 0.05)
 
     spawn_info: dict[str, int | None] = {"pid": None, "pgid": None}
     real_popen = subprocess.Popen
@@ -1098,9 +1098,9 @@ def test_terminate_process_kills_sigterm_resistant_descendant(tmp_path, monkeypa
     import subprocess
     import sys
 
-    from tools.cursor_agent_tool import _terminate_process
+    from tools.agent_cli_runner import _terminate_process
 
-    monkeypatch.setattr("tools.cursor_agent_tool._TERMINATE_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr("tools.agent_cli_runner._TERMINATE_GRACE_SECONDS", 0.5)
 
     desc_pid_file = tmp_path / "desc.pid"
     leader_script = f"""
