@@ -1382,3 +1382,177 @@ class TestTrivialPromptClassifier:
                   "hello world", "ok so what's next", "what's my name",
                   "hey can you check the logs", "continue the migration plan"):
             assert not is_trivial_prompt(t), f"expected non-trivial: {t!r}"
+
+
+# ---------------------------------------------------------------------------
+# Gateway scaffolding normalization (provenance-anchored stripping)
+# ---------------------------------------------------------------------------
+
+# Exact shapes gateway/run.py prepends to a turn's user message. The Discord
+# block text is gateway-authored (only the message id varies); the Slack
+# suffix " | Slack user <@id>" is derived from the trusted event envelope.
+_DISCORD_BLOCK = (
+    "[Triggering message id: `{msg_id}` — use as "
+    "`message_id` for reply/react/pin via the discord tools.]\n\n"
+)
+
+
+def _discord_wrap(body: str, msg_id: str = "123456") -> str:
+    """Discord shared-session turn: exact block, then the sender wrapper."""
+    return _DISCORD_BLOCK.format(msg_id=msg_id) + body
+
+
+class TestStripGatewayScaffolding:
+    """Only trusted provenance is stripped; bare labels are preserved.
+
+    The exact Discord triggering-message block is gateway-authored text and
+    anchors exactly one immediately-following ``[label] `` sender wrapper
+    (the structural form gateway/run.py emits for shared multi-user
+    sessions). Slack's ``[label | Slack user <@id>] `` prefix is
+    envelope-derived and trusted on its own. Anything else — including a
+    bare leading ``[label] `` — is indistinguishable from a user's own
+    bracket tag and must pass through byte-for-byte.
+    """
+
+    def test_discord_block_anchors_sender_wrapper(self):
+        from agent.memory_provider import strip_gateway_scaffolding
+
+        assert strip_gateway_scaffolding(_discord_wrap("[parsayazdani] hi")) == "hi"
+
+    def test_discord_block_anchors_title_case_wrapper(self):
+        from agent.memory_provider import strip_gateway_scaffolding
+
+        assert strip_gateway_scaffolding(_discord_wrap("[Alice] substantive")) == "substantive"
+
+    def test_anchored_strip_removes_exactly_one_wrapper(self):
+        from agent.memory_provider import strip_gateway_scaffolding
+
+        wrapped = _discord_wrap("[parsayazdani] [bug] fix auth")
+        assert strip_gateway_scaffolding(wrapped) == "[bug] fix auth"
+
+    def test_discord_block_without_wrapper_strips_block_only(self):
+        from agent.memory_provider import strip_gateway_scaffolding
+
+        query = "what did we decide about the postgres migration?"
+        assert strip_gateway_scaffolding(_discord_wrap(query)) == query
+
+    def test_slack_envelope_prefix_stripped_at_start(self):
+        from agent.memory_provider import strip_gateway_scaffolding
+
+        wrapped = "[alice | Slack user <@U01234567>] status check"
+        assert strip_gateway_scaffolding(wrapped) == "status check"
+
+    def test_slack_prefix_without_envelope_suffix_preserved(self):
+        from agent.memory_provider import strip_gateway_scaffolding
+
+        # The " | Slack user <@id>" suffix is what marks the prefix as
+        # envelope-derived; without it the bracket is a plain label.
+        text = "[alice | Slack user] status check"
+        assert strip_gateway_scaffolding(text) == text
+
+    @pytest.mark.parametrize(
+        "text",
+        (
+            "[parsayazdani] hi",
+            "[Alice] hi",
+            "[important] x",
+            "[Bug] fix",
+            "[bug] fix",
+        ),
+    )
+    def test_standalone_bare_label_preserved_bytewise(self, text):
+        from agent.memory_provider import strip_gateway_scaffolding
+
+        assert strip_gateway_scaffolding(text) == text
+
+    def test_unwrapped_and_mid_text_brackets_byte_identical(self):
+        from agent.memory_provider import strip_gateway_scaffolding
+
+        for text in (
+            "hello world",
+            "see [bug] in the logs",
+            "please fix [bug] in auth before deploy",
+            "line one\nline two",
+            "[note]\nsecond line continues",
+        ):
+            assert strip_gateway_scaffolding(text) == text
+
+    def test_empty_body_after_anchored_strip_normalizes_empty(self):
+        from agent.memory_provider import strip_gateway_scaffolding
+
+        # The gateway wrapper form is "[name] " even around an empty body.
+        assert strip_gateway_scaffolding(_discord_wrap("[parsayazdani] ")) == ""
+
+
+class TestTrivialPromptWithGatewayScaffolding:
+    """Anchored wrappers classify like the bare user text inside them."""
+
+    @pytest.mark.parametrize("body", ("hi", "hello!", "thanks", "/status", ""))
+    def test_anchored_trivial_bodies(self, body):
+        from agent.memory_provider import is_trivial_prompt
+
+        assert is_trivial_prompt(_discord_wrap(f"[parsayazdani] {body}"))
+
+    def test_slack_wrapped_trivial_body(self):
+        from agent.memory_provider import is_trivial_prompt
+
+        assert is_trivial_prompt("[alice | Slack user <@U1>] hi")
+
+    def test_anchored_substantive_prompt(self):
+        from agent.memory_provider import is_trivial_prompt
+
+        query = "what did we decide about the postgres migration?"
+        assert not is_trivial_prompt(_discord_wrap(f"[parsayazdani] {query}"))
+
+    def test_standalone_bare_label_is_not_trivial(self):
+        from agent.memory_provider import is_trivial_prompt
+
+        # Preserved rather than stripped, so the label is part of the text
+        # the classifier sees — the turn is treated as carrying content.
+        assert not is_trivial_prompt("[parsayazdani] hi")
+
+
+class TestMemoryManagerStripsGatewayScaffolding:
+    """prefetch_all / queue_prefetch_all / sync_all receive clean user text."""
+
+    def test_prefetch_all_passes_clean_substantive_query(self):
+        mgr = MemoryManager()
+        provider = FakeMemoryProvider("external")
+        mgr.add_provider(provider)
+
+        query = "what did we decide about the postgres migration?"
+        mgr.prefetch_all(_discord_wrap(f"[parsayazdani] {query}"))
+
+        assert provider.prefetch_queries == [query]
+
+    def test_queue_prefetch_all_passes_clean_substantive_query(self):
+        mgr = MemoryManager()
+        provider = FakeMemoryProvider("external")
+        mgr.add_provider(provider)
+
+        query = "what did we decide about the postgres migration?"
+        mgr.queue_prefetch_all(_discord_wrap(f"[parsayazdani] {query}"))
+        mgr.flush_pending(timeout=5.0)
+
+        assert provider.queued_prefetches == [query]
+
+    def test_sync_all_passes_clean_substantive_query(self):
+        mgr = MemoryManager()
+        provider = FakeMemoryProvider("external")
+        mgr.add_provider(provider)
+
+        query = "what did we decide about the postgres migration?"
+        mgr.sync_all(_discord_wrap(f"[parsayazdani] {query}"), "We decided to defer.")
+        mgr.flush_pending(timeout=5.0)
+
+        assert provider.synced_turns == [(query, "We decided to defer.")]
+
+    def test_standalone_bare_label_reaches_provider_unchanged(self):
+        mgr = MemoryManager()
+        provider = FakeMemoryProvider("external")
+        mgr.add_provider(provider)
+
+        text = "[parsayazdani] what did we decide about the postgres migration?"
+        mgr.prefetch_all(text)
+
+        assert provider.prefetch_queries == [text]
