@@ -222,11 +222,12 @@ def test_review_unavailable_blocks(kanban_home, tmp_path):
     executor._active[task_id] = ex.ActiveTask(task_id, run.id, ex.PHASE_REVIEWING)
 
     with patch.object(ex, "unified_diff", return_value="diff"):
-        with patch.object(ex, "hermes_chat_review") as mock_kimi:
-            mock_kimi.return_value = type(
-                "P", (), {"stdout": "not json", "stderr": ""}
-            )()
-            with patch.object(ex, "resolve_cursor_agent_binary", return_value=None):
+        with patch.object(ex, "resolve_claude_binary", return_value="/bin/claude"):
+            with patch.object(
+                ex,
+                "run_agent_cli",
+                return_value=(None, None, "not json", 1.0, 0),
+            ):
                 executor._phase_reviewing(
                     conn, task_id, run.id, meta, ex.pipeline_state(meta)
                 )

@@ -240,6 +240,68 @@ def test_plan_mode_garbage_rejected(kanban_home, git_repo, monkeypatch):
     assert result["message"] == "plan_mode must be 'consult' or 'debate'"
 
 
+def test_open_pr_missing_omits_key_from_body(kanban_home, git_repo, monkeypatch):
+    monkeypatch.setattr(dpt, "check_dev_pipeline_requirements", lambda: True)
+    with patch.object(dpt, "_maybe_register_notify_sub"):
+        raw = dpt.delegate_development(repo=str(git_repo), task="Add widget")
+    result = _parse_result(raw)
+    assert result["success"] is True
+
+    conn = kb.connect(board="dev")
+    try:
+        task = kb.get_task(conn, result["task_id"])
+        body = json.loads(task.body)
+        assert "open_pr" not in body
+    finally:
+        conn.close()
+
+
+def test_open_pr_true_omits_key_from_body(kanban_home, git_repo, monkeypatch):
+    monkeypatch.setattr(dpt, "check_dev_pipeline_requirements", lambda: True)
+    with patch.object(dpt, "_maybe_register_notify_sub"):
+        raw = dpt.delegate_development(
+            repo=str(git_repo), task="Add widget", open_pr=True
+        )
+    result = _parse_result(raw)
+    assert result["success"] is True
+
+    conn = kb.connect(board="dev")
+    try:
+        task = kb.get_task(conn, result["task_id"])
+        body = json.loads(task.body)
+        assert "open_pr" not in body
+    finally:
+        conn.close()
+
+
+def test_open_pr_false_stored_in_body(kanban_home, git_repo, monkeypatch):
+    monkeypatch.setattr(dpt, "check_dev_pipeline_requirements", lambda: True)
+    with patch.object(dpt, "_maybe_register_notify_sub"):
+        raw = dpt.delegate_development(
+            repo=str(git_repo), task="Add widget", open_pr=False
+        )
+    result = _parse_result(raw)
+    assert result["success"] is True
+
+    conn = kb.connect(board="dev")
+    try:
+        task = kb.get_task(conn, result["task_id"])
+        body = json.loads(task.body)
+        assert body["open_pr"] is False
+    finally:
+        conn.close()
+
+
+def test_open_pr_non_boolean_rejected(kanban_home, git_repo, monkeypatch):
+    monkeypatch.setattr(dpt, "check_dev_pipeline_requirements", lambda: True)
+    raw = dpt.delegate_development(
+        repo=str(git_repo), task="Add widget", open_pr="yes"
+    )
+    result = _parse_result(raw)
+    assert result["success"] is False
+    assert result["message"] == "open_pr must be a boolean"
+
+
 class TestRepoUrlCredentialGuard:
     def test_https_url_with_userinfo_rejected(self):
         from plugins.dev_pipeline.pipeline import validate_repo_input
