@@ -1,7 +1,7 @@
 # Fork-only workflow: keeps QuixThe2nd/hermes-agent main in sync with
 # NousResearch/hermes-agent main. Do not upstream this file.
 #
-# Merges upstream/main every 6 hours and pushes. On merge conflict the job
+# Merges upstream/main hourly (at :17 past) and pushes. On merge conflict the job
 # fails without pushing — the fork falls behind until someone resolves by
 # hand (merge upstream locally, resolve, push).
 name: Sync fork with upstream

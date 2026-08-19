@@ -1,6 +1,6 @@
-# Hermes — Quix Edition ☤
+# Hermes IDE ☤
 
-An edition of [Hermes Agent](https://github.com/NousResearch/hermes-agent) with extra tooling and gateway behavior, kept current with upstream (auto-synced hourly). Everything lands via PR with full CI.
+A developer edition of [Hermes Agent](https://github.com/NousResearch/hermes-agent): a Hermes that can maintain codebases, with extra tooling and gateway behavior, kept current with upstream (auto-synced hourly). Everything lands via PR with full CI.
 
 **What's different here:**
 - **Tools**
@@ -10,13 +10,13 @@ An edition of [Hermes Agent](https://github.com/NousResearch/hermes-agent) with 
   - Delegation — `delegate_task action='list'` surfaces per-child liveness (current tool, iteration, seconds since activity, stalled flag) so a wedged subagent is distinguishable from a slow one
   - Delegation — one shared agent-CLI runner powers both delegate tools and the dev-pipeline build lanes
   - Delegation — `delegate_development plan_mode=debate` runs the multi-round adversarial council for planning; consult stays the default
-  - Delegation — dev-pipeline review runs as one Russian adversarial claude pass over a bounded diff; `delegate_development` gains `open_pr=false` to skip the draft PR
+  - Delegation — dev-pipeline review runs as a Russian-language kimi + grok dual review; `delegate_development` gains `open_pr=false` to skip the draft PR
   - MoA — `consult_moa` and `moa_debate`, restored from the archive
   - Memory (Honcho) — memory tools surface backend failures (dead API keys, auth 401s, timeouts) as explicit errors instead of silently looking like "nothing stored"
 - **Plugins**
   - dev-pipeline — hand a repo + task to an automated pipeline: MoA planning, Cursor execution, mechanical verification, dual-model review, draft PR, with stage-progress messages to your chat and a status tool
   - dev-pipeline claude-endurance lane — Claude Code (claude-glm) builds for broad/long tasks
-  - Discord History — read-only search over an owner-authorized PostgreSQL archive of Discord messages
+  - Discord History — read-only search over an owner-authorized PostgreSQL archive of Discord messages (opt-in, off by default)
   - Papercuts — structured journal of workflow friction, plus an opt-in daily autofix cron (`hermes papercuts autofix install`) that turns small mechanical fixes into PRs
 - **Other**
   - Gateway — replies can end with a timing breakdown: total, API, tools, other (off by default upstream)

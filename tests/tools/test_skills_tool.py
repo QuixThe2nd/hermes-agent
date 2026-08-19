@@ -263,7 +263,7 @@ class TestSkillsList:
         """Isolate local-skill listing tests from plugin-provided skills.
 
         On the fork, bundled plugins with default_enabled: true (e.g.
-        discord-history) load during tests and contribute skills via the
+        dev_pipeline) load during tests and contribute skills via the
         plugin registry; these tests assert exact contents of a tmp local
         SKILLS_DIR, so plugin skills are stubbed out.
         """
