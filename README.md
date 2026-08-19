@@ -10,7 +10,7 @@ A developer edition of [Hermes Agent](https://github.com/NousResearch/hermes-age
   - Delegation — `delegate_task action='list'` surfaces per-child liveness (current tool, iteration, seconds since activity, stalled flag) so a wedged subagent is distinguishable from a slow one
   - Delegation — one shared agent-CLI runner powers both delegate tools and the dev-pipeline build lanes
   - Delegation — `delegate_development plan_mode=debate` runs the multi-round adversarial council for planning; consult stays the default
-  - Delegation — dev-pipeline review runs as one Russian adversarial claude pass over a bounded diff; `delegate_development` gains `open_pr=false` to skip the draft PR
+  - Delegation — dev-pipeline review runs as a Russian-language kimi + grok dual review; `delegate_development` gains `open_pr=false` to skip the draft PR
   - MoA — `consult_moa` and `moa_debate`, restored from the archive
   - Memory (Honcho) — memory tools surface backend failures (dead API keys, auth 401s, timeouts) as explicit errors instead of silently looking like "nothing stored"
 - **Plugins**
