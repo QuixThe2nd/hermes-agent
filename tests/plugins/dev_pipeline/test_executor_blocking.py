@@ -78,14 +78,10 @@ def test_review_unavailable_blocks_after_attempt_end(kanban_home, tmp_path):
     executor._active[task_id] = ex.ActiveTask(task_id, run_id, ex.PHASE_REVIEWING)
 
     with patch.object(ex, "unified_diff", return_value="safe diff"):
-        with patch.object(ex, "hermes_chat_review") as mock_kimi:
-            mock_kimi.return_value = type(
-                "P", (), {"stdout": "garbage", "stderr": ""}
-            )()
-            with patch.object(ex, "resolve_cursor_agent_binary", return_value=None):
-                executor._phase_reviewing(
-                    conn, task_id, run_id, meta, ex.pipeline_state(meta)
-                )
+        with patch.object(ex, "resolve_claude_binary", return_value=None):
+            executor._phase_reviewing(
+                conn, task_id, run_id, meta, ex.pipeline_state(meta)
+            )
 
     task = kb.get_task(conn, task_id)
     assert task is not None
@@ -139,14 +135,14 @@ def test_reviewing_secret_scan_before_writing_artifacts(kanban_home, tmp_path):
     with patch.object(
         ex, "unified_diff", return_value="+ghp_secretleak123456789012345678901234\n"
     ):
-        with patch.object(ex, "hermes_chat_review") as mock_kimi:
+        with patch.object(ex, "run_agent_cli") as mock_claude:
             executor._phase_reviewing(
                 conn, task_id, run_id, meta, ex.pipeline_state(meta)
             )
-            mock_kimi.assert_not_called()
+            mock_claude.assert_not_called()
 
     assert (logs / "secret-scan-quarantine.json").is_file()
-    assert not (logs / "review-kimi.raw").exists()
+    assert not (logs / "review-claude.jsonl").exists()
     conn.close()
 
 

@@ -170,6 +170,7 @@ def delegate_development(
     branch: str | None = None,
     *,
     plan_mode: str | None = None,
+    open_pr: bool | None = None,
     task_id: str | None = None,
 ) -> str:
     del task_id  # reserved for future correlation
@@ -184,6 +185,14 @@ def delegate_development(
             board=None,
             deduplicated=False,
             message="plan_mode must be 'consult' or 'debate'",
+        )
+    if open_pr is not None and not isinstance(open_pr, bool):
+        return _make_result(
+            success=False,
+            task_id=None,
+            board=None,
+            deduplicated=False,
+            message="open_pr must be a boolean",
         )
     if not task:
         return _make_result(
@@ -242,6 +251,8 @@ def delegate_development(
             }
             if mode_raw != "consult":
                 body_obj["plan_mode"] = mode_raw
+            if open_pr is False:
+                body_obj["open_pr"] = False
             body = json.dumps(body_obj, ensure_ascii=False)
             title = task if len(task) <= 120 else task[:117] + "..."
 
@@ -286,8 +297,9 @@ DELEGATE_DEVELOPMENT_SCHEMA = {
     "description": (
         "Submit a durable automated development job. This is the ONLY way to "
         "queue dev-pipeline work that survives gateway and executor restarts. "
-        "Hermes plans the task, runs bounded implementation via Cursor, "
-        "verifies mechanically, reviews, and opens a draft PR on success. "
+        "Hermes plans the task, runs implementation via Cursor or Claude Code "
+        "(plan-contract routing), verifies mechanically, reviews, and opens "
+        "a draft PR on success. "
         "Returns a Kanban task id immediately; completion and blocked "
         "notifications arrive via the kanban notifier. Requires the Cursor "
         "Agent CLI and Kanban."
@@ -323,6 +335,14 @@ DELEGATE_DEVELOPMENT_SCHEMA = {
                     "big/ambiguous tasks."
                 ),
             },
+            "open_pr": {
+                "type": "boolean",
+                "description": (
+                    "Open a draft PR on success (default true). Set false to "
+                    "stop after review: the verified branch and diff stay in "
+                    "the executor workspace and the result names them."
+                ),
+            },
         },
         "required": ["repo", "task"],
     },
@@ -335,6 +355,7 @@ def _handle_delegate_development(args: dict, **kw: Any) -> str:
         task=args.get("task", ""),
         branch=args.get("branch"),
         plan_mode=args.get("plan_mode"),
+        open_pr=args.get("open_pr"),
         task_id=kw.get("task_id"),
     )
 
