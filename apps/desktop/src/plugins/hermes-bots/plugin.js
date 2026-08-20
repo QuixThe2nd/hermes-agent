@@ -195,17 +195,13 @@ const $selectedBot = atom('default')
  *  the socket happened to be homed on. */
 const $focusedBotProfile = host.state.focusedSessionProfile || host.state.profile
 
-/** Optional secondary navigation inside the Bots pane. Primary row clicks still
- * open the bot's canonical chat; this state opens its stored-session browser. */
-const $botSessionsWorkspace = atom(null)
-const $botSelectedSessions = atom({})
-const $sessionsGatewayGeneration = atom(0)
+/** Optional secondary navigation inside the Bots pane (group-chat rooms). */
 
 /** Group-chat rooms: { [group]: { log: [{from:{kind,name},text,at}], watermarks:{[member]:idx}, epoch, running } }.
  *  Log + watermarks persist via plugin storage; epoch/running are runtime-only. */
 const $groupChats = atom({})
-/** Group whose room view is open in the Bots pane (secondary navigation,
- *  same pattern as $botSessionsWorkspace). */
+/** Group whose room view is open in the Bots pane (secondary navigation
+ *  inside the pane; a normal row click returns to the roster). */
 const $groupChatWorkspace = atom(null)
 /** Groups whose latest room activity mentions @user — the needs-you badge. */
 const $groupNeedsYou = atom({})
@@ -297,8 +293,6 @@ function groupActivityTone(kind) {
 }
 
 function handleSessionsGatewayTransition() {
-  $sessionsGatewayGeneration.set($sessionsGatewayGeneration.get() + 1)
-  $botSelectedSessions.set({})
   // A gateway swap invalidates any in-flight room drive: bump every room's
   // epoch so running loops bail at their next member boundary.
   const rooms = { ...$groupChats.get() }
@@ -3354,6 +3348,10 @@ function showsHandle(name, meta, bot) {
 // In-flight creations, keyed by bot name — double-clicking a row must not
 // mint two canonical chats.
 const canonicalCreations = new Map()
+
+/** Upper bound for per-profile session.list scans (hide sweep, canonical-chat
+ *  adoption, stored-session lookups). */
+const PROFILE_SESSION_LIST_LIMIT = 200
 let botOpenGeneration = 0
 
 async function openStoredBotChat(name, storedId, summary) {
@@ -3383,10 +3381,42 @@ async function openStoredBotChat(name, storedId, summary) {
   return storedId
 }
 
+/** Adopt-before-mint: the profile may already own a canonical Bot Chat that
+ *  the pin lost track of (pin cleared during an outage, ui_meta rolled back,
+ *  a fork squatting the title). The core UNIQUE title index guarantees at
+ *  most ONE session titled "Bot Chat" per profile db — Profile → Named
+ *  Session is an exact registry, so consult it exactly: `title` asks the
+ *  gateway for an indexed WHERE title = ? lookup (window-free; a busy
+ *  profile can push the forever-chat past any recency window, which would
+ *  re-open the fork loop with a higher trigger threshold). Minting while a
+ *  "Bot Chat" row exists is always wrong twice over: it forks the
+ *  forever-chat AND the new row can never take the (already held) canonical
+ *  title, so the next identity check misreads it and forks again — the
+ *  infinite-fork loop. An older gateway ignores the unknown `title` param
+ *  and returns the plain windowed listing instead — the pre-exact-lookup
+ *  behavior — so the local scan below stays as the compatibility rung.
+ *  include_hidden is required (canonical chats are always hidden); a gateway
+ *  without it simply finds nothing and we fall through to mint. */
+async function findExistingCanonicalChat(name) {
+  try {
+    const res = await host.request('session.list', {
+      profile: name,
+      title: 'Bot Chat',
+      limit: PROFILE_SESSION_LIST_LIMIT,
+      include_hidden: true
+    })
+    const rows = res?.sessions ?? []
+    return rows.find(row => isCanonicalBotChatHistory(row)) || null
+  } catch {
+    return null
+  }
+}
+
 /** Create the bot's ONE forever chat: a real session opened with a kickoff
  *  message (the gateway prunes zero-message sessions, so the chat is born
  *  with the bot introducing itself). Pins the stored id in bot meta and
- *  returns it. */
+ *  returns it. Adopts an existing "Bot Chat" row instead of creating when
+ *  the profile already has one (see findExistingCanonicalChat). */
 function createCanonicalChat(name) {
   const inflight = canonicalCreations.get(name)
 
@@ -3395,6 +3425,21 @@ function createCanonicalChat(name) {
   }
 
   const run = (async () => {
+    const existing = await findExistingCanonicalChat(name)
+
+    if (existing?.id) {
+      saveBotMeta(name, { chat: existing.id })
+
+      if (typeof host.openSession === 'function') {
+        // The exact-lookup gateway reports the compression-lineage tip as
+        // resolved_id; the pin stays the durable row id (same split the
+        // preferred_session path uses).
+        await openStoredBotChat(name, existing.resolved_id || existing.id, existing)
+      }
+
+      return existing.id
+    }
+
     const res = await host.request('session.create', {
       profile: name,
       title: 'Bot Chat',
@@ -3524,8 +3569,29 @@ async function openBotCanonicalChat(name, pinned, history) {
 
   if (preferred) {
     // The stored pointer resolved to a real session, but not to Bot Mode's
-    // plumbing session. Treat it as corrupted metadata rather than opening or
-    // hiding the user's ordinary conversation.
+    // titled plumbing session. Two legitimate ways to get here, and neither
+    // means "mint a new chat":
+    //  - the pin IS the forever-chat but its title drifted (grandfathered
+    //    pre-convention chats; the LLM auto-titler renaming an untitled row
+    //    after a silent unique-title conflict dropped "Bot Chat"). A pinned
+    //    session carrying real history is the user's conversation — forking
+    //    away from it silently loses their thread, the exact bug this whole
+    //    resolver exists to prevent. The pin is the durable intent: keep it
+    //    and open it, even when some other (likely forked) row holds the
+    //    "Bot Chat" title. The hide sweep only matches plumbing titles, so
+    //    an adopted odd-titled chat is never swept out of the user's
+    //    ordinary session list.
+    //  - the pin resolves to an EMPTY non-plumbing session (a stray draft):
+    //    genuinely corrupted metadata. Clear it — createCanonicalChat then
+    //    adopts the profile's existing "Bot Chat" row if one exists before
+    //    ever creating a new one.
+    const messageCount = Number(preferred.message_count) || 0
+
+    if (messageCount > 0) {
+      await openStoredBotChat(name, preferred.resolved_id || preferred.id, preferred)
+      return pinned
+    }
+
     await saveBotMeta(name, { chat: null })
     return createCanonicalChat(name)
   }
@@ -4997,8 +5063,8 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
   // thin to rich; conditionally calling useValue here breaks React hook order.
   const unreadByName = useValue($botUnread)
   const unread = !bot.remoteSource && Boolean(unreadByName[bot.name])
-  // WHO sent the last message (bot-to-bot DM vs human) — the full stored
-  // history lives in the Sessions workspace (context menu), not inline.
+  // WHO sent the last message (bot-to-bot DM vs human) — shown in the row
+  // preview; the conversation itself lives in the bot's one canonical chat.
   const { fromBot } = previewKind(previewSession?.preview)
   // DM previews read like DMs: strip the delivery prefix, keep the message.
   const displayPreview = stripPreviewMarkdown(
@@ -5246,10 +5312,6 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
             children: meta?.hidden ? 'Unhide Bot' : 'Hide Bot'
           }),
           jsx(ContextMenuSeparator, {}),
-          jsx(ContextMenuItem, {
-            onSelect: () => openBotSessionsWorkspace(bot),
-            children: 'Sessions'
-          }),
           jsx(ContextMenuItem, { onSelect: () => onEdit(bot), children: 'Edit Profile' }),
           !bot.remoteSource
             ? jsx(ContextMenuItem, {
@@ -7952,162 +8014,6 @@ function RoutinesPane() {
   })
 }
 
-// ── profile session workspace ────────────────────────────────────────────────
-
-const PROFILE_SESSION_LIST_LIMIT = 200
-
-function openBotSessionsWorkspace(bot) {
-  if (bot?.name && NAME_RE.test(bot.name)) {
-    $botSessionsWorkspace.set(bot.name)
-  }
-}
-
-function filterProfileSessions(sessions, query) {
-  const needle = String(query || '').trim().toLowerCase()
-  const rows = Array.isArray(sessions) ? sessions : []
-  if (!needle) return rows
-  return rows.filter(session =>
-    `${session?.title || ''} ${session?.preview || ''} ${session?.source || ''}`.toLowerCase().includes(needle)
-  )
-}
-
-function useProfileSessions(botName, gatewayGeneration) {
-  return useQuery({
-    queryKey: [ID, 'profile-sessions', botName, gatewayGeneration],
-    enabled: Boolean(botName),
-    // include_hidden: this browser exists precisely to see the profile's own
-    // (always-hidden) Bot Mode sessions alongside its regular ones.
-    queryFn: () => host.request('session.list', { profile: botName, limit: PROFILE_SESSION_LIST_LIMIT, include_hidden: true }),
-    refetchInterval: 8000,
-    staleTime: 4000,
-    retry: false
-  })
-}
-
-async function openProfileSession(botName, session, gatewayGeneration) {
-  const profile = String(botName || '')
-  const id = String(session?.id || '')
-  if (!NAME_RE.test(profile) || !id || gatewayGeneration !== $sessionsGatewayGeneration.get()) return
-  if (typeof host.openSession !== 'function') {
-    throw new Error('This Hermes Desktop version cannot open stored sessions')
-  }
-
-  // Same hydration contract as canonical Bot Chats (#89206): a bare open can
-  // focus a main surface whose runtime/transcript silently vanished, leaving a
-  // blank pane while the row preview still shows the conversation. Waiting on
-  // hydration lets the SDK issue the explicit resume when the surface is stale.
-  const hasAuthoritativeCount =
-    typeof session?.message_count === 'number' && Number.isFinite(session.message_count)
-  const expectHistory = hasAuthoritativeCount ? session.message_count > 0 : Boolean(session?.preview)
-
-  await host.openSession(id, { profile, awaitHydration: true, expectHistory, keepAllProfilesScope: true })
-  if (gatewayGeneration !== $sessionsGatewayGeneration.get()) return
-  $botSelectedSessions.set({ ...$botSelectedSessions.get(), [profile]: id })
-}
-
-function ProfileSessionRow({ session, botName, active, gatewayGeneration }) {
-  return jsxs('button', {
-    type: 'button',
-    'aria-current': active ? 'page' : undefined,
-    onClick: () => void openProfileSession(botName, session, gatewayGeneration).catch(err => host.notifyError(err, 'Could not open session')),
-    className: cn(
-      'flex w-full flex-col gap-0.5 overflow-hidden rounded-md px-2 py-1.5 text-left transition-colors',
-      'hover:bg-(--chrome-action-hover)',
-      active && 'bg-(--ui-row-active-background)'
-    ),
-    children: [
-      jsx('span', {
-        className: 'truncate text-[0.8125rem] font-medium',
-        children: session.title || 'Untitled session'
-      }),
-      jsx('div', {
-        className: 'truncate text-[0.7rem] text-(--ui-text-tertiary)',
-        children: session.preview || session.source || 'No messages yet'
-      })
-    ]
-  })
-}
-
-function ProfileSessionsWorkspace({ bot }) {
-  const gatewayGeneration = useValue($sessionsGatewayGeneration)
-  const { data, isLoading, error } = useProfileSessions(bot.name, gatewayGeneration)
-  const selectedByProfile = useValue($botSelectedSessions)
-  const [query, setQuery] = useState('')
-  const sourceSessions = data?.sessions || []
-  const sessions = filterProfileSessions(sourceSessions, query)
-  const inventoryBounded = sourceSessions.length >= PROFILE_SESSION_LIST_LIMIT
-  const selectedId = selectedByProfile[bot.name] || ''
-
-  const header = jsxs('div', {
-    className: 'flex items-center gap-2 px-2.5 pt-2.5 pb-2',
-    children: [
-      jsx(Button, {
-        variant: 'ghost',
-        size: 'sm',
-        onClick: () => $botSessionsWorkspace.set(null),
-        children: 'Back'
-      }),
-      jsx('div', {
-        className: 'min-w-0 flex-1 truncate text-sm font-semibold',
-        children: `${displayName(bot, $botMeta.get()[bot.name])} sessions`
-      })
-    ]
-  })
-
-  return jsxs('div', {
-    className: 'flex h-full flex-col',
-    children: [
-      header,
-      jsx('div', {
-        className: 'px-2 pb-2',
-        children: jsx(Input, {
-          'aria-label': 'Filter sessions',
-          placeholder: 'Filter sessions…',
-          value: query,
-          onChange: event => setQuery(event.target.value)
-        })
-      }),
-      inventoryBounded
-        ? jsx('div', {
-            className: 'px-2.5 pb-2 text-[0.65rem] text-(--ui-text-quaternary)',
-            children: `Showing the ${PROFILE_SESSION_LIST_LIMIT} most recent sessions.`
-          })
-        : null,
-      isLoading
-        ? jsx('div', {
-            className: 'flex flex-1 items-center justify-center',
-            children: jsx(GlyphSpinner, { spinner: 'breathe' })
-          })
-        : error
-          ? jsx('div', {
-              className: 'px-3 py-3 text-xs text-(--ui-text-tertiary)',
-              children: 'Could not load sessions for this profile.'
-            })
-          : jsx(ScrollArea, {
-              className: 'min-h-0 flex-1',
-              children: jsx('div', {
-                className: 'grid gap-0.5 px-1.5 pb-2',
-                children: sessions.length
-                  ? sessions.map(session => jsx(ProfileSessionRow, {
-                      session,
-                      botName: bot.name,
-                      active: selectedId === session.id,
-                      gatewayGeneration
-                    }, session.id))
-                  : jsx('div', {
-                      className: 'px-2 py-3 text-center text-xs text-(--ui-text-tertiary)',
-                      children: query.trim()
-                        ? inventoryBounded
-                          ? `No matching sessions in the ${PROFILE_SESSION_LIST_LIMIT} most recent.`
-                          : 'No sessions match that filter.'
-                        : 'No stored sessions yet.'
-                    })
-              })
-            })
-    ]
-  })
-}
-
 // ── roster pane ──────────────────────────────────────────────────────────────
 
 /** "Active now" presence strip above the roster: chips for every bot that is
@@ -9513,7 +9419,7 @@ function GroupChatWorkspace({ group, members, onBack }) {
             String(members.length),
             ' bots and clears the shared room log. The bots themselves and their “Group: ',
             group,
-            '” sessions are kept — you can still open those from each bot’s session browser.'
+            '” sessions are kept.'
           ]
         }),
         destructive: true,
@@ -9534,12 +9440,32 @@ function GroupChatWorkspace({ group, members, onBack }) {
  *  disband (or the room view's own Back) can retire the tab it opened. */
 const groupChatMainTabs = new Map()
 
+/** Reactive shadow of `groupChatMainTabs` membership. The Map itself can't
+ *  notify React, and #89788's first fix read it non-reactively: a BotsPane
+ *  render that landed between selecting the group and recording its main
+ *  tab kept the in-pane room on screen forever (the map write repaints
+ *  nothing). Every map mutation goes through the two helpers below so the
+ *  rev bump re-evaluates the gate. */
+const $groupMainTabsRev = atom(0)
+
+function recordGroupMainTab(group, close) {
+  groupChatMainTabs.set(group, close)
+  $groupMainTabsRev.set($groupMainTabsRev.get() + 1)
+}
+
+function dropGroupMainTab(group) {
+  if (groupChatMainTabs.delete(group)) {
+    $groupMainTabsRev.set($groupMainTabsRev.get() + 1)
+  }
+}
+
 /** The in-panel room is the FALLBACK surface, not a second copy: it renders
  *  only while no main-window tab owns the group. On desktops with the door
  *  the room already lives in a main tab, and painting it here too produced
  *  two live panes with independent drafts driving one shared engine (#89788).
  *  The selection atom stays set either way so the roster row still
- *  highlights. */
+ *  highlights. Callers must subscribe to `$groupMainTabsRev` (BotsPane does)
+ *  so ownership changes re-run this gate. */
 function shouldRenderGroupChatInPane(group) {
   return Boolean(group && !groupChatMainTabs.has(group))
 }
@@ -9547,7 +9473,7 @@ function shouldRenderGroupChatInPane(group) {
 function closeGroupChatMainTab(group) {
   const close = groupChatMainTabs.get(group)
 
-  groupChatMainTabs.delete(group)
+  dropGroupMainTab(group)
 
   if ($groupChatWorkspace.get() === group) {
     $groupChatWorkspace.set(null)
@@ -9577,10 +9503,16 @@ function GroupChatMainView({ group }) {
 
 /** Open a group chat the Discord way: a tab taking over the MAIN chat window
  *  (host.openWorkspace, newer desktops), falling back to the in-panel room
- *  view on desktops whose SDK predates the main-area door. */
+ *  view on desktops whose SDK predates the main-area door.
+ *
+ *  Ordering matters (#89788 follow-up): the main tab must be RECORDED before
+ *  the selection atom is set. Setting the atom first opened a window where
+ *  BotsPane rendered with a selected group and an empty tab map — the
+ *  in-pane fallback painted alongside the main tab, and because the map
+ *  write itself repaints nothing, the duplicate stuck until an unrelated
+ *  re-render. */
 function openGroupChat(group) {
   $groupNeedsYou.set({ ...$groupNeedsYou.get(), [group]: false })
-  $groupChatWorkspace.set(group)
 
   if (typeof host.openWorkspace === 'function') {
     try {
@@ -9589,7 +9521,7 @@ function openGroupChat(group) {
         minWidth: '24rem',
         render: () => jsx(GroupChatMainView, { group }),
         onClose: () => {
-          groupChatMainTabs.delete(group)
+          dropGroupMainTab(group)
 
           if ($groupChatWorkspace.get() === group) {
             $groupChatWorkspace.set(null)
@@ -9597,7 +9529,10 @@ function openGroupChat(group) {
         }
       })
 
-      groupChatMainTabs.set(group, close)
+      recordGroupMainTab(group, close)
+      // Tab ownership is on record — the atom now only drives the roster
+      // highlight; shouldRenderGroupChatInPane stays false throughout.
+      $groupChatWorkspace.set(group)
 
       return
     } catch {
@@ -9605,8 +9540,9 @@ function openGroupChat(group) {
     }
   }
 
-  // The selected-group atom was set before trying the main-window door, so
-  // older desktops naturally render the in-panel room as the fallback.
+  // No main-window door (older desktop) or it threw: select the group so
+  // the in-panel room renders as the fallback surface.
+  $groupChatWorkspace.set(group)
 }
 
 /** One group chat as ONE roster row — the Discord shape: stacked member
@@ -9733,8 +9669,12 @@ function BotsPane() {
   const [grouping, setGrouping] = useState(null)
   const [query, setQuery] = useState('')
   const activityToasts = useValue($activityToasts)
-  const sessionsWorkspaceName = useValue($botSessionsWorkspace)
   const groupChatName = useValue($groupChatWorkspace)
+  // Main-tab ownership is a module Map; this rev subscription makes the
+  // shouldRenderGroupChatInPane gate below reactive to tab open/close
+  // (#89788 follow-up — without it a stale render could paint the in-pane
+  // room beside a live main tab and stick).
+  useValue($groupMainTabsRev)
   const groupNeedsYou = useValue($groupNeedsYou)
   const groupRooms = useValue($groupChats)
 
@@ -9825,11 +9765,6 @@ function BotsPane() {
   const staleNotice = error && !live && roster.length
     ? 'Roster refresh failed — showing the last good list.' + (gatewayUp ? '' : ' Waiting for the gateway to reconnect…')
     : null
-  const sessionsWorkspaceBot = roster.find(bot => bot.name === sessionsWorkspaceName)
-
-  if (sessionsWorkspaceBot) {
-    return jsx(ProfileSessionsWorkspace, { bot: sessionsWorkspaceBot })
-  }
 
   const groupChatMembers = groupChatName ? groupChatMemberBots(groupChatName, roster, allMeta) : []
 
