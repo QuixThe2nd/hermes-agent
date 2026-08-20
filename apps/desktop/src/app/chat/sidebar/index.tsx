@@ -257,6 +257,16 @@ const HEADER_NAV_BTN =
 // FTS results cover sessions that aren't in the loaded page; synthesize a
 // minimal SessionInfo so they render in the same row component (resume works
 // by id; the snippet stands in for the preview).
+
+// The backend's FTS layer wraps matched terms in literal '>>>' / '<<<'
+// highlight markers (sqlite snippet() delimiters — see hermes_state_search.py).
+// The sidebar renders the snippet as plain text, so the markers must be
+// stripped or a search for "foo" paints rows titled ">>>foo<<<".
+// Exported for tests.
+export function stripFtsMarkers(snippet: string): string {
+  return snippet.replaceAll('>>>', '').replaceAll('<<<', '')
+}
+
 function searchResultToSession(result: SessionSearchResult): SessionInfo {
   const ts = result.session_started ?? Date.now() / 1000
 
@@ -272,7 +282,7 @@ function searchResultToSession(result: SessionSearchResult): SessionInfo {
     message_count: 0,
     model: result.model ?? null,
     output_tokens: 0,
-    preview: result.snippet?.trim() || null,
+    preview: stripFtsMarkers(result.snippet ?? '').trim() || null,
     source: result.source ?? null,
     started_at: ts,
     title: null,
@@ -467,16 +477,19 @@ export function ChatSidebar({
 
   // Profile scope = the "workspace switcher" context. Concrete scope shows only
   // that profile's sessions (clean rows, no per-row tags); ALL fans every
-  // profile in, grouped by profile below. Single-profile users land here with
-  // scope === their only profile, so nothing is filtered out.
+  // profile in. Grouped rendering stays gated on `showAllProfiles` (multi-profile
+  // + ALL) so a single-profile user is never stranded in a grouped view with no
+  // rail — but the *data* still has to fan in when the persisted scope is ALL
+  // (Grouping → Profile). Filtering that pool against the `__all__` sentinel
+  // matches nothing and empties recents + pins.
   // Archived rows are excluded from the sessions query, so Archived is a view of
   // its own set rather than a filter over this one — a flat list of archived
   // rows, no project tree, no date or status dividers.
   const scopedSessions = useMemo(() => {
     const pool = showArchived ? archivedSessions : sessions
 
-    return showAllProfiles ? pool : pool.filter(s => normalizeProfileKey(s.profile) === profileScope)
-  }, [sessions, archivedSessions, showArchived, showAllProfiles, profileScope])
+    return filterSessionsByProfileScope(pool, profileScope)
+  }, [sessions, archivedSessions, showArchived, profileScope])
 
   // One predicate for the status/project filters, so the flat list and the
   // project lanes narrow by the same rule. A project lane holds rows the loaded

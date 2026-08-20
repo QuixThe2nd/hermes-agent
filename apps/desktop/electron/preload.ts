@@ -1,6 +1,17 @@
 import { contextBridge, ipcRenderer, webFrame, webUtils } from 'electron'
 
+// Which translucency the OS can back. Asked synchronously because the renderer
+// needs it before its first paint, and answered by main because deciding it
+// needs `os.release()` — a sandboxed preload may only require electron, events,
+// timers and url, so importing node:os here throws before contextBridge runs
+// and takes the ENTIRE bridge down with it (window.hermesDesktop undefined =>
+// "Desktop IPC bridge is unavailable"). No reply means no glass, which degrades
+// to an ordinary opaque window rather than a page thinned over nothing.
+const translucencySupport = ipcRenderer.sendSync('hermes:translucency:support')
+
 contextBridge.exposeInMainWorld('hermesDesktop', {
+  glassSupported: translucencySupport?.glass === true,
+  translucencySupported: translucencySupport?.translucency === true,
   getConnection: profile => ipcRenderer.invoke('hermes:connection', profile),
   // Registry-scoped backend resolution: { connectionId, profile } → descriptor.
   getConnectionFor: payload => ipcRenderer.invoke('hermes:connection:for', payload),
@@ -64,7 +75,10 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     setIgnoreMouse: ignore => ipcRenderer.send('hermes:hud:ignore-mouse', ignore),
     moveBy: delta => ipcRenderer.send('hermes:hud:move-by', delta),
     setBounds: bounds => ipcRenderer.send('hermes:hud:set-bounds', bounds),
-    setVibrancy: on => ipcRenderer.invoke('hermes:hud:vibrancy', on),
+    // Whether the band covers the window below the bar. Main pairs it with the
+    // user's translucency setting to decide the native frost (macOS vibrancy /
+    // Windows 11 DWM backdrop) — see hudFrostFor.
+    setFrost: showing => ipcRenderer.invoke('hermes:hud:frost', showing),
     // The HUD tells main which session it is on; main hands that back to the
     // app window when the HUD closes, so the app can re-home onto it.
     setSession: sessionId => ipcRenderer.send('hermes:hud:session', sessionId),

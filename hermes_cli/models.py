@@ -1600,6 +1600,39 @@ _openrouter_reasoning_caps_cache: dict[str, Optional[dict[str, Any]]] | None = N
 _openrouter_reasoning_caps_failed_at: float | None = None
 
 
+def _fetch_reasoning_caps_catalog(
+    url: str, timeout: float
+) -> Optional[dict[str, Optional[dict[str, Any]]]]:
+    """Fetch one OpenRouter-shaped ``/v1/models`` catalog → per-model caps.
+
+    Shared by every aggregator that serves OpenRouter's catalog schema
+    (OpenRouter itself, Nous Portal). Returns None when the catalog is
+    unreachable or carries no usable entries, so callers can remember the
+    failure and fall back rather than caching an empty result.
+
+    Sends a User-Agent because the Portal 403s anonymous catalog reads.
+    """
+    headers = {"Accept": "application/json", "User-Agent": _HERMES_USER_AGENT}
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode())
+    except Exception:
+        return None
+    items = payload.get("data")
+    if not isinstance(items, list):
+        return None
+    caps_by_id: dict[str, Optional[dict[str, Any]]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        mid = str(item.get("id") or "").strip()
+        if not mid:
+            continue
+        caps_by_id[mid] = parse_openrouter_reasoning_capabilities(item)
+    return caps_by_id or None
+
+
 def _fetch_openrouter_reasoning_caps(timeout: float = 6.0) -> Optional[dict[str, Optional[dict[str, Any]]]]:
     """Fetch + cache per-model reasoning capabilities from the live catalog.
 
@@ -1616,29 +1649,10 @@ def _fetch_openrouter_reasoning_caps(timeout: float = 6.0) -> Optional[dict[str,
         and (time.monotonic() - _openrouter_reasoning_caps_failed_at) < 60
     ):
         return None
-    try:
-        req = urllib.request.Request(
-            "https://openrouter.ai/api/v1/models",
-            headers={"Accept": "application/json"},
-        )
-        with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode())
-    except Exception:
-        _openrouter_reasoning_caps_failed_at = time.monotonic()
-        return None
-    items = payload.get("data")
-    if not isinstance(items, list):
-        _openrouter_reasoning_caps_failed_at = time.monotonic()
-        return None
-    caps_by_id: dict[str, Optional[dict[str, Any]]] = {}
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        mid = str(item.get("id") or "").strip()
-        if not mid:
-            continue
-        caps_by_id[mid] = parse_openrouter_reasoning_capabilities(item)
-    if not caps_by_id:
+    caps_by_id = _fetch_reasoning_caps_catalog(
+        "https://openrouter.ai/api/v1/models", timeout
+    )
+    if caps_by_id is None:
         _openrouter_reasoning_caps_failed_at = time.monotonic()
         return None
     _openrouter_reasoning_caps_cache = caps_by_id
@@ -1705,12 +1719,76 @@ def warm_openrouter_reasoning_caps_async() -> None:
     ).start()
 
 
-# Canonical low→high ordering used for nearest-level clamping. Superset of
-# hermes_constants.VALID_REASONING_EFFORTS ("none" included so an explicit
-# disable can be clamped too when a provider publishes it as a level).
-_REASONING_EFFORT_ORDER = (
-    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
-)
+# Nous Portal serves OpenRouter's catalog schema, so the same parser and
+# tri-state contract apply. Kept in its own cache because the two catalogs
+# list different models (and different capabilities for shared ids).
+_nous_reasoning_caps_cache: dict[str, Optional[dict[str, Any]]] | None = None
+_nous_reasoning_caps_failed_at: float | None = None
+_nous_caps_warm_started = False
+
+
+def _fetch_nous_reasoning_caps(timeout: float = 6.0) -> Optional[dict[str, Optional[dict[str, Any]]]]:
+    """Nous Portal counterpart of :func:`_fetch_openrouter_reasoning_caps`."""
+    global _nous_reasoning_caps_cache, _nous_reasoning_caps_failed_at
+    if _nous_reasoning_caps_cache is not None:
+        return _nous_reasoning_caps_cache
+    if (
+        _nous_reasoning_caps_failed_at is not None
+        and (time.monotonic() - _nous_reasoning_caps_failed_at) < 60
+    ):
+        return None
+    caps_by_id = _fetch_reasoning_caps_catalog(
+        f"{_DEFAULT_NOUS_INFERENCE_BASE}/v1/models", timeout
+    )
+    if caps_by_id is None:
+        _nous_reasoning_caps_failed_at = time.monotonic()
+        return None
+    _nous_reasoning_caps_cache = caps_by_id
+    return caps_by_id
+
+
+def nous_model_reasoning_capabilities(
+    model_id: Optional[str],
+    *,
+    timeout: float = 6.0,
+    allow_fetch: bool = False,
+) -> Optional[dict[str, Any]]:
+    """Return live-catalog reasoning capabilities for a Nous Portal model.
+
+    Same tri-state contract and cache-only default as
+    :func:`openrouter_model_reasoning_capabilities`; warm the cache with
+    :func:`warm_nous_reasoning_caps_async` from hot paths.
+    """
+    model = str(model_id or "").strip()
+    if not model:
+        return None
+    caps_by_id = _nous_reasoning_caps_cache
+    if caps_by_id is None and allow_fetch:
+        caps_by_id = _fetch_nous_reasoning_caps(timeout=timeout)
+    if caps_by_id is None:
+        return None
+    return caps_by_id.get(model)
+
+
+def warm_nous_reasoning_caps_async() -> None:
+    """Nous Portal counterpart of :func:`warm_openrouter_reasoning_caps_async`."""
+    global _nous_caps_warm_started
+    if _nous_caps_warm_started or _nous_reasoning_caps_cache is not None:
+        return
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    _nous_caps_warm_started = True
+    threading.Thread(
+        target=_fetch_nous_reasoning_caps,
+        name="nous-reasoning-caps-warm",
+        daemon=True,
+    ).start()
+
+
+# Canonical low→high ordering used for nearest-level clamping. Kept as an
+# alias of the single source of truth in ``agent.reasoning_effort``.
+from agent.reasoning_effort import EFFORT_LADDER as _REASONING_EFFORT_ORDER
+from agent.reasoning_effort import clamp_effort as _clamp_effort
 
 
 def clamp_reasoning_effort_to_supported(
@@ -1719,38 +1797,17 @@ def clamp_reasoning_effort_to_supported(
 ) -> Optional[str]:
     """Clamp a requested reasoning effort to a provider's supported levels.
 
-    Returns the requested effort unchanged when it is supported, when the
-    supported list is unknown (None/empty), or when the effort isn't a
-    recognized level (custom providers may use bespoke names — pass through
-    rather than guess). Otherwise returns the nearest supported level,
-    preferring the closest LOWER level so a clamp never silently escalates
-    cost (requesting ``xhigh`` against ``[low, medium, high]`` yields
-    ``high``; requesting ``minimal`` against ``[low, medium]`` yields
-    ``low`` because no lower level exists).
+    Thin wrapper over the canonical policy in
+    :func:`agent.reasoning_effort.clamp_effort` (single implementation for
+    every transport and provider profile): keep a supported level verbatim,
+    otherwise nearest WEAKER supported level (never silently escalate cost),
+    weakest supported level when nothing weaker exists, pass through unknown
+    supported-sets and bespoke level names unchanged.
 
     Ported from PrimeIntellect-ai/prime-agent#1258's thinking-level-map
     normalization.
     """
-    requested = str(effort or "").strip().lower()
-    if not requested or not supported_efforts:
-        return effort
-    supported = [
-        str(level).strip().lower()
-        for level in supported_efforts
-        if str(level).strip().lower() in _REASONING_EFFORT_ORDER
-    ]
-    if not supported or requested in supported:
-        return effort
-    if requested not in _REASONING_EFFORT_ORDER:
-        return effort
-    requested_idx = _REASONING_EFFORT_ORDER.index(requested)
-    below = [
-        level for level in supported
-        if _REASONING_EFFORT_ORDER.index(level) < requested_idx
-    ]
-    if below:
-        return max(below, key=_REASONING_EFFORT_ORDER.index)
-    return min(supported, key=_REASONING_EFFORT_ORDER.index)
+    return _clamp_effort(effort, supported_efforts)
 
 
 def fetch_openrouter_models(
