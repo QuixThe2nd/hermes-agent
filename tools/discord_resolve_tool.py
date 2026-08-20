@@ -18,6 +18,7 @@ platforms. Reuses the REST helper and token resolution from
 
 import json
 import logging
+import urllib.parse
 from typing import Any, Dict, List, Optional
 
 from tools.discord_tool import (
@@ -32,13 +33,37 @@ logger = logging.getLogger(__name__)
 
 _THREAD_TYPES = {10, 11, 12}  # announcement_thread, public_thread, private_thread
 _EMBED_COLOR = 0x57F287  # Discord green
+_EMBED_COLOR_DECLINED = 0x95A5A6  # gray
+
+EMOJI_CONFIRM = "✅"
+EMOJI_DECLINE = "❌"
+_FOOTER_MARKER = "hermes ticket resolution"
+_FOOTER_OPEN = f"{_FOOTER_MARKER} • archive only, never delete"
 
 _PROPOSE_DESCRIPTION = (
     "{summary}\n\n"
-    "Reply **yes** (or \"close it\") to close this ticket — the thread is "
-    "archived, nothing is deleted and it can be reopened at any time. "
-    "Reply **no** to keep it open."
+    f"React {EMOJI_CONFIRM} to close this ticket — the thread is archived, "
+    "nothing is deleted and it can be reopened at any time. "
+    f"React {EMOJI_DECLINE} to keep it open. (A plain \"yes\"/\"no\" reply works too.)"
 )
+
+
+def _add_reaction(token: str, channel_id: str, message_id: str, emoji: str) -> None:
+    encoded = urllib.parse.quote(emoji, safe="")
+    _discord_request(
+        "PUT",
+        f"/channels/{channel_id}/messages/{message_id}/reactions/{encoded}/@me",
+        token,
+    )
+
+
+def _edit_embed(token: str, channel_id: str, message_id: str, embed: Dict[str, Any]) -> None:
+    _discord_request(
+        "PATCH",
+        f"/channels/{channel_id}/messages/{message_id}",
+        token,
+        body={"embeds": [embed]},
+    )
 
 
 def _post_embed(token: str, channel_id: str, summary: str) -> Dict[str, Any]:
@@ -48,14 +73,24 @@ def _post_embed(token: str, channel_id: str, summary: str) -> Dict[str, Any]:
             summary=summary.strip() or "I believe this ticket is resolved."
         ),
         "color": _EMBED_COLOR,
-        "footer": {"text": "hermes ticket resolution • archive only, never delete"},
+        "footer": {"text": _FOOTER_OPEN},
     }
-    return _discord_request(
+    message = _discord_request(
         "POST",
         f"/channels/{channel_id}/messages",
         token,
         body={"embeds": [embed]},
     )
+    message_id = (message or {}).get("id")
+    if message_id:
+        # Best-effort: without both reactions the confirm flow still works
+        # via text reply, so a reaction failure is not fatal.
+        for emoji in (EMOJI_CONFIRM, EMOJI_DECLINE):
+            try:
+                _add_reaction(token, channel_id, message_id, emoji)
+            except DiscordAPIError as exc:
+                logger.warning("resolve_ticket: adding %s reaction failed (%s)", emoji, exc)
+    return message
 
 
 def _close_thread(token: str, channel_id: str) -> Dict[str, Any]:
@@ -91,6 +126,62 @@ def _close_thread(token: str, channel_id: str) -> Dict[str, Any]:
     after = _discord_request("GET", f"/channels/{channel_id}", token)
     archived = bool((after.get("thread_metadata") or {}).get("archived"))
     return {"archived": archived, "already_archived": False}
+
+
+def _message_footer(message: Dict[str, Any]) -> str:
+    embeds = message.get("embeds") or []
+    if not embeds:
+        return ""
+    return ((embeds[0].get("footer") or {}).get("text") or "")
+
+
+def handle_resolve_reaction(channel_id: str, message_id: str, emoji: str) -> Dict[str, Any]:
+    """Handle a reaction added to a resolve_ticket confirmation embed.
+
+    Called by the Discord gateway adapter's ``on_raw_reaction_add`` (bot's
+    own reactions are filtered there). Archive-only: the confirm path uses
+    :func:`_close_thread`, which never deletes.
+    """
+    if emoji not in (EMOJI_CONFIRM, EMOJI_DECLINE):
+        return {"acted": False, "reason": "unrelated_emoji"}
+
+    token = _get_bot_token()
+    if not token:
+        return {"acted": False, "reason": "no_token"}
+
+    try:
+        message = _discord_request("GET", f"/channels/{channel_id}/messages/{message_id}", token)
+    except DiscordAPIError as exc:
+        return {"acted": False, "reason": f"fetch_failed:{exc.status}"}
+
+    footer = _message_footer(message)
+    if not footer.startswith(_FOOTER_MARKER):
+        return {"acted": False, "reason": "not_a_resolve_embed"}
+    if "• closed" in footer or "• kept open" in footer:
+        return {"acted": False, "reason": "already_decided"}
+
+    summary = (message.get("embeds") or [{}])[0].get("description", "")
+
+    if emoji == EMOJI_CONFIRM:
+        try:
+            _edit_embed(token, channel_id, message_id, {
+                "title": "🔒 Ticket closed",
+                "description": summary,
+                "color": _EMBED_COLOR,
+                "footer": {"text": f"{_FOOTER_MARKER} • closed"},
+            })
+        except DiscordAPIError as exc:
+            logger.warning("resolve_ticket: closed-embed edit failed (%s); archiving anyway", exc)
+        result = _close_thread(token, channel_id)
+        return {"acted": True, "decision": "closed", "archived": result["archived"]}
+
+    _edit_embed(token, channel_id, message_id, {
+        "title": "🎫 Ticket kept open",
+        "description": summary,
+        "color": _EMBED_COLOR_DECLINED,
+        "footer": {"text": f"{_FOOTER_MARKER} • kept open"},
+    })
+    return {"acted": True, "decision": "kept_open"}
 
 
 def resolve_ticket(

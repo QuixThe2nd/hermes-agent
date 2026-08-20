@@ -1417,6 +1417,31 @@ class DiscordAdapter(BasePlatformAdapter):
                 await adapter_self._on_platform_thread_update(before, after)
 
             @self._client.event
+            async def on_raw_reaction_add(payload):
+                """Resolve-ticket confirmations: ✅/❌ on resolve_ticket embeds.
+
+                The handler filters to the tool's own embeds via the footer
+                marker, so unrelated reactions cost one cheap emoji check.
+                """
+                try:
+                    if payload.emoji.name not in ("✅", "❌"):
+                        return
+                    bot_user = adapter_self._client.user
+                    if bot_user is not None and payload.user_id == bot_user.id:
+                        return
+                    from tools.discord_resolve_tool import handle_resolve_reaction
+                    result = await asyncio.to_thread(
+                        handle_resolve_reaction,
+                        str(payload.channel_id),
+                        str(payload.message_id),
+                        payload.emoji.name,
+                    )
+                    if result.get("acted"):
+                        logger.info("[%s] resolve_ticket reaction: %s", adapter_self.name, result)
+                except Exception:
+                    logger.exception("[%s] resolve_ticket reaction handler failed", adapter_self.name)
+
+            @self._client.event
             async def on_voice_state_update(member, before, after):
                 """Track voice channel join/leave events."""
                 # Only track channels where the bot is connected
