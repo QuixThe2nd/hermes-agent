@@ -61,6 +61,82 @@ _UPDATE_RUNTIME_RELOAD_MODULES = (
     "tools.lazy_deps",
 )
 
+#: Package prefixes whose cached modules become stale the moment the checkout
+#: changes under this process. Purged (not reloaded) by
+#: ``_purge_stale_hermes_modules`` so any LATER import chain resolves against
+#: fresh on-disk source only.
+_STALE_PURGE_PREFIXES = (
+    "hermes_cli",
+    "gateway",
+    "tools",
+    "tui_gateway",
+    "agent",
+)
+
+#: Modules that must survive the purge: they are (or are referenced by) the
+#: code currently EXECUTING the update, so evicting them buys nothing — the
+#: running frames keep their module objects alive regardless — and reloading
+#: them mid-flight is the one genuinely unsafe move.
+_STALE_PURGE_PROTECTED = frozenset(
+    {
+        "hermes_cli",
+        "hermes_cli.main",
+        "hermes_cli.update_cmd",
+        "hermes_cli.hermes_logging",
+    }
+)
+
+
+def _purge_stale_hermes_modules() -> None:
+    """Evict every cached Hermes module after the checkout changed in-place.
+
+    ``hermes update`` keeps running in the pre-pull Python process. The
+    gateway auto-restart phase that follows does function-level
+    ``from hermes_cli.gateway import ...`` — executing NEW source inside an
+    OLD ``sys.modules`` world. The moment new source references a symbol
+    that was added to an already-cached module, the import dies (2026-08-20
+    field failure: freshly-pulled ``hermes_cli.gateway`` does
+    ``from hermes_cli.cli_output import line_input``, but ``cli_output`` was
+    cached from before d0132b582 which introduced ``line_input`` → the whole
+    restart phase aborted and the gateway kept serving pre-update code).
+
+    ``_UPDATE_RUNTIME_RELOAD_MODULES`` handled this per-symptom — three
+    hardcoded module names, re-fixed every time a new module grew a new
+    export. This is the class fix: drop EVERY cached module under the Hermes
+    package prefixes so subsequent lazy imports rebuild a self-consistent,
+    all-new module graph from the updated checkout. Old module objects
+    referenced by the running updater frames stay alive and functional (a
+    purge only removes the ``sys.modules`` cache entry); only genuinely
+    executing modules are exempted, because reloading-in-place — not purging
+    — is the operation that can pull code out from under a running frame.
+
+    Best-effort: never raises.
+    """
+    try:
+        import importlib
+
+        importlib.invalidate_caches()
+        purged = []
+        for name in list(_m().sys.modules):
+            if name in _STALE_PURGE_PROTECTED:
+                continue
+            if not name.startswith(_STALE_PURGE_PREFIXES):
+                continue
+            root = name.split(".", 1)[0]
+            if root not in _STALE_PURGE_PREFIXES:
+                # Prefix-string match caught an unrelated package
+                # (e.g. ``gateway_foo``) — leave it alone.
+                continue
+            if _m().sys.modules.pop(name, None) is not None:
+                purged.append(name)
+        if purged:
+            logger.debug(
+                "Purged %d stale Hermes module(s) after checkout update", len(purged)
+            )
+    except Exception as exc:
+        logger.debug("Could not purge stale Hermes modules: %s", exc)
+
+
 def _reload_updated_runtime_modules() -> None:
     """Reload update-sensitive modules after the checkout changes in-place.
 
@@ -1610,6 +1686,20 @@ def _stash_apply_failed_only_on_existing_untracked(stderr: str) -> bool:
         else:
             return False
     return saw_untracked_error
+
+def _park_stashed_changes(stash_ref: str) -> None:
+    """Leave a pre-update autostash parked instead of re-applying it.
+
+    Used by ``hermes update --keep-stash`` (the desktop updater's mode): the
+    stash made the update possible on a dirty tree, but local source edits
+    must never be silently re-applied onto the updated code. Nothing is
+    lost — the entry stays in ``git stash`` with printed recovery guidance.
+    """
+    print()
+    print("ℹ️  Local changes were stashed before updating and were NOT re-applied (--keep-stash).")
+    print(f"  Stash ref: {stash_ref}")
+    print(f"  Restore manually with: git stash apply {stash_ref}")
+
 
 def _restore_stashed_changes(
     git_cmd: list[str],
@@ -3941,6 +4031,50 @@ def _orphaned_desktop_backend_pids(
     return roots
 
 
+def _ledger_reapable_backend_pids(
+    matches: list[tuple[int, str, str]],
+) -> list[int]:
+    """PIDs positively identified by the spawn ledger as orphaned backends.
+
+    The strongest rung: instead of inferring lineage from PPIDs or cmdline
+    shape, look each venv holder up in the machine spawn ledger
+    (``hermes_cli.process_identity``). A holder qualifies when ALL of:
+
+    - its ``(pid, create_time)`` matches a live ledger entry (PID reuse
+      cannot forge this pair);
+    - the entry's purpose is a reapable backend kind (serve/dashboard/
+      gateway — never interactive processes);
+    - the entry's recorded SPAWNER is provably dead (``spawner_is_dead``).
+
+    Unlike the heuristic rungs, this is safe in ANY update context — no
+    hand-off contract needed — because the ownership claim is explicit: the
+    process itself declared who supervises it, and that supervisor is gone.
+    Holders not in the ledger are simply not returned (they fall through to
+    the later rungs); they never disqualify the identified ones. Never raises.
+    """
+    try:
+        from hermes_cli.process_identity import (
+            REAPABLE_PURPOSES,
+            ledger_entries,
+            spawner_is_dead,
+        )
+
+        entries = ledger_entries()
+    except Exception:
+        return []
+    by_pid = {e.get("pid"): e for e in entries if isinstance(e.get("pid"), int)}
+    roots: list[int] = []
+    for pid, _name, _cmdline in matches:
+        entry = by_pid.get(int(pid))
+        if not entry:
+            continue
+        if entry.get("purpose") not in REAPABLE_PURPOSES:
+            continue
+        if spawner_is_dead(entry) is True:
+            roots.append(int(pid))
+    return roots
+
+
 def _handoff_reapable_backend_pids(
     matches: list[tuple[int, str, str]],
 ) -> list[int] | None:
@@ -4784,6 +4918,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
         else None
     )
     assume_yes = bool(getattr(args, "yes", False))
+    # --keep-stash (desktop updater): stash local changes so the update can
+    # proceed, but never re-apply them afterward — they stay parked in git
+    # stash. Only applies when an update actually landed; abort/no-op paths
+    # still restore, since the tree they restore onto is unchanged.
+    keep_stash = bool(getattr(args, "keep_stash", False))
 
     # Whether this update is running without a human at the keyboard.
     # Interactive terminal updates always stash-and-ask (unchanged behavior);
@@ -4873,6 +5012,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         logger.debug(
                             "Could not stop leftover gateway %s: %s", _pid, exc
                         )
+                _time.sleep(1.0)
+                _venv_holders = _m()._detect_venv_python_processes()
+        if _venv_holders:
+            # Positive-identity rung (runs FIRST, any update context): holders
+            # the spawn ledger proves are orphaned Hermes backends — the
+            # process self-registered (pid, create_time, purpose, spawner) at
+            # startup and its recorded spawner is provably dead. No PPID
+            # archaeology, no hand-off contract required.
+            _ledger_backends = _m()._ledger_reapable_backend_pids(_venv_holders)
+            if _ledger_backends:
+                print(
+                    f"  ⚠ {len(_ledger_backends)} ledger-identified orphaned "
+                    "Hermes backend process(es) hold the venv; stopping their trees"
+                )
+                _m()._stop_process_trees(_ledger_backends)
                 _time.sleep(1.0)
                 _venv_holders = _m()._detect_venv_python_processes()
         if _venv_holders:
@@ -5449,6 +5603,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         _m().PROJECT_ROOT,
                         auto_stash_ref,
                     )
+                elif keep_stash:
+                    # --keep-stash (desktop updater): the update landed; leave
+                    # local edits parked in the stash instead of silently
+                    # re-applying them onto the updated code.
+                    _m()._park_stashed_changes(auto_stash_ref)
                 else:
                     _m()._restore_stashed_changes(
                         git_cmd,
@@ -6178,6 +6337,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # Auto-restart ALL gateways after update.
         # The code update (git pull) is shared across all profiles, so every
         # running gateway needs restarting to pick up the new code.
+        #
+        # Purge stale cached Hermes modules FIRST: the import below pulls
+        # freshly-updated gateway source into this pre-update interpreter,
+        # and any already-cached sibling module (cli_output, status, ...)
+        # that the new source expects a new symbol from would otherwise
+        # ImportError and abort this whole phase (2026-08-20 field failure:
+        # new gateway.py ← stale cli_output missing line_input).
+        _m()._purge_stale_hermes_modules()
         try:
             from hermes_cli.gateway import (
                 is_macos,
