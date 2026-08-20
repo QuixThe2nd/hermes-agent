@@ -171,7 +171,7 @@ def _close_thread(token: str, channel_id: str) -> Dict[str, Any]:
             "POST",
             f"/channels/{channel_id}/messages",
             token,
-            body={"content": "🔒 Ticket closed — this thread has been archived. Nothing was deleted; ask here to reopen it."},
+            body={"content": "🔒 Chat closed — this thread has been archived. Nothing was deleted; ask here to reopen it."},
         )
     except DiscordAPIError as exc:
         logger.warning("resolve_ticket: farewell message failed (%s); archiving anyway", exc)
@@ -237,7 +237,7 @@ def handle_resolve_reaction(
     if emoji == EMOJI_CONFIRM:
         try:
             _edit_embed(token, channel_id, message_id, {
-                "title": "🔒 Ticket closed",
+                "title": "🔒 Chat closed",
                 "description": summary,
                 "color": _EMBED_COLOR,
                 "footer": {"text": f"{_FOOTER_MARKER} • closed"},
