@@ -546,6 +546,7 @@ TOOLSETS = {
         "tools": _HERMES_CORE_TOOLS + [
             "discord",
             "discord_admin",
+            "resolve_ticket",
         ],
         "includes": []
     },
