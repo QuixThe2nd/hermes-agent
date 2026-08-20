@@ -356,8 +356,8 @@ TOOLSETS = {
     },
 
     "discord": {
-        "description": "Discord read and participate tools (fetch messages, search members, create threads)",
-        "tools": ["discord"],
+        "description": "Discord read and participate tools (fetch messages, search members, create threads, resolve tickets)",
+        "tools": ["discord", "resolve_ticket"],
         "includes": [],
     },
 
