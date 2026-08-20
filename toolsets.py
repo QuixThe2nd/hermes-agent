@@ -324,6 +324,12 @@ TOOLSETS = {
         "includes": [],
     },
 
+    "quota_channels": {
+        "description": "Discord voice-channel quota display for Codex, Kimi, z.ai, Cursor, and Grok",
+        "tools": ["quota_channels_tick"],
+        "includes": [],
+    },
+
     # "honcho" toolset removed — Honcho is now a memory provider plugin.
     # Tools are injected via MemoryManager, not the toolset system.
 
