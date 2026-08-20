@@ -1435,6 +1435,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         str(payload.channel_id),
                         str(payload.message_id),
                         payload.emoji.name,
+                        adapter_self.config.token,
                     )
                     if result.get("acted"):
                         logger.info("[%s] resolve_ticket reaction: %s", adapter_self.name, result)

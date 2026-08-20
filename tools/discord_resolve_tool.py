@@ -135,17 +135,25 @@ def _message_footer(message: Dict[str, Any]) -> str:
     return ((embeds[0].get("footer") or {}).get("text") or "")
 
 
-def handle_resolve_reaction(channel_id: str, message_id: str, emoji: str) -> Dict[str, Any]:
+def handle_resolve_reaction(
+    channel_id: str,
+    message_id: str,
+    emoji: str,
+    token: Optional[str] = None,
+) -> Dict[str, Any]:
     """Handle a reaction added to a resolve_ticket confirmation embed.
 
     Called by the Discord gateway adapter's ``on_raw_reaction_add`` (bot's
-    own reactions are filtered there). Archive-only: the confirm path uses
+    own reactions are filtered there). The adapter passes its configured
+    bot ``token`` explicitly: raw gateway events run outside the per-turn
+    profile secret scope, so ``_get_bot_token()`` would raise
+    ``UnscopedSecretError`` here. Archive-only: the confirm path uses
     :func:`_close_thread`, which never deletes.
     """
     if emoji not in (EMOJI_CONFIRM, EMOJI_DECLINE):
         return {"acted": False, "reason": "unrelated_emoji"}
 
-    token = _get_bot_token()
+    token = (token or "").strip() or _get_bot_token()
     if not token:
         return {"acted": False, "reason": "no_token"}
 

@@ -210,6 +210,23 @@ class TestReactionHandler:
 
         assert result == {"acted": False, "reason": "already_decided"}
 
+    def test_explicit_token_bypasses_secret_scope(self):
+        """Regression: raw gateway reaction events run outside the per-turn
+        profile secret scope, so _get_bot_token() raises there. The adapter
+        passes its configured token explicitly."""
+        def explode():
+            raise RuntimeError("UnscopedSecretError")
+
+        def fake_request(method, path, token, params=None, body=None, timeout=15):
+            assert token == "adapter-token"
+            return _resolve_embed_message()
+
+        with patch.object(drt, "_get_bot_token", explode), \
+                patch.object(drt, "_discord_request", fake_request):
+            result = drt.handle_resolve_reaction("123", "msg-1", "❌", token="adapter-token")
+
+        assert result == {"acted": True, "decision": "kept_open"}
+
 
 class TestRegistration:
     def test_registered_in_discord_toolset(self):
