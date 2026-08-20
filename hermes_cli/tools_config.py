@@ -123,6 +123,7 @@ CONFIGURABLE_TOOLSETS = [
     ("yuanbao",          "🤖 Yuanbao",                  "group info, member queries, DM"),
     ("computer_use",     "🖱️  Computer Use (macOS/Windows/Linux)", "background desktop control via cua-driver"),
     ("dev-pipeline",    "🏗️ Dev Pipeline",              "durable automated development jobs"),
+    ("quota_channels",  "📊 Quota Channels",            "quota_channels_tick (Discord voice-channel quota display)"),
 ]
 
 
@@ -161,7 +162,7 @@ def gui_toolset_label(label: str) -> str:
 # discord/discord_admin stay platform-restricted to discord via
 # _TOOLSET_PLATFORM_RESTRICTIONS, so this only affects Discord sessions.
 # Upstream keeps all three opt-in.
-_DEFAULT_OFF_TOOLSETS = {"moa", "homeassistant", "spotify", "video", "video_gen", "x_search", "a2a"}
+_DEFAULT_OFF_TOOLSETS = {"moa", "homeassistant", "spotify", "video", "video_gen", "x_search", "a2a", "quota_channels"}
 
 
 # Config-only capabilities: they appear in `hermes tools` for provider/API-key
