@@ -66,7 +66,7 @@ def _pending_path():
 
 def _load_pending() -> Dict[str, Any]:
     try:
-        return json.loads(_pending_path().read_text())
+        return json.loads(_pending_path().read_text(encoding="utf-8"))
     except Exception:
         return {}
 
@@ -74,7 +74,7 @@ def _load_pending() -> Dict[str, Any]:
 def _save_pending(pending: Dict[str, Any]) -> None:
     path = _pending_path()
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(pending, indent=1))
+    tmp.write_text(json.dumps(pending, indent=1), encoding="utf-8")
     tmp.replace(path)
 
 
