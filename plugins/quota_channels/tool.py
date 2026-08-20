@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
 from plugins.quota_channels.core import (
@@ -34,14 +33,10 @@ QUOTA_CHANNELS_TICK_SCHEMA = {
 
 
 def _load_config_mapping() -> dict:
-    import yaml
-    from hermes_constants import get_hermes_home
-
-    path = get_hermes_home() / "config.yaml"
     try:
-        if not path.exists():
-            return {}
-        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        from hermes_cli.config import load_config_readonly
+
+        return load_config_readonly()
     except Exception:
         return {}
 

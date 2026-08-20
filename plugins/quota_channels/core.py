@@ -506,15 +506,22 @@ def check_minimum_config_from_mapping(config: Mapping[str, Any]) -> bool:
 
 
 def load_quota_config(config_path: Optional[Path] = None) -> dict:
-    import yaml
+    if config_path is None:
+        try:
+            from hermes_cli.config import load_config_readonly
 
-    path = config_path or (_hermes_home() / "config.yaml")
-    try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except OSError as exc:
-        raise QuotaChannelsError(f"cannot read {path}: {exc}") from exc
-    except Exception as exc:
-        raise QuotaChannelsError(f"cannot parse {path}: {exc}") from exc
+            raw = load_config_readonly()
+        except Exception as exc:
+            raise QuotaChannelsError(f"cannot load config: {exc}") from exc
+    else:
+        import yaml
+
+        try:
+            raw = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
+        except OSError as exc:
+            raise QuotaChannelsError(f"cannot read {config_path}: {exc}") from exc
+        except Exception as exc:
+            raise QuotaChannelsError(f"cannot parse {config_path}: {exc}") from exc
     section = raw.get("quota_channels")
     if section is None:
         raise QuotaChannelsError("quota_channels section missing in config.yaml")
