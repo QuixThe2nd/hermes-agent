@@ -1,44 +1,43 @@
-"""Restart-safe recovery tests for delegate_cursor_agent (fake CLI)."""
+"""Cloud-only restart recovery tests for delegate_cursor_agent."""
 
 from __future__ import annotations
 
 import json
 import os
-import sys
 import threading
-import time
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from tests.tools.fixtures.fake_cursor_cloud import FakeCursorCloud
+from tests.tools.test_cursor_agent_tool import _WorkerFakePopen
 from tools.cursor_run_receipts import (
+    ReceiptValidationError,
+    binding_hash,
+    binding_run_lock,
+    create_receipt,
     cursor_runs_dir,
+    deterministic_client_agent_id,
+    hash_prompt,
     read_receipt,
-    receipt_run_lock,
-    update_receipt,
+    receipt_path_for_binding,
+    request_fingerprint,
 )
 from tools.cursor_agent_tool import (
     recover_delegate_cursor_agent_history,
-    run_cursor_agent_cli_with_receipt,
 )
+from tools import cursor_agent_tool
 
 
 @pytest.fixture
-def fake_agent_script() -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
-    return repo_root / "tests" / "tools" / "fixtures" / "fake_cursor_agent.py"
-
-
-@pytest.fixture
-def fake_binary(fake_agent_script, monkeypatch):
-    binary = str(fake_agent_script)
-    monkeypatch.setattr(
-        "tools.cursor_agent_tool.resolve_cursor_agent_binary",
-        lambda: binary,
-    )
-    monkeypatch.setattr("tools.agent_cli_runner._MONITOR_POLL_SECONDS", 0.05)
-    return binary
+def cloud_env(monkeypatch, tmp_path):
+    cloud = FakeCursorCloud()
+    cloud.install(monkeypatch, cursor_agent_tool, tmp_path=tmp_path)
+    monkeypatch.setattr(cursor_agent_tool.subprocess, "Popen", _WorkerFakePopen)
+    workdir = tmp_path / "repo"
+    workdir.mkdir()
+    return cloud, workdir
 
 
 def _dangling_history(tool_call_id: str, workdir: str, task: str = "do work") -> list[dict]:
@@ -59,512 +58,435 @@ def _dangling_history(tool_call_id: str, workdir: str, task: str = "do work") ->
     ]
 
 
-def test_receipt_created_before_spawn(fake_binary, tmp_path):
-    result = json.loads(
-        run_cursor_agent_cli_with_receipt(
-            task="hello",
-            workdir=str(tmp_path),
-            model=None,
-            timeout_seconds=0,
-            force=True,
-            hermes_session_id="sess-a",
-            tool_call_id="call-1",
+def _delegate(
+    cloud: FakeCursorCloud,
+    workdir: Path,
+    *,
+    session_id: str,
+    tool_call_id: str,
+    task: str = "cloud task",
+) -> dict:
+    return json.loads(
+        cursor_agent_tool.delegate_cursor_agent(
+            task=task,
+            workdir=str(workdir.resolve()),
+            session_id=session_id,
+            tool_call_id=tool_call_id,
         )
     )
-    assert result["success"] is True
-    receipts = list(cursor_runs_dir().glob("*.receipt.json"))
-    assert len(receipts) == 1
-    receipt = read_receipt(receipts[0])
-    assert receipt["hermes_session_id"] == "sess-a"
-    assert receipt["tool_call_id"] == "call-1"
-    assert receipt["prompt_hash"].startswith("sha256:")
-    assert "hello" not in json.dumps(receipt)
-    assert oct(receipts[0].stat().st_mode & 0o777) == "0o600"
 
 
-def _wait_for_fake_child_pid(pid_file: Path, *, timeout: float = 3.0) -> int:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if pid_file.is_file():
-            text = pid_file.read_text(encoding="utf-8").strip()
-            if text.isdigit():
-                return int(text)
-        time.sleep(0.05)
-    raise AssertionError(f"fake child pid file never appeared: {pid_file}")
-
-
-def _kill_fake_child(pid_file: Path) -> int:
-    child_pid = _wait_for_fake_child_pid(pid_file)
-    os.kill(child_pid, 9)  # windows-footgun: ok — POSIX test cleanup
-    deadline = time.monotonic() + 3.0
-    while time.monotonic() < deadline:
-        try:
-            os.kill(child_pid, 0)  # windows-footgun: ok — POSIX liveness probe
-        except ProcessLookupError:
-            return child_pid
-        time.sleep(0.05)
-    raise AssertionError(f"fake child pid {child_pid} was not reaped")
-
-
-@pytest.mark.live_system_guard_bypass
-def test_live_session_id_persisted_while_blocked(fake_binary, tmp_path, monkeypatch):
-    pid_file = tmp_path / "child.pid"
-    monkeypatch.setenv("FAKE_CURSOR_BLOCK_AFTER_INIT", "1")
-    monkeypatch.setenv("FAKE_CURSOR_SESSION_ID", "sess-live")
-    monkeypatch.setenv("FAKE_CURSOR_PID_FILE", str(pid_file))
-    holder: dict = {}
-
-    def _run() -> None:
-        holder["result"] = run_cursor_agent_cli_with_receipt(
-            task="block",
-            workdir=str(tmp_path),
-            model=None,
-            timeout_seconds=0,
-            force=True,
-            hermes_session_id="sess-live",
-            tool_call_id="call-live",
-        )
-
-    thread = threading.Thread(target=_run)
-    thread.start()
-    receipt_path = None
-    deadline = time.monotonic() + 3.0
-    while time.monotonic() < deadline:
-        for path in cursor_runs_dir().glob("*.receipt.json"):
-            receipt = read_receipt(path)
-            if receipt and receipt.get("cursor_session_id") == "sess-live":
-                receipt_path = path
-                assert thread.is_alive()
-                break
-        if receipt_path is not None:
-            break
-        time.sleep(0.05)
-    assert receipt_path is not None
-
-    _kill_fake_child(pid_file)
-    thread.join(timeout=10)
-    assert "result" in holder
-    result = json.loads(holder["result"])
-    assert result["success"] is False
-    assert result.get("outcome") == "failed"
-    assert "-9" in str(result.get("error") or "")
-
-
-def test_fragmented_init_persisted(fake_binary, tmp_path, monkeypatch):
-    monkeypatch.setenv("FAKE_CURSOR_FRAGMENT_INIT", "1")
-    monkeypatch.setenv("FAKE_CURSOR_SESSION_ID", "frag-id")
-    json.loads(
-        run_cursor_agent_cli_with_receipt(
-            task="frag",
-            workdir=str(tmp_path),
-            model=None,
-            timeout_seconds=0,
-            force=True,
-            hermes_session_id="sess-frag",
-            tool_call_id="call-frag",
-        )
-    )
-    receipt = read_receipt(next(cursor_runs_dir().glob("*.receipt.json")))
-    assert receipt["cursor_session_id"] == "frag-id"
-
-
-@pytest.mark.live_system_guard_bypass
-def test_resume_once_after_crash_after_init(fake_binary, tmp_path, monkeypatch):
-    pid_file = tmp_path / "child.pid"
-    monkeypatch.setenv("FAKE_CURSOR_BLOCK_AFTER_INIT", "1")
-    monkeypatch.setenv("FAKE_CURSOR_SESSION_ID", "resume-sess")
-    monkeypatch.setenv("FAKE_CURSOR_PID_FILE", str(pid_file))
-    invocations: list[list[str]] = []
-    real_popen = __import__("subprocess").Popen
-
-    def _track_popen(cmd, **kwargs):
-        invocations.append(list(cmd))
-        return real_popen(cmd, **kwargs)
-
-    monkeypatch.setattr("tools.agent_cli_runner.subprocess.Popen", _track_popen)
-
-    thread = threading.Thread(
-        target=lambda: run_cursor_agent_cli_with_receipt(
-            task="original task",
-            workdir=str(tmp_path),
-            model=None,
-            timeout_seconds=0,
-            force=True,
-            hermes_session_id="sess-resume",
-            tool_call_id="call-resume",
-        )
-    )
-    thread.start()
-    receipt_path = None
-    for _ in range(60):
-        for path in cursor_runs_dir().glob("*.receipt.json"):
-            receipt = read_receipt(path)
-            if receipt and receipt.get("cursor_session_id") == "resume-sess":
-                receipt_path = path
-                break
-        if receipt_path:
-            break
-        time.sleep(0.05)
-    assert receipt_path is not None
-    _kill_fake_child(pid_file)
-    thread.join(timeout=10)
-
-    # First CLI child was SIGKILL'd after init; simulate a gateway crash before
-    # the tool handler persisted a terminal receipt/outcome.
-    update_receipt(
-        receipt_path,
-        state="running",
-        outcome=None,
-        terminal_result=None,
-        resume_attempts=0,
-    )
-    monkeypatch.delenv("FAKE_CURSOR_BLOCK_AFTER_INIT", raising=False)
-
-    history, note = recover_delegate_cursor_agent_history(
-        _dangling_history("call-resume", str(tmp_path)),
-        hermes_session_id="sess-resume",
-    )
-    assert note and "Automatically resumed" in note
-    assert history[-1]["role"] == "tool"
-    resume_argv = [cmd for cmd in invocations if any(a.startswith("--resume=") for a in cmd)]
-    cold_argv = [cmd for cmd in invocations if not any(a.startswith("--resume=") for a in cmd)]
-    assert len(resume_argv) == 1
-    assert len(cold_argv) == 1
-    assert any("resume-sess" in arg for arg in resume_argv[0])
-
-
-def test_no_automatic_run_without_session_id(fake_binary, tmp_path):
-    receipt_path = cursor_runs_dir() / "manual.receipt.json"
-    from tools.cursor_run_receipts import _atomic_write_json
-
-    _atomic_write_json(
-        receipt_path,
-        {
-            "schema_version": 1,
-            "run_id": "manual",
-            "attempt_id": "a1",
-            "hermes_session_id": "sess-none",
-            "tool_call_id": "call-none",
-            "workdir": str(tmp_path),
-            "prompt_hash": "sha256:x",
-            "state": "running",
-            "outcome": None,
-            "created_at": "2026-01-01T00:00:00+00:00",
-            "updated_at": "2026-01-01T00:00:00+00:00",
-            "log_path": str(tmp_path / "empty.jsonl"),
-            "owner_pid": os.getpid(),
-            "owner_boot_id": "test",
-            "model": None,
-            "force": True,
-            "timeout_seconds": 0,
-            "execution_mode": "cli",
-            "cursor_session_id": None,
-            "cloud_agent_id": None,
-            "cloud_run_id": None,
-            "resume_attempts": 0,
-            "resumed": False,
-            "terminal_result": None,
-        },
-    )
-    history, note = recover_delegate_cursor_agent_history(
-        _dangling_history("call-none", str(tmp_path)),
-        hermes_session_id="sess-none",
-    )
-    assert history[-1]["role"] == "assistant"
-    assert note and "no canonical Cursor session id" in note
-
-
-def test_terminal_log_reconciliation_skips_resume(fake_binary, tmp_path):
-    first = json.loads(
-        run_cursor_agent_cli_with_receipt(
-            task="done",
-            workdir=str(tmp_path),
-            model=None,
-            timeout_seconds=0,
-            force=True,
-            hermes_session_id="sess-term",
-            tool_call_id="call-term",
-        )
-    )
-    assert first["success"] is True
-    receipt = read_receipt(next(cursor_runs_dir().glob("*.receipt.json")))
-    assert receipt["state"] == "terminal"
-
-    with patch("tools.cursor_agent_tool.run_cursor_agent_cli_with_receipt") as resume_mock:
-        history, note = recover_delegate_cursor_agent_history(
-            _dangling_history("call-term", str(tmp_path)),
-            hermes_session_id="sess-term",
-        )
-        resume_mock.assert_not_called()
-    assert history[-1]["role"] == "tool"
-    assert note and "terminal" in note.lower()
-
-
-@pytest.mark.parametrize(
-    "mode,outcome",
-    [
-        ("success", "success"),
-        ("nonzero", "failed"),
-        ("action_required", "action_required"),
-    ],
-)
-def test_terminal_outcomes_do_not_resume(fake_binary, tmp_path, monkeypatch, mode, outcome):
-    monkeypatch.setenv("FAKE_CURSOR_MODE", mode)
-    result = json.loads(
-        run_cursor_agent_cli_with_receipt(
-            task="terminal",
-            workdir=str(tmp_path),
-            model=None,
-            timeout_seconds=0,
-            force=True,
-            hermes_session_id="sess-out",
-            tool_call_id=f"call-{mode}",
-        )
-    )
-    receipt = read_receipt(next(cursor_runs_dir().glob("*.receipt.json")))
-    assert receipt["outcome"] == outcome
-    with patch("tools.cursor_agent_tool.run_cursor_agent_cli_with_receipt") as resume_mock:
-        recover_delegate_cursor_agent_history(
-            _dangling_history(f"call-{mode}", str(tmp_path)),
-            hermes_session_id="sess-out",
-        )
-        resume_mock.assert_not_called()
-
-
-def test_concurrent_resume_lock_single_winner(tmp_path):
-    from tools.cursor_run_receipts import create_receipt
-
-    _run_id, _path = create_receipt(
-        hermes_session_id="sess-lock",
-        tool_call_id="call-lock",
-        workdir=str(tmp_path),
-        prompt_hash="sha256:x",
-        log_path=str(tmp_path / "x.jsonl"),
-        model=None,
-        force=True,
-        timeout_seconds=0,
-        execution_mode="cli",
-    )
-    with receipt_run_lock(_run_id) as first:
-        assert first is True
-        with receipt_run_lock(_run_id) as second:
-            assert second is False
-
-
-def test_unrelated_session_cannot_recover(fake_binary, tmp_path):
-    run_cursor_agent_cli_with_receipt(
-        task="mine",
-        workdir=str(tmp_path),
-        model=None,
-        timeout_seconds=0,
-        force=True,
-        hermes_session_id="sess-owner",
-        tool_call_id="call-owner",
-    )
-    history, note = recover_delegate_cursor_agent_history(
-        _dangling_history("call-owner", str(tmp_path)),
-        hermes_session_id="sess-other",
-    )
-    assert history[-1]["role"] == "assistant"
-    assert note and "no matching restart receipt" in note
-
-
-def test_second_resume_uses_same_canonical_session(fake_binary, tmp_path, monkeypatch):
-    monkeypatch.setenv("FAKE_CURSOR_SESSION_ID", "canonical-1")
-    from tools.cursor_run_receipts import _atomic_write_json
-
-    receipt_path = cursor_runs_dir() / "second.receipt.json"
-    _atomic_write_json(
-        receipt_path,
-        {
-            "schema_version": 1,
-            "run_id": "second",
-            "attempt_id": "a1",
-            "hermes_session_id": "sess-second",
-            "tool_call_id": "call-second",
-            "workdir": str(tmp_path),
-            "prompt_hash": "sha256:x",
-            "state": "running",
-            "outcome": None,
-            "created_at": "2026-01-01T00:00:00+00:00",
-            "updated_at": "2026-01-01T00:00:00+00:00",
-            "log_path": str(tmp_path / "first.jsonl"),
-            "owner_pid": os.getpid(),
-            "owner_boot_id": "test",
-            "model": None,
-            "force": True,
-            "timeout_seconds": 0,
-            "execution_mode": "cli",
-            "cursor_session_id": "canonical-1",
-            "cloud_agent_id": None,
-            "cloud_run_id": None,
-            "resume_attempts": 0,
-            "resumed": False,
-            "terminal_result": None,
-        },
-    )
-    recover_delegate_cursor_agent_history(
-        _dangling_history("call-second", str(tmp_path)),
-        hermes_session_id="sess-second",
-    )
-    receipt = read_receipt(receipt_path)
-    assert receipt["cursor_session_id"] == "canonical-1"
-    assert receipt["resume_attempts"] >= 1
-    assert receipt.get("resumed") is True
-    assert "resume-" in receipt["log_path"] or receipt["log_path"].endswith(".jsonl")
-
-
-def test_conflicting_resume_session_id_fails_closed(fake_binary, tmp_path, monkeypatch):
-    from tools.cursor_run_receipts import _atomic_write_json
-
-    receipt_path = cursor_runs_dir() / "conflict.receipt.json"
-    _atomic_write_json(
-        receipt_path,
-        {
-            "schema_version": 1,
-            "run_id": "conflict",
-            "attempt_id": "a1",
-            "hermes_session_id": "sess-conflict",
-            "tool_call_id": "call-conflict",
-            "workdir": str(tmp_path),
-            "prompt_hash": "sha256:x",
-            "state": "running",
-            "outcome": None,
-            "created_at": "2026-01-01T00:00:00+00:00",
-            "updated_at": "2026-01-01T00:00:00+00:00",
-            "log_path": str(tmp_path / "seed.jsonl"),
-            "owner_pid": os.getpid(),
-            "owner_boot_id": "test",
-            "model": None,
-            "force": True,
-            "timeout_seconds": 0,
-            "execution_mode": "cli",
-            "cursor_session_id": "expected-sess",
-            "cloud_agent_id": None,
-            "cloud_run_id": None,
-            "resume_attempts": 0,
-            "resumed": False,
-            "terminal_result": None,
-        },
-    )
-    monkeypatch.setenv("FAKE_CURSOR_CONFLICT_SESSION_ID", "wrong-sess")
-    result = json.loads(
-        run_cursor_agent_cli_with_receipt(
-            task="resume",
-            workdir=str(tmp_path),
-            model=None,
-            timeout_seconds=0,
-            force=True,
-            hermes_session_id="sess-conflict",
-            tool_call_id="call-conflict",
-            resume_session_id="expected-sess",
-            continuation=True,
-            existing_receipt_path=receipt_path,
-            existing_run_id="conflict",
-            resume_attempt_increment=True,
-        )
-    )
-    assert result["success"] is False
-    assert "conflicting" in (result.get("error") or "").lower()
-
-
-def test_resume_nonzero_is_terminal_no_loop(fake_binary, tmp_path, monkeypatch):
-    monkeypatch.setenv("FAKE_CURSOR_MODE", "nonzero")
-    monkeypatch.setenv("FAKE_CURSOR_SESSION_ID", "nz-sess")
-    receipt_path = cursor_runs_dir() / "nz.receipt.json"
-    from tools.cursor_run_receipts import _atomic_write_json
-
-    _atomic_write_json(
-        receipt_path,
-        {
-            "schema_version": 1,
-            "run_id": "nz",
-            "attempt_id": "a1",
-            "hermes_session_id": "sess-nz",
-            "tool_call_id": "call-nz",
-            "workdir": str(tmp_path),
-            "prompt_hash": "sha256:x",
-            "state": "running",
-            "outcome": None,
-            "created_at": "2026-01-01T00:00:00+00:00",
-            "updated_at": "2026-01-01T00:00:00+00:00",
-            "log_path": str(tmp_path / "x.jsonl"),
-            "owner_pid": os.getpid(),
-            "owner_boot_id": "test",
-            "model": None,
-            "force": True,
-            "timeout_seconds": 0,
-            "execution_mode": "cli",
-            "cursor_session_id": "nz-sess",
-            "cloud_agent_id": None,
-            "cloud_run_id": None,
-            "resume_attempts": 0,
-            "resumed": False,
-            "terminal_result": None,
-        },
-    )
-    history, _note = recover_delegate_cursor_agent_history(
-        _dangling_history("call-nz", str(tmp_path)),
-        hermes_session_id="sess-nz",
-    )
-    assert history[-1]["role"] == "tool"
-    receipt = read_receipt(receipt_path)
-    assert receipt["state"] == "terminal"
-    with patch("tools.cursor_agent_tool.run_cursor_agent_cli_with_receipt") as resume_mock:
-        recover_delegate_cursor_agent_history(
-            _dangling_history("call-nz", str(tmp_path)),
-            hermes_session_id="sess-nz",
-        )
-        resume_mock.assert_not_called()
-
-
-def test_handle_function_call_forwards_tool_call_id_to_receipt(monkeypatch, tmp_path):
+def test_handler_uses_session_id_not_task_id(monkeypatch, tmp_path):
     from model_tools import handle_function_call
 
     captured: dict[str, str | None] = {}
 
     def _fake_delegate(**kwargs):
-        captured["task_id"] = kwargs.get("task_id")
-        captured["tool_call_id"] = kwargs.get("tool_call_id")
+        captured.update(kwargs)
         return json.dumps({"success": True})
 
     monkeypatch.setattr("tools.cursor_agent_tool.delegate_cursor_agent", _fake_delegate)
-
-    handle_function_call(
-        "delegate_cursor_agent",
-        {"task": "x", "workdir": str(tmp_path.resolve())},
-        task_id="hermes-sess-1",
-        tool_call_id="call-xyz",
-    )
-
-    assert captured["task_id"] == "hermes-sess-1"
-    assert captured["tool_call_id"] == "call-xyz"
-
-
-def test_cloud_delegate_finalizes_terminal_receipt(monkeypatch, tmp_path):
-    from tests.tools.test_cursor_agent_tool import _install_cloud_happy_path
-    from tools import cursor_agent_tool
-
-    _install_cloud_happy_path(monkeypatch, tmp_path)
     workdir = tmp_path / "repo"
     workdir.mkdir()
 
-    result = json.loads(
-        cursor_agent_tool.delegate_cursor_agent(
-            task="cloud task",
-            workdir=str(workdir.resolve()),
-            task_id="cloud-session",
-            tool_call_id="cloud-call",
-        )
+    handle_function_call(
+        "delegate_cursor_agent",
+        {"task": "x", "workdir": str(workdir.resolve())},
+        task_id="task-meta",
+        session_id="hermes-sess-1",
+        tool_call_id="call-xyz",
     )
 
+    assert captured["session_id"] == "hermes-sess-1"
+    assert captured["tool_call_id"] == "call-xyz"
+    assert captured["task_id"] == "task-meta"
+
+
+def test_same_task_two_sessions_do_not_collide(cloud_env):
+    cloud, workdir = cloud_env
+    _delegate(cloud, workdir, session_id="sess-a", tool_call_id="call-1")
+    _delegate(cloud, workdir, session_id="sess-b", tool_call_id="call-1")
+    assert cloud.create_calls == 2
+    paths = list(cursor_runs_dir().glob("*.receipt.json"))
+    assert len(paths) == 2
+
+
+def test_two_calls_one_session_do_not_collide(cloud_env):
+    cloud, workdir = cloud_env
+    _delegate(cloud, workdir, session_id="sess-a", tool_call_id="call-1")
+    _delegate(cloud, workdir, session_id="sess-a", tool_call_id="call-2")
+    assert cloud.create_calls == 2
+
+
+def test_receipt_write_failure_zero_create_calls(cloud_env, monkeypatch):
+    cloud, workdir = cloud_env
+
+    def _boom(path, payload):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("tools.cursor_run_receipts._atomic_write_json", _boom)
+    result = _delegate(cloud, workdir, session_id="sess-fail", tool_call_id="call-fail")
+    assert result["success"] is False
+    assert "receipt" in result["error"].lower()
+    assert cloud.create_calls == 0
+
+
+def test_receipt_created_before_cloud_create(cloud_env):
+    cloud, workdir = cloud_env
+    seen: dict[str, bool] = {"receipt": False, "create": False}
+
+    def _on_create(_payload):
+        seen["create"] = True
+        assert seen["receipt"] is True
+
+    cloud.on_create = _on_create
+
+    original_create = cursor_agent_tool.create_receipt
+
+    def _wrapped_create(**kwargs):
+        path, receipt = original_create(**kwargs)
+        seen["receipt"] = True
+        assert seen["create"] is False
+        return path, receipt
+
+    with patch.object(cursor_agent_tool, "create_receipt", side_effect=_wrapped_create):
+        result = _delegate(cloud, workdir, session_id="sess-order", tool_call_id="call-order")
     assert result["success"] is True
-    receipts = list(cursor_runs_dir().glob("*.receipt.json"))
-    assert len(receipts) == 1
-    receipt = read_receipt(receipts[0])
-    assert receipt["state"] == "terminal"
-    assert receipt["outcome"] == "success"
-    assert receipt["tool_call_id"] == "cloud-call"
-    assert receipt["cloud_agent_id"]
-    assert receipt["cloud_run_id"]
-    assert isinstance(receipt.get("terminal_result"), dict)
+    receipt = read_receipt(
+        receipt_path_for_binding("sess-order", "call-order")
+    )
+    assert receipt["execution_mode"] == "cloud"
+    assert receipt["client_agent_id"].startswith("bc-")
+
+
+def test_terminal_while_gateway_down_recovers_without_create(cloud_env):
+    cloud, workdir = cloud_env
+    session_id = "sess-term"
+    tool_call_id = "call-term"
+    client_id = deterministic_client_agent_id(session_id, tool_call_id)
+    cloud.seed_terminal(agent_id=client_id, run_id="run-term", result_text="done from cloud")
+    receipt_path, receipt = create_receipt(
+        hermes_session_id=session_id,
+        tool_call_id=tool_call_id,
+        workdir=str(workdir),
+        prompt_hash=hash_prompt("cloud task"),
+        log_path=str(workdir / "worker.log"),
+        model=None,
+        force=True,
+        timeout_seconds=0,
+        task="cloud task",
+    )
+    from tools.cursor_run_receipts import persist_cloud_ids, finalize_receipt
+
+    persist_cloud_ids(receipt_path, cloud_agent_id=client_id, cloud_run_id="run-term")
+    result_json = json.dumps({"success": True, "final_report": "done from cloud"})
+    finalize_receipt(
+        receipt_path,
+        outcome="success",
+        terminal_result={"result_json": result_json},
+        cloud_agent_id=client_id,
+        cloud_run_id="run-term",
+    )
+    cloud.reset_counters()
+
+    history, note = recover_delegate_cursor_agent_history(
+        _dangling_history(tool_call_id, str(workdir), task="cloud task"),
+        hermes_session_id=session_id,
+    )
+    assert cloud.create_calls == 0
+    assert history[-1]["role"] == "tool"
+    assert note and "terminal" in note.lower()
+
+
+def test_running_recovery_resumes_poll_zero_create(cloud_env):
+    cloud, workdir = cloud_env
+    session_id = "sess-run"
+    tool_call_id = "call-run"
+    client_id = deterministic_client_agent_id(session_id, tool_call_id)
+    cloud.seed_running(agent_id=client_id, run_id="run-live", status="CREATING")
+    receipt_path, _receipt = create_receipt(
+        hermes_session_id=session_id,
+        tool_call_id=tool_call_id,
+        workdir=str(workdir),
+        prompt_hash=hash_prompt("cloud task"),
+        log_path=str(workdir / "worker.log"),
+        model=None,
+        force=True,
+        timeout_seconds=0,
+        task="cloud task",
+    )
+    from tools.cursor_run_receipts import persist_cloud_ids
+
+    persist_cloud_ids(receipt_path, cloud_agent_id=client_id, cloud_run_id="run-live")
+    cloud.reset_counters()
+
+    history, note = recover_delegate_cursor_agent_history(
+        _dangling_history(tool_call_id, str(workdir), task="cloud task"),
+        hermes_session_id=session_id,
+    )
+    assert cloud.create_calls == 0
+    assert cloud.poll_calls >= 1
+    assert history[-1]["role"] == "tool"
+    assert note and "cloud run" in note
+
+
+def test_nonterminal_log_cannot_manufacture_success(cloud_env, tmp_path):
+    cloud, workdir = cloud_env
+    session_id = "sess-log"
+    tool_call_id = "call-log"
+    receipt_path, _receipt = create_receipt(
+        hermes_session_id=session_id,
+        tool_call_id=tool_call_id,
+        workdir=str(workdir),
+        prompt_hash=hash_prompt("cloud task"),
+        log_path=str(workdir / "worker.log"),
+        model=None,
+        force=True,
+        timeout_seconds=0,
+        task="cloud task",
+    )
+    log_path = workdir / "worker.log"
+    log_path.write_text('{"type":"assistant","message":{"content":[{"type":"text","text":"looks done"}]}}\n')
+    from tools.cursor_run_receipts import update_receipt
+
+    update_receipt(
+        receipt_path,
+        state="terminal",
+        outcome="success",
+        terminal_result={"note": "missing result_json"},
+        log_path=str(log_path),
+    )
+    history, note = recover_delegate_cursor_agent_history(
+        _dangling_history(tool_call_id, str(workdir), task="cloud task"),
+        hermes_session_id=session_id,
+    )
+    assert history[-1]["role"] == "assistant"
+    assert note and "could not be reconciled" in note
+    assert cloud.create_calls == 0
+
+
+def test_duplicate_recovery_appends_once(cloud_env):
+    cloud, workdir = cloud_env
+    session_id = "sess-dup"
+    tool_call_id = "call-dup"
+    client_id = deterministic_client_agent_id(session_id, tool_call_id)
+    cloud.seed_terminal(agent_id=client_id, run_id="run-dup")
+    receipt_path, _ = create_receipt(
+        hermes_session_id=session_id,
+        tool_call_id=tool_call_id,
+        workdir=str(workdir),
+        prompt_hash=hash_prompt("cloud task"),
+        log_path=str(workdir / "worker.log"),
+        model=None,
+        force=True,
+        timeout_seconds=0,
+        task="cloud task",
+    )
+    from tools.cursor_run_receipts import persist_cloud_ids, finalize_receipt
+
+    persist_cloud_ids(receipt_path, cloud_agent_id=client_id, cloud_run_id="run-dup")
+    result_json = json.dumps({"success": True, "final_report": "ok"})
+    finalize_receipt(
+        receipt_path,
+        outcome="success",
+        terminal_result={"result_json": result_json},
+        cloud_agent_id=client_id,
+        cloud_run_id="run-dup",
+    )
+    history = _dangling_history(tool_call_id, str(workdir), task="cloud task")
+    first, _note1 = recover_delegate_cursor_agent_history(history, hermes_session_id=session_id)
+    assert first[-1]["role"] == "tool"
+    second, _note2 = recover_delegate_cursor_agent_history(first, hermes_session_id=session_id)
+    assert len([m for m in second if m.get("role") == "tool"]) == 1
+    assert second is first or second[-1]["content"] == first[-1]["content"]
+
+
+def test_symlink_receipt_fails_closed(cloud_env, tmp_path):
+    cloud, workdir = cloud_env
+    session_id = "sess-symlink"
+    tool_call_id = "call-symlink"
+    target = tmp_path / "target.receipt.json"
+    target.write_text("{}", encoding="utf-8")
+    link = receipt_path_for_binding(session_id, tool_call_id)
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.exists():
+        link.unlink()
+    os.symlink(target, link)
+    history, note = recover_delegate_cursor_agent_history(
+        _dangling_history(tool_call_id, str(workdir), task="cloud task"),
+        hermes_session_id=session_id,
+    )
+    assert history[-1]["role"] == "assistant"
+    assert cloud.create_calls == 0
+    assert note is None or "no matching" in note
+
+
+def test_cli_mode_receipt_rejected(cloud_env, tmp_path):
+    cloud, workdir = cloud_env
+    from tools.cursor_run_receipts import _atomic_write_json
+
+    session_id = "sess-cli"
+    tool_call_id = "call-cli"
+    path = receipt_path_for_binding(session_id, tool_call_id)
+    _atomic_write_json(
+        path,
+        {
+            "schema_version": 2,
+            "binding_hash": binding_hash(session_id, tool_call_id),
+            "attempt_id": "a1",
+            "hermes_session_id": session_id,
+            "tool_call_id": tool_call_id,
+            "request_fingerprint": request_fingerprint(
+                task="cloud task",
+                workdir=str(workdir),
+                model=None,
+                force=True,
+                timeout_seconds=0,
+                prompt_hash=hash_prompt("cloud task"),
+            ),
+            "workdir": str(workdir),
+            "prompt_hash": hash_prompt("cloud task"),
+            "state": "running",
+            "outcome": None,
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "log_path": str(workdir / "x.log"),
+            "owner_pid": 1,
+            "owner_boot_id": "test",
+            "model": None,
+            "force": True,
+            "timeout_seconds": 0,
+            "execution_mode": "cli",
+            "client_agent_id": "bc-cli",
+            "cloud_agent_id": "bc-cli",
+            "cloud_run_id": "run-cli",
+            "recovery_attempts": 0,
+            "terminal_result": None,
+        },
+    )
+    history, note = recover_delegate_cursor_agent_history(
+        _dangling_history(tool_call_id, str(workdir), task="cloud task"),
+        hermes_session_id=session_id,
+    )
+    assert history[-1]["role"] == "assistant"
+    assert cloud.create_calls == 0
+    assert cloud.poll_calls == 0
+
+
+def test_fingerprint_mismatch_fails_closed(cloud_env, tmp_path):
+    cloud, workdir = cloud_env
+    session_id = "sess-fp"
+    tool_call_id = "call-fp"
+    path, receipt = create_receipt(
+        hermes_session_id=session_id,
+        tool_call_id=tool_call_id,
+        workdir=str(workdir),
+        prompt_hash=hash_prompt("cloud task"),
+        log_path=str(workdir / "worker.log"),
+        model=None,
+        force=True,
+        timeout_seconds=0,
+        task="cloud task",
+    )
+    from tools.cursor_run_receipts import update_receipt
+
+    update_receipt(path, request_fingerprint="sha256:deadbeef")
+    history, note = recover_delegate_cursor_agent_history(
+        _dangling_history(tool_call_id, str(workdir), task="different task"),
+        hermes_session_id=session_id,
+    )
+    assert history[-1]["role"] == "assistant"
+    assert note and "binding mismatch" in note
+    assert cloud.create_calls == 0
+
+
+def test_concurrent_binding_lock_single_winner(cloud_env, tmp_path):
+    cloud, workdir = cloud_env
+    session_id = "sess-lock"
+    tool_call_id = "call-lock"
+    winner: dict = {}
+
+    def _attempt(name: str) -> None:
+        with binding_run_lock(session_id, tool_call_id) as acquired:
+            if acquired:
+                winner["name"] = name
+                import time
+
+                time.sleep(0.2)
+
+    t1 = threading.Thread(target=_attempt, args=("a",))
+    t2 = threading.Thread(target=_attempt, args=("b",))
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+    assert winner
+
+
+def test_pending_create_without_ids_fail_closed_on_recovery(cloud_env):
+    cloud, workdir = cloud_env
+    session_id = "sess-pending"
+    tool_call_id = "call-pending"
+    create_receipt(
+        hermes_session_id=session_id,
+        tool_call_id=tool_call_id,
+        workdir=str(workdir),
+        prompt_hash=hash_prompt("cloud task"),
+        log_path=str(workdir / "worker.log"),
+        model=None,
+        force=True,
+        timeout_seconds=0,
+        task="cloud task",
+    )
+    cloud.reset_counters()
+    history, note = recover_delegate_cursor_agent_history(
+        _dangling_history(tool_call_id, str(workdir), task="cloud task"),
+        hermes_session_id=session_id,
+    )
+    assert cloud.create_calls == 0
+    assert history[-1]["role"] == "tool"
+    payload = json.loads(history[-1]["content"])
+    assert payload["success"] is False
+    assert "automatic recovery refused" in payload["error"]
+
+
+def test_recovery_does_not_call_cli_helper(cloud_env):
+    cloud, workdir = cloud_env
+    assert not hasattr(cursor_agent_tool, "run_cursor_agent_cli_with_receipt")
+    session_id = "sess-nocli"
+    tool_call_id = "call-nocli"
+    client_id = deterministic_client_agent_id(session_id, tool_call_id)
+    cloud.seed_running(agent_id=client_id, run_id="run-nocli")
+    receipt_path, _ = create_receipt(
+        hermes_session_id=session_id,
+        tool_call_id=tool_call_id,
+        workdir=str(workdir),
+        prompt_hash=hash_prompt("cloud task"),
+        log_path=str(workdir / "worker.log"),
+        model=None,
+        force=True,
+        timeout_seconds=0,
+        task="cloud task",
+    )
+    from tools.cursor_run_receipts import persist_cloud_ids
+
+    persist_cloud_ids(receipt_path, cloud_agent_id=client_id, cloud_run_id="run-nocli")
+    recover_delegate_cursor_agent_history(
+        _dangling_history(tool_call_id, str(workdir)),
+        hermes_session_id=session_id,
+    )
+
+
+def test_create_receipt_requires_tool_call_id():
+    with pytest.raises(ReceiptValidationError):
+        create_receipt(
+            hermes_session_id="sess",
+            tool_call_id=None,
+            workdir="/tmp/x",
+            prompt_hash="sha256:x",
+            log_path="/tmp/x.log",
+            model=None,
+            force=True,
+            timeout_seconds=0,
+            task="t",
+        )

@@ -12,6 +12,16 @@ from pathlib import Path
 
 import pytest
 
+_DEFAULT_DELEGATE_SESSION = "test-session"
+_DEFAULT_DELEGATE_TOOL_CALL = "test-tool-call"
+
+
+def _delegate(task, workdir, **kwargs):
+    kwargs.setdefault("session_id", _DEFAULT_DELEGATE_SESSION)
+    kwargs.setdefault("tool_call_id", _DEFAULT_DELEGATE_TOOL_CALL)
+    from tools import cursor_agent_tool
+    return cursor_agent_tool.delegate_cursor_agent(task=task, workdir=workdir, **kwargs)
+
 
 SAMPLE_STREAM_JSON = "\n".join(
     [
@@ -391,7 +401,7 @@ def test_validation_errors_use_full_result_shape(monkeypatch, tmp_path):
     assert "absolute path" in relative["error"]
 
     missing = json.loads(
-        cursor_agent_tool.delegate_cursor_agent(
+        _delegate(
             task="x",
             workdir=str((tmp_path / "missing").resolve()),
         )
@@ -470,7 +480,7 @@ def test_happy_path_e2e(monkeypatch, tmp_path):
     workdir.mkdir()
 
     result = json.loads(
-        cursor_agent_tool.delegate_cursor_agent(
+        _delegate(
             task="implement feature",
             workdir=str(workdir.resolve()),
         )
@@ -524,7 +534,7 @@ def test_explicit_model_adds_payload_id(monkeypatch, tmp_path):
     workdir = tmp_path / "repo"
     workdir.mkdir()
 
-    cursor_agent_tool.delegate_cursor_agent(
+    _delegate(
         task="implement feature",
         workdir=str(workdir.resolve()),
         model="composer-2.5",
@@ -557,7 +567,7 @@ def test_force_does_not_enable_pushes(monkeypatch, tmp_path, force_value):
     workdir = tmp_path / "repo"
     workdir.mkdir()
 
-    cursor_agent_tool.delegate_cursor_agent(
+    _delegate(
         task="no pushes",
         workdir=str(workdir.resolve()),
         force=force_value,
@@ -599,7 +609,9 @@ def test_handler_force_string_false(monkeypatch, tmp_path):
             "task": "handler force",
             "workdir": str(workdir.resolve()),
             "force": "false",
-        }
+        },
+        session_id="handler-session",
+        tool_call_id="handler-call",
     )
 
     assert captured["payload"]["autoCreatePR"] is False
@@ -1005,8 +1017,10 @@ def test_incremental_stdout_updates_log_before_child_exit(monkeypatch, tmp_path)
 
     result_holder: dict = {}
 
+    from tools.agent_cli_runner import run_agent_cli
+
     def run() -> None:
-        result_holder["result"] = cursor_agent_tool._run_and_stream(
+        result_holder["result"] = run_agent_cli(
             cmd,
             workdir=str(tmp_path),
             timeout_seconds=60,
@@ -1168,7 +1182,7 @@ def test_child_env_guarantees_home_and_local_bin(monkeypatch, tmp_path):
     workdir = tmp_path / "repo"
     workdir.mkdir()
     result = json.loads(
-        cursor_agent_tool.delegate_cursor_agent(
+        _delegate(
             task="x",
             workdir=str(workdir.resolve()),
         )
@@ -1268,7 +1282,7 @@ def test_missing_key_file_fails_clearly(monkeypatch, tmp_path):
     workdir = tmp_path / "repo"
     workdir.mkdir()
     result = json.loads(
-        cursor_agent_tool.delegate_cursor_agent(
+        _delegate(
             task="x",
             workdir=str(workdir.resolve()),
         )
@@ -1304,7 +1318,7 @@ def test_secret_not_placed_in_argv_or_result(monkeypatch, tmp_path):
     workdir = tmp_path / "repo"
     workdir.mkdir()
     result = json.loads(
-        cursor_agent_tool.delegate_cursor_agent(
+        _delegate(
             task="secret check",
             workdir=str(workdir.resolve()),
         )
@@ -1469,7 +1483,7 @@ def test_poll_statuses_map_to_final_json(monkeypatch, tmp_path, status, expect_s
     workdir = tmp_path / "repo"
     workdir.mkdir()
     result = json.loads(
-        cursor_agent_tool.delegate_cursor_agent(
+        _delegate(
             task="status map",
             workdir=str(workdir.resolve()),
         )
@@ -1571,7 +1585,7 @@ def test_progress_url_is_exact_api_value(monkeypatch, tmp_path):
     workdir = tmp_path / "repo"
     workdir.mkdir()
     result = json.loads(
-        cursor_agent_tool.delegate_cursor_agent(
+        _delegate(
             task="url",
             workdir=str(workdir.resolve()),
         )
@@ -1751,7 +1765,7 @@ def test_local_only_branch_omits_starting_ref(monkeypatch, tmp_path):
     monkeypatch.setattr(cursor_agent_tool, "resolve_workdir_starting_ref", lambda workdir: None)
     monkeypatch.setattr(cursor_agent_tool, "create_agent_with_timeout_dedupe", _create)
     result = json.loads(
-        cursor_agent_tool.delegate_cursor_agent(
+        _delegate(
             task="local only branch",
             workdir=str(repo.resolve()),
         )
@@ -1778,7 +1792,7 @@ def _run_no_push_delegate(monkeypatch, tmp_path, *, mutate):
     monkeypatch.setenv("GH_TOKEN", "should-not-reach-worker")
     mutate(cursor_agent_tool, captured)
     result = json.loads(
-        cursor_agent_tool.delegate_cursor_agent(
+        _delegate(
             task="no push",
             workdir=str(repo.resolve()),
         )
@@ -1809,7 +1823,7 @@ def test_no_push_restored_on_worker_start_failure(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cursor_agent_tool.subprocess, "Popen", _boom)
     result = json.loads(
-        cursor_agent_tool.delegate_cursor_agent(
+        _delegate(
             task="worker fail",
             workdir=str(repo.resolve()),
         )
@@ -1874,6 +1888,8 @@ def test_progress_url_emitted_once_before_poll_via_handle_function_call(monkeypa
         raw = handle_function_call(
             "delegate_cursor_agent",
             {"task": "ship it", "workdir": str(workdir.resolve())},
+            session_id="progress-session",
+            tool_call_id="progress-call",
             skip_pre_tool_call_hook=True,
             skip_tool_request_middleware=True,
             skip_tool_execution_middleware=True,
@@ -1913,6 +1929,8 @@ def test_progress_notice_is_noop_without_tool_status_context(monkeypatch, tmp_pa
     raw = handle_function_call(
         "delegate_cursor_agent",
         {"task": "no context", "workdir": str(workdir.resolve())},
+        session_id="noop-session",
+        tool_call_id="noop-call",
         skip_pre_tool_call_hook=True,
         skip_tool_request_middleware=True,
         skip_tool_execution_middleware=True,
@@ -2227,7 +2245,7 @@ def test_delegate_unauthenticated_preflight_is_clear_and_clean(monkeypatch, tmp_
     workdir = tmp_path / "repo"
     workdir.mkdir()
     result = json.loads(
-        cursor_agent_tool.delegate_cursor_agent(
+        _delegate(
             task="needs login",
             workdir=str(workdir.resolve()),
         )
