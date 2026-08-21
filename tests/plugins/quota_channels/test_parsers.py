@@ -300,6 +300,20 @@ class TestParseGrokUsage:
     def test_remaining_from_name_grok_percent(self):
         assert _remaining_from_name("Grok: 76% \u2022 4d left", "Grok") == 76
 
+    def test_remaining_from_name_with_token_segment(self):
+        assert (
+            _remaining_from_name(
+                "Codex: 99% \u2022 2.2B tok/7d \u2022 7d left", "Codex"
+            )
+            == 99
+        )
+        assert (
+            _remaining_from_name(
+                "Cursor: 88%/85% \u2022 49M tok/7d \u2022 27d left", "Cursor"
+            )
+            == {"auto": 88, "api": 85}
+        )
+
     def test_reset_without_field8_marker_raises(self):
         period_end = int(datetime(2026, 8, 30, tzinfo=timezone.utc).timestamp())
         period_start = period_end - 86400 * 7

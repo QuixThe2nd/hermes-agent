@@ -3415,12 +3415,24 @@ class DiscordAdapter(BasePlatformAdapter):
             fail_if_not_exists=False,
         )
 
-    def _reply_reference_for_send(self, reply_to, channel):
+    def _reply_reference_for_send(
+        self,
+        reply_to,
+        channel,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
         """Reply anchor for send paths, honoring reply_to_mode.
 
-        Mirrors telegram's _reply_to_message_id_for_send: raw reply_to in,
-        platform send-time anchor out, ``off`` mode suppressed.
+        Discord notifies the referenced user on every ``MessageReference``.
+        Streaming previews, tool progress, status, and interim commentary
+        must stay standalone; only notify-worthy turn-final deliveries get a
+        reply anchor (``metadata["notify"]`` is set by the gateway final path
+        and the stream consumer's fresh-final send).
         """
+        if metadata and metadata.get("_interim_send"):
+            return None
+        if not metadata or not metadata.get("notify"):
+            return None
         if not reply_to or self._reply_to_mode == "off":
             return None
         try:
@@ -3428,6 +3440,19 @@ class DiscordAdapter(BasePlatformAdapter):
         except (ValueError, TypeError) as e:
             logger.debug("Could not build reply-to reference: %s", e)
             return None
+
+    def prefers_fresh_final_streaming(
+        self,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Finalize streamed replies via a fresh send, not an edit.
+
+        Discord cannot attach a ``MessageReference`` to an existing message
+        via ``message.edit``, so the stream consumer must delete the preview
+        and deliver the completed answer as a new reply.
+        """
+        return True
 
     def _cap_split_chunks(self, chunks: List[str]) -> List[str]:
         """Cap the number of chunks sent for one logical response (#86581).
@@ -3536,7 +3561,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             message_ids = []
             # Build the reference from ids — no fetch_message round trip.
-            reference = self._reply_reference_for_send(reply_to, channel)
+            reference = self._reply_reference_for_send(reply_to, channel, metadata)
 
             for i, chunk in enumerate(chunks):
                 if self._reply_to_mode == "all":
@@ -3851,6 +3876,33 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
             return SendResult(success=False, error=str(e))
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a previously sent Discord message.
+
+        Used by the stream consumer's fresh-final cleanup path to remove
+        streaming previews after the completed reply is sent as a new
+        message with a reply reference.
+        """
+        if not self._client:
+            return False
+        try:
+            channel = self._client.get_channel(int(chat_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(chat_id))
+            if not channel:
+                return False
+            msg = channel.get_partial_message(int(message_id))
+            await msg.delete()
+            return True
+        except Exception as e:
+            logger.debug(
+                "[%s] Failed to delete Discord message %s: %s",
+                self.name,
+                message_id,
+                e,
+            )
+            return False
 
     @staticmethod
     def _is_length_overflow_error(err: Exception) -> bool:
@@ -4223,7 +4275,7 @@ class DiscordAdapter(BasePlatformAdapter):
             filename = os.path.basename(audio_path)
 
             # ids-only reference — same no-fetch rationale as the text path.
-            reference = self._reply_reference_for_send(reply_to, channel)
+            reference = self._reply_reference_for_send(reply_to, channel, metadata)
 
             with open(audio_path, "rb") as f:
                 file_data = f.read()

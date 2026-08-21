@@ -28,7 +28,7 @@ class TestDiscord429Policy:
 
         result = rename_channel(
             "cat-id",
-            "Quotas \u2022 Updated: Just Now",
+            "Quotas \u2022 21/8 6:53pm \u2022 Next: 7:23pm",
             _headers(),
             skip_on_429=True,
             http_fn=fake_http,

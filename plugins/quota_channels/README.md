@@ -1,14 +1,14 @@
 # quota_channels
 
-Discord voice-channel quota display for **Codex**, **Kimi**, **z.ai**, **Cursor**, and **Grok**. Renames configured voice channels with remaining quota percentages and a granular time-until-reset countdown (days at 2+ days out, then hours, then minutes), sorts channels by time until reset (ascending), and keeps a category channel label fresh between cron ticks.
+Discord voice-channel quota display for **Codex**, **Kimi**, **z.ai**, **Cursor**, and **Grok**. Renames one configured voice channel per provider with remaining quota percentages, a granular time-until-reset countdown (days at 2+ days out, then hours, then minutes), and — for Codex, z.ai, and Cursor — rolling 7-day consumed tokens in the same channel name. Channels are sorted by time until reset (ascending), and the category label stays fresh between cron ticks.
 
 ## What it does
 
 Each tick (typically every minute via cron):
 
 1. **Quota gate** — provider API fetches run at most every `quota_interval_seconds` (default 30 minutes) unless forced. State lives in `HERMES_HOME/quota_channels_state.json`.
-2. **On a quota run** — fetch all enabled providers, rename voice channels, sort them by time until reset, save state, sleep `post_quota_delay_seconds` (default 31s), then refresh the category label again.
-3. **Every tick** — update the Quotas category name with a bucketed freshness label derived from seconds since the last successful full quota run.
+2. **On a quota run** — fetch all enabled providers, rename their voice channels (quota + token segment where supported), sort by time until reset, and save state.
+3. **Every tick** — update the Quotas category name once with the absolute local timestamp of the last successful quota run and either the next scheduled run time or `Due` when the interval has elapsed. Format: `Quotas • <day/month hour:minam/pm> • Next: <hour:minam/pm|Due>`.
 
 Silent success for the headless CLI; failures print `quota-channels: <message>` and exit 1.
 
@@ -21,7 +21,7 @@ quota_channels:
   guild_id: "YOUR_GUILD_ID"
   category_id: "YOUR_CATEGORY_CHANNEL_ID"
   quota_interval_seconds: 1800   # optional, default 1800 (30 min)
-  post_quota_delay_seconds: 31   # optional, default 31
+  post_quota_delay_seconds: 31   # deprecated; ignored (kept for backward compatibility)
   channel_ids:
     codex: "VOICE_CHANNEL_ID"
     kimi: "VOICE_CHANNEL_ID"
@@ -37,6 +37,21 @@ quota_channels:
 ```
 
 `enabled_providers` may also be a list, e.g. `["codex", "kimi"]`.
+
+**Upgrade note:** Updating the plugin automatically enriches existing quota channels for Codex, z.ai, and Cursor with a `<compact> tok/7d` segment — no config changes required.
+
+## Rolling 7-day token enrichment
+
+Each provider has **one** voice channel. For Codex, z.ai, and Cursor the channel name includes quota fields plus a rolling 7-day token total between the percentage segment and the reset countdown, e.g. `Codex: 99% • 2.2B tok/7d • 7d left`. Kimi and Grok have no account-wide consumed-token API; their channels stay quota-only and make **no** token-related HTTP request.
+
+| Provider | Source | Notes |
+|----------|--------|-------|
+| Codex | `GET …/wham/profiles/me` → sum latest 7 calendar-day `stats.daily_usage_buckets` | Stats may lag ~1 day (`stats_as_of`); OAuth refresh on 401 |
+| z.ai | `GET …/model-usage` with UTC `startTime`/`endTime` as `yyyy-MM-dd HH:mm:ss` | HTTP 200 with empty body is an error, not zero |
+| Cursor | `POST …/GetAggregatedUsageEvents` (epoch-ms strings, now−7d..now) | Total = input + output only; cache tokens excluded |
+| Kimi, Grok | — | Quota-only channel names; no token HTTP call |
+
+If a token fetch fails, the channel is still renamed with fresh quota data. When the current name already contains a parseable `tok/7d` segment, that segment is preserved; otherwise the name is quota-only. Token failures never block other providers, sorting, or the category update. Quota fetch failures leave that channel completely unchanged.
 
 Enable the toolset for sessions that should call the tool:
 

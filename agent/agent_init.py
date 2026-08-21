@@ -909,14 +909,12 @@ def init_agent(
     agent._active_children = []      # Running child AIAgents (for interrupt propagation)
     agent._active_children_lock = threading.Lock()
 
-    # Background memory/skill review state (agent/background_review.py). Holds
-    # the forked review AIAgent while its run_conversation() is in flight, so
-    # the NEXT live turn can proactively interrupt a still-running review
-    # instead of letting the two race concurrently against the same
-    # session_id/credentials (observed as doubled prompt-token counts and a
-    # Ctrl+C-proof lockup when a live turn started before a review fired at
-    # the end of the prior turn had finished).
+    # Background memory/skill review state (agent/background_review.py).
+    # ``_background_review_run`` is installed before the worker starts and
+    # fences its first provider-capable phase; the direct agent pointer keeps
+    # normal interrupt propagation available once the fork is constructed.
     agent._background_review_agent = None
+    agent._background_review_run = None
     agent._background_review_lock = threading.Lock()
 
     # Store OpenRouter provider preferences
@@ -1818,9 +1816,10 @@ def init_agent(
     # skip_memory=True skips the external memory *provider*. Flush/background
     # agents can still pass enabled_toolsets=["memory"] so the built-in file
     # store exists and the memory tool does not fail with store=None (#65429).
-    # A toolset on disabled_toolsets is not a request. Cron always denylists
-    # memory, but the default cron toolset still names it, so an enabled-only
-    # check would load MEMORY.md into an auto-approve job.
+    # A toolset on disabled_toolsets is not a request: a caller that denylists
+    # memory while its default toolset still names it must not get MEMORY.md
+    # loaded by an enabled-only check. (Cron agents now run with
+    # skip_memory=False and take the normal path here.)
     _enabled_toolsets = agent.enabled_toolsets or []
     _disabled_toolsets = agent.disabled_toolsets or []
     _memory_toolset_requested = (

@@ -4,7 +4,7 @@ A developer edition of [Hermes Agent](https://github.com/NousResearch/hermes-age
 
 **What's different here:**
 - **Tools**
-  - Delegation — send coding tasks to the Cursor Agent CLI, straight from chat
+  - Delegation — send coding tasks to a Cursor My Machines Cloud Agent in the target checkout, straight from chat
   - Delegation — send coding tasks to the Claude Code CLI, straight from chat
   - Delegation — delegate coding tools run unbounded by default; stall watchdog is the only kill switch
   - Delegation — `delegate_task action='list'` surfaces per-child liveness (current tool, iteration, seconds since activity, stalled flag) so a wedged subagent is distinguishable from a slow one
@@ -19,12 +19,14 @@ A developer edition of [Hermes Agent](https://github.com/NousResearch/hermes-age
   - Discord History — read-only search over an owner-authorized PostgreSQL archive of Discord messages (opt-in, off by default)
   - Papercuts — structured journal of workflow friction, plus an opt-in daily autofix cron (`hermes papercuts autofix install`) that turns small mechanical fixes into PRs
   - Hermes Starts — your AI can open conversations instead of only replying; it creates and pins its own Discord inbox
-  - quota_channels — Discord quota channels for five AI providers (opt-in)
+  - quota_channels — Discord quota channels for five AI providers (one channel each), with automatic 7-day token enrichment on Codex, z.ai, and Cursor
 - **Other**
   - Gateway — replies can end with a timing breakdown: total, API, tools, other (off by default upstream)
   - Discord — sessions keyed to your stable username, not your per-server nickname
   - Discord — threads renamed once, after the first reply lands, never mid-turn
   - Discord — progress updates respect each platform's real message limits
+  - Discord — only the completed turn-final answer reply-pings the user; streaming previews and interim messages stay standalone
+  - Discord — resolve_ticket propose is terminal: the confirmation embed is the reply, no follow-up message
   - Cron — lifecycle guard blocks cron-spawned commands that would restart the gateway or rewrite the live checkout (quote-aware)
   - Memory — per-turn injection skips lines already delivered earlier in the session
   - Config — API retry backoff timing
