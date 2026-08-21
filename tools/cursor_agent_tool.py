@@ -1199,13 +1199,6 @@ def _terminal_summary_from_result_json(result_json: str) -> Dict[str, Any]:
     return {key: payload.get(key) for key in keep if key in payload}
 
 
-def _reconcile_result_from_receipt(receipt: Dict[str, Any]) -> Optional[str]:
-    terminal = receipt.get("terminal_result")
-    if isinstance(terminal, dict) and terminal.get("result_json"):
-        return str(terminal["result_json"])
-    return None
-
-
 def _revalidate_receipt_for_recovery(
     receipt_path: Path,
     receipt: Dict[str, Any],
@@ -2076,9 +2069,55 @@ def delegate_cursor_agent(
                 )
 
             if is_terminal_receipt(receipt):
-                existing = _reconcile_result_from_receipt(receipt)
-                if existing:
-                    return existing
+                fresh = read_receipt(receipt_path)
+                if fresh is None:
+                    return _make_result(
+                        success=False,
+                        error=(
+                            "delegate_cursor_agent receipt disappeared during "
+                            "repeat invocation; refusing to create replacement work."
+                        ),
+                    )
+                try:
+                    _revalidate_receipt_for_recovery(
+                        receipt_path,
+                        fresh,
+                        hermes_session_id=hermes_session_id,
+                        tool_call_id=tool_call_id,
+                        request_fingerprint_value=request_fingerprint(
+                            task=task_text,
+                            workdir=str(workdir_path),
+                            model=model_name,
+                            force=force_enabled,
+                            timeout_seconds=clamped_timeout,
+                            prompt_hash=prompt_hash,
+                        ),
+                    )
+                except ReceiptValidationError as exc:
+                    return _make_result(
+                        success=False,
+                        error=(
+                            "delegate_cursor_agent receipt revalidation refused: "
+                            f"{exc}"
+                        ),
+                    )
+                result_json, cloud_still_running = _authoritative_terminal_reconcile(
+                    fresh,
+                    receipt_path,
+                    api_key=api_key,
+                )
+                if result_json:
+                    return result_json
+                if not cloud_still_running:
+                    return _make_result(
+                        success=False,
+                        error=(
+                            "delegate_cursor_agent terminal receipt could not be "
+                            "verified against Cursor Cloud; refusing to create "
+                            "replacement work."
+                        ),
+                    )
+                receipt = fresh
 
             return _execute_cloud_delegation(
                 task=task_text,

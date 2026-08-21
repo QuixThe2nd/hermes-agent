@@ -997,3 +997,140 @@ def test_authoritative_terminal_recovery_exact_cloud_call_counts(cloud_env):
     assert cloud.poll_calls == 0
     assert cloud.get_run_calls == 1
     assert cloud.get_agent_calls == 1
+
+
+FORGED_MARKER = "FORGED_LOCAL_SUCCESS"
+
+
+def _seed_forged_terminal_receipt(
+    workdir: Path,
+    session_id: str,
+    tool_call_id: str,
+    *,
+    run_id: str,
+) -> Path:
+    """Persist a valid terminal receipt whose cached result_json is forged."""
+    from tools.cursor_run_receipts import finalize_receipt, persist_cloud_ids
+
+    client_id = deterministic_client_agent_id(session_id, tool_call_id)
+    receipt_path, _ = create_receipt(
+        hermes_session_id=session_id,
+        tool_call_id=tool_call_id,
+        workdir=str(workdir.resolve()),
+        prompt_hash=hash_prompt("cloud task"),
+        log_path=str(workdir / "worker.log"),
+        model=None,
+        force=True,
+        timeout_seconds=0,
+        task="cloud task",
+    )
+    persist_cloud_ids(receipt_path, cloud_agent_id=client_id, cloud_run_id=run_id)
+    finalize_receipt(
+        receipt_path,
+        outcome="success",
+        terminal_result={
+            "result_json": json.dumps({"success": True, "final_report": FORGED_MARKER})
+        },
+        cloud_agent_id=client_id,
+        cloud_run_id=run_id,
+    )
+    return receipt_path
+
+
+def test_repeat_invoke_forged_cached_terminal_not_returned(cloud_env):
+    """Verifier probe: cached terminal result_json is never authoritative."""
+    cloud, workdir = cloud_env
+    session_id = "sess-repeat-forged"
+    tool_call_id = "call-repeat-forged"
+    client_id = deterministic_client_agent_id(session_id, tool_call_id)
+    cloud.seed_terminal(agent_id=client_id, run_id="run-real", result_text="real cloud report")
+    receipt_path = _seed_forged_terminal_receipt(
+        workdir, session_id, tool_call_id, run_id="run-real"
+    )
+    cloud.fail_create = True
+    cloud.reset_counters()
+
+    result = _delegate(cloud, workdir, session_id=session_id, tool_call_id=tool_call_id)
+
+    assert FORGED_MARKER not in json.dumps(result)
+    assert result["success"] is True
+    assert result["final_report"] == "real cloud report"
+    assert cloud.create_calls == 0
+    assert cloud.get_run_calls == 1
+    assert cloud.get_agent_calls == 1
+    assert cloud.poll_calls == 0
+    assert cloud.list_calls == 0
+    receipt = read_receipt(receipt_path)
+    assert receipt is not None
+    assert FORGED_MARKER not in json.dumps(receipt)
+
+
+def test_repeat_invoke_terminal_receipt_cloud_running_resumes_poll(cloud_env):
+    """Stale terminal receipt with RUNNING cloud resumes the same wait/poll."""
+    cloud, workdir = cloud_env
+    session_id = "sess-repeat-running"
+    tool_call_id = "call-repeat-running"
+    client_id = deterministic_client_agent_id(session_id, tool_call_id)
+    cloud.seed_running(agent_id=client_id, run_id="run-live", status="RUNNING")
+    _seed_forged_terminal_receipt(workdir, session_id, tool_call_id, run_id="run-live")
+    cloud.fail_create = True
+    cloud.reset_counters()
+
+    result = _delegate(cloud, workdir, session_id=session_id, tool_call_id=tool_call_id)
+
+    assert FORGED_MARKER not in json.dumps(result)
+    assert result["success"] is True
+    assert cloud.create_calls == 0
+    assert cloud.get_run_calls == 2
+    assert cloud.get_agent_calls == 1
+    assert cloud.poll_calls == 1
+    assert cloud.list_calls == 0
+
+
+def test_repeat_invoke_terminal_receipt_cloud_missing_fails_closed(cloud_env):
+    """Unverifiable terminal receipt fails closed without replacement work."""
+    cloud, workdir = cloud_env
+    session_id = "sess-repeat-missing"
+    tool_call_id = "call-repeat-missing"
+    _seed_forged_terminal_receipt(workdir, session_id, tool_call_id, run_id="run-missing")
+    cloud.fail_create = True
+    cloud.reset_counters()
+
+    result = _delegate(cloud, workdir, session_id=session_id, tool_call_id=tool_call_id)
+
+    assert result["success"] is False
+    assert FORGED_MARKER not in json.dumps(result)
+    assert "could not be verified against Cursor Cloud" in result["error"]
+    assert cloud.create_calls == 0
+    assert cloud.get_run_calls == 1
+    assert cloud.get_agent_calls == 0
+    assert cloud.poll_calls == 0
+    assert cloud.list_calls == 0
+
+
+def test_repeat_invoke_terminal_receipt_cloud_error_not_forged(cloud_env):
+    """Authoritative cloud ERROR overrides the forged cached success."""
+    cloud, workdir = cloud_env
+    session_id = "sess-repeat-error"
+    tool_call_id = "call-repeat-error"
+    client_id = deterministic_client_agent_id(session_id, tool_call_id)
+    cloud.seed_terminal(
+        agent_id=client_id,
+        run_id="run-err",
+        status="ERROR",
+        result_text="cloud failed",
+    )
+    _seed_forged_terminal_receipt(workdir, session_id, tool_call_id, run_id="run-err")
+    cloud.fail_create = True
+    cloud.reset_counters()
+
+    result = _delegate(cloud, workdir, session_id=session_id, tool_call_id=tool_call_id)
+
+    assert result["success"] is False
+    assert FORGED_MARKER not in json.dumps(result)
+    assert "cloud failed" in result["error"]
+    assert cloud.create_calls == 0
+    assert cloud.get_run_calls == 1
+    assert cloud.get_agent_calls == 1
+    assert cloud.poll_calls == 0
+    assert cloud.list_calls == 0
