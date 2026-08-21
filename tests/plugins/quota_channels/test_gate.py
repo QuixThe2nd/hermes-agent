@@ -59,8 +59,7 @@ class TestRunTickGate:
         calls = {"providers": 0, "category": 0}
 
         def fake_run_provider(*args, **kwargs):
-            calls["providers"] += 1
-            return "Codex", 1, "Codex: 99% \u2022 1d left", "renamed"
+            return "Codex", 1, "Codex: 99% \u2022 1d left", "renamed", {}
 
         monkeypatch.setattr(
             "plugins.quota_channels.core.run_provider_quota", fake_run_provider
@@ -99,7 +98,7 @@ class TestRunTickGate:
 
         def fake_run_provider(*args, **kwargs):
             calls["providers"] += 1
-            return "Codex", 2, "Codex: 50% \u2022 2d left", "renamed"
+            return "Codex", 2, "Codex: 50% \u2022 2d left", "renamed", {}
 
         monkeypatch.setattr(
             "plugins.quota_channels.core.run_provider_quota", fake_run_provider
@@ -132,7 +131,7 @@ class TestRunTickGate:
 
         monkeypatch.setattr(
             "plugins.quota_channels.core.run_provider_quota",
-            lambda *a, **k: ("Codex", 1, "Codex: 1% \u2022 1d left", "renamed"),
+            lambda *a, **k: ("Codex", 1, "Codex: 1% \u2022 1d left", "renamed", {}),
         )
         monkeypatch.setattr(
             "plugins.quota_channels.core.sort_voice_channels", lambda *a, **k: False
@@ -186,7 +185,7 @@ class TestRunTickGate:
 
         def fake_run_provider(key, channel_id, headers, http_fn=None, now_fn=None):
             if key == "codex":
-                return "Codex", 2, "Codex: 50% \u2022 2d left", "renamed"
+                return "Codex", 2, "Codex: 50% \u2022 2d left", "renamed", {}
             raise QuotaChannelsError("kimi boom")
 
         sort_entries = []
