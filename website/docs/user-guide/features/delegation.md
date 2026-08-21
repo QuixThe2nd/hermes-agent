@@ -440,6 +440,8 @@ The backend is a [Cursor My Machines](https://cursor.com/docs/cloud-agent/self-h
 
 The result keeps the previous fields (`success`, `final_report`, `delegations`, `duration_seconds`, `session_id`, `log_path`, `error`) and adds `agent_id`, `run_id`, `cloud_status`, and the exact `progress_url` returned by the API.
 
+**Restart recovery:** each run writes a restrictive receipt under `~/.hermes/cursor-runs/` (prompt hash and metadata only — never the plaintext task). If the gateway restarts mid-turn, it can reconcile a terminal log/result from that receipt or resume a local CLI Cursor session once via `--resume=<session_id>` when the init event session id was persisted. Cloud runs record terminal outcomes in receipts but do not auto-resume without a canonical CLI session id (fail closed).
+
 Mid-tool progress uses the generic `tools.tool_status` callback context bound on CLI/gateway conversation turns (`invoke_tool` / `run_conversation`). An integration test dispatches the real top-level tool through `handle_function_call` and asserts that exact `progress_url` is emitted **once before poll completion**. Unbound dispatch (direct `registry.dispatch` / cron / tests without the context) is a no-op for the live notice; `progress_url` is still in the final JSON. The seam does not import Discord or mutate conversation messages.
 
 The tool is gated on the Cursor `agent` CLI binary (`PATH` or `~/.local/bin/agent`).
