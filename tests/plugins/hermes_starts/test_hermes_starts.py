@@ -75,7 +75,7 @@ class MockDiscordRouter:
             return self._response(
                 {
                     "id": f"channel-{self.channel_counter}",
-                    "name": body.get("name", "hermes-started-this"),
+                    "name": body.get("name", "inbox"),
                     "guild_id": url.split("/guilds/")[1].split("/")[0],
                 }
             )
@@ -187,7 +187,7 @@ class TestCounterPersistence:
                 {
                     "guild_id": "guild-1",
                     "channel_id": "channel-existing",
-                    "channel_name": "hermes-started-this",
+                    "channel_name": "inbox",
                     "welcome_message_id": "msg-0",
                     "counter": 4,
                 }
@@ -258,7 +258,7 @@ class TestHttpErrors:
                 {
                     "guild_id": "guild-1",
                     "channel_id": "channel-existing",
-                    "channel_name": "hermes-started-this",
+                    "channel_name": "inbox",
                     "welcome_message_id": "msg-0",
                     "counter": 0,
                 }
@@ -294,7 +294,7 @@ class TestSetupProvisioning:
         assert result["success"] is True
         assert result["guild_id"] == "guild-1"
         assert result["channel_id"] == "channel-1"
-        assert result["channel_name"] == "hermes-started-this"
+        assert result["channel_name"] == "inbox"
         assert result["welcome_message_id"] == "msg-1"
 
         state_path = _isolate_env / "hermes_starts" / "state.json"
@@ -312,13 +312,13 @@ class TestSetupProvisioning:
         assert "test-bot-token" not in json.dumps(result)
 
         channel_body = json.loads(discord_router.calls[1]["body"])
-        assert channel_body["name"] == "hermes-started-this"
+        assert channel_body["name"] == "inbox"
         assert channel_body["topic"] == hermes_starts_module._CHANNEL_TOPIC
 
         welcome_body = json.loads(discord_router.calls[2]["body"])
         assert "embeds" in welcome_body
         embed = welcome_body["embeds"][0]
-        assert embed["title"] == "💬 Hermes Started This"
+        assert embed["title"] == "📥 Inbox"
         assert "Your AI has always had a reply box. This gives it an opening line." in embed[
             "description"
         ]
@@ -386,6 +386,25 @@ class TestSetupProvisioning:
         assert saved["channel_name"] == "second-channel"
         assert saved["channel_id"] == "channel-2"
 
+    def test_force_reprovision_uses_inbox_default_not_prior_channel_name(
+        self, hermes_starts_module, token_env, discord_router, _isolate_env
+    ):
+        _call(hermes_starts_module, {"action": "setup", "channel_name": "legacy-channel"})
+        result = _call(hermes_starts_module, {"action": "setup", "force": True})
+
+        assert result["success"] is True
+        assert result["channel_name"] == "inbox"
+
+        create_calls = [
+            json.loads(call["body"])
+            for call in discord_router.calls
+            if call["method"] == "POST" and call["url"].endswith("/channels")
+        ]
+        assert [body["name"] for body in create_calls] == ["legacy-channel", "inbox"]
+
+        saved = json.loads((_isolate_env / "hermes_starts" / "state.json").read_text())
+        assert saved["channel_name"] == "inbox"
+
     def test_pin_failure_tolerated(
         self, hermes_starts_module, token_env, discord_router, _isolate_env
     ):
@@ -436,7 +455,7 @@ class TestStartAutoProvision:
                 {
                     "guild_id": "guild-1",
                     "channel_id": "channel-existing",
-                    "channel_name": "hermes-started-this",
+                    "channel_name": "inbox",
                     "welcome_message_id": "msg-0",
                     "counter": 0,
                 }
@@ -493,7 +512,7 @@ class TestKindValidation:
                 {
                     "guild_id": "guild-1",
                     "channel_id": "channel-existing",
-                    "channel_name": "hermes-started-this",
+                    "channel_name": "inbox",
                     "welcome_message_id": "msg-0",
                     "counter": 0,
                 }
@@ -518,7 +537,7 @@ class TestKindValidation:
                 {
                     "guild_id": "guild-1",
                     "channel_id": "channel-existing",
-                    "channel_name": "hermes-started-this",
+                    "channel_name": "inbox",
                     "welcome_message_id": "msg-0",
                     "counter": 0,
                 }

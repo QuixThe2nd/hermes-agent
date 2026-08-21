@@ -19,7 +19,7 @@ The bot needs the **Manage Channels** permission for first-time channel provisio
 ## First start
 
 On the first `start` action, if no channel exists yet, the plugin auto-runs setup: it creates
-`#hermes-started-this` (or your chosen name), posts a pinned welcome embed, and saves state under
+`#inbox` (or your chosen name), posts a pinned welcome embed, and saves state under
 `$HERMES_HOME/hermes_starts/state.json`.
 
 You can also provision explicitly with `action='setup'`.

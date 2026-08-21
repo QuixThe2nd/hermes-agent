@@ -32,7 +32,7 @@ _ALLOWED_KINDS = {
     "business",
 }
 _ALLOWED_TONES = {"warm", "direct", "playful", "serious", "curious", "blunt"}
-_DEFAULT_CHANNEL_NAME = "hermes-started-this"
+_DEFAULT_CHANNEL_NAME = "inbox"
 _CHANNEL_TOPIC = (
     "Hermes starts the conversations it thinks are worth having — "
     "personal, practical, funny, difficult, or otherwise."
@@ -92,7 +92,7 @@ START_CONVERSATION_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Name for the Hermes Starts channel on setup. "
-                    "Defaults to hermes-started-this."
+                    "Defaults to inbox."
                 ),
             },
             "force": {
@@ -106,7 +106,7 @@ START_CONVERSATION_SCHEMA = {
 }
 
 _WELCOME_EMBED = {
-    "title": "💬 Hermes Started This",
+    "title": "📥 Inbox",
     "description": (
         "Your AI has always had a reply box. This gives it an opening line.\n\n"
         "This is where Hermes starts conversations without waiting to be asked — "
