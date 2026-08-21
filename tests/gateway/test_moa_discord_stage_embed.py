@@ -868,6 +868,33 @@ def _successful_terminal_deliveries(adapter):
     ]
 
 
+class _FastFailTerminalAdapter(_RecordingStageAdapter):
+    """Terminal send/edit fails immediately with SendResult(success=False)."""
+
+    async def send_tool_stage_embed(self, chat_id, stage, metadata=None, reply_to=None):
+        if stage.get("terminal"):
+            self.sends.append({"chat_id": chat_id, "stage": dict(stage), "ok": False})
+            return SendResult(success=False, error="terminal boom")
+        return await super().send_tool_stage_embed(
+            chat_id, stage, metadata=metadata, reply_to=reply_to
+        )
+
+    async def edit_tool_stage_embed(self, chat_id, message_id, stage, metadata=None):
+        if stage.get("terminal"):
+            self.edits.append(
+                {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "stage": dict(stage),
+                    "ok": False,
+                }
+            )
+            return SendResult(success=False, error="terminal boom")
+        return await super().edit_tool_stage_embed(
+            chat_id, message_id, stage, metadata=metadata
+        )
+
+
 @pytest.mark.asyncio
 async def test_drain_cancel_delivers_inflight_terminal():
     """Cancel during a blocked terminal send/edit must not drop the dequeued event."""
@@ -961,25 +988,20 @@ async def test_drain_cancel_after_terminal_side_effect_is_exactly_once():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "adapter_factory",
-    [_BlockingFailureTerminalAdapter, _BlockingRaiseTerminalAdapter],
-    ids=["send_result_failure", "adapter_raises"],
-)
-async def test_drain_cancel_retries_failed_terminal_once(adapter_factory):
-    """Failed in-flight terminal delivery is retried exactly once on flush."""
+async def test_drain_double_cancel_is_exactly_once():
+    """Nested cancel during shield recovery must not start a duplicate delivery."""
     from gateway.run import TurnRunner
 
-    adapter = adapter_factory()
+    adapter = _PostSideEffectBlockAdapter()
     ctx = _stage_ctx(adapter)
     runner = TurnRunner(_StubGatewayRunner(), ctx)
     ctx.stage_event_queue.put_nowait(
-        _stage_event("consult_moa", "inv-failed-terminal", "starting")
+        _stage_event("consult_moa", "inv-double-cancel", "starting")
     )
     ctx.stage_event_queue.put_nowait(
         _stage_event(
             "consult_moa",
-            "inv-failed-terminal",
+            "inv-double-cancel",
             "complete",
             "success",
             advisors=2,
@@ -990,24 +1012,424 @@ async def test_drain_cancel_retries_failed_terminal_once(adapter_factory):
     await asyncio.wait_for(adapter.blocked.wait(), timeout=2.0)
 
     task.cancel()
+    for _ in range(20):
+        await asyncio.sleep(0)
+    task.cancel()
+
     adapter.release.set()
 
     with pytest.raises(asyncio.CancelledError):
         await task
 
+    assert adapter.terminal_successful_side_effects == 1
+    terminal_deliveries = [
+        record
+        for record in adapter.ok_sends + adapter.ok_edits
+        if record.get("ok")
+        and record["stage"].get("terminal")
+        and record["stage"].get("invocation_id") == "inv-double-cancel"
+    ]
+    assert len(terminal_deliveries) == 1
+    duplicate_terminal_deliveries = [
+        record
+        for record in adapter.ok_sends + adapter.ok_edits
+        if record.get("ok")
+        and record["stage"].get("terminal")
+        and record["stage"].get("invocation_id") != "inv-double-cancel"
+    ]
+    assert duplicate_terminal_deliveries == []
+
+
+class _WedgedTerminalAdapter(_RecordingStageAdapter):
+    """Blocks terminal send/edit until release; side effect only after release."""
+
+    def __init__(self):
+        super().__init__()
+        self.blocked = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def _block_then_deliver(
+        self, chat_id, stage, *, message_id=None, metadata=None, reply_to=None
+    ):
+        self.blocked.set()
+        await self.release.wait()
+        if message_id is None:
+            return await super().send_tool_stage_embed(
+                chat_id, stage, metadata=metadata, reply_to=reply_to
+            )
+        return await super().edit_tool_stage_embed(
+            chat_id, message_id, stage, metadata=metadata
+        )
+
+    async def send_tool_stage_embed(self, chat_id, stage, metadata=None, reply_to=None):
+        if stage.get("terminal"):
+            return await self._block_then_deliver(
+                chat_id, stage, metadata=metadata, reply_to=reply_to
+            )
+        return await super().send_tool_stage_embed(
+            chat_id, stage, metadata=metadata, reply_to=reply_to
+        )
+
+    async def edit_tool_stage_embed(self, chat_id, message_id, stage, metadata=None):
+        if stage.get("terminal"):
+            return await self._block_then_deliver(
+                chat_id, stage, message_id=message_id, metadata=metadata
+            )
+        return await super().edit_tool_stage_embed(
+            chat_id, message_id, stage, metadata=metadata
+        )
+
+
+class _WedgedIntermediateAdapter(_RecordingStageAdapter):
+    """Blocks a non-terminal intermediate stage until release."""
+
+    WEDGE_STAGE = "advisors"
+
+    def __init__(self):
+        super().__init__()
+        self.blocked = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def _block_then_deliver(
+        self, chat_id, stage, *, message_id=None, metadata=None, reply_to=None
+    ):
+        self.blocked.set()
+        await self.release.wait()
+        if message_id is None:
+            return await super().send_tool_stage_embed(
+                chat_id, stage, metadata=metadata, reply_to=reply_to
+            )
+        return await super().edit_tool_stage_embed(
+            chat_id, message_id, stage, metadata=metadata
+        )
+
+    async def send_tool_stage_embed(self, chat_id, stage, metadata=None, reply_to=None):
+        if stage.get("stage") == self.WEDGE_STAGE:
+            return await self._block_then_deliver(
+                chat_id, stage, metadata=metadata, reply_to=reply_to
+            )
+        return await super().send_tool_stage_embed(
+            chat_id, stage, metadata=metadata, reply_to=reply_to
+        )
+
+    async def edit_tool_stage_embed(self, chat_id, message_id, stage, metadata=None):
+        if stage.get("stage") == self.WEDGE_STAGE:
+            return await self._block_then_deliver(
+                chat_id, stage, message_id=message_id, metadata=metadata
+            )
+        return await super().edit_tool_stage_embed(
+            chat_id, message_id, stage, metadata=metadata
+        )
+
+
+@pytest.mark.asyncio
+async def test_drain_unknown_pin_parks_then_delivers_terminal_once(monkeypatch):
+    """Intermediate UNKNOWN pin must not drop a later terminal stage event."""
+    from gateway.run import TurnRunner
+
+    monkeypatch.setattr(TurnRunner, "_STAGE_DELIVERY_RECOVER_TIMEOUT", 0.2)
+
+    adapter = _WedgedIntermediateAdapter()
+    ctx = _stage_ctx(adapter)
+    runner = TurnRunner(_StubGatewayRunner(), ctx)
+    invocation = "inv-parked-terminal"
+    ctx.stage_event_queue.put_nowait(
+        _stage_event("consult_moa", invocation, "starting")
+    )
+    ctx.stage_event_queue.put_nowait(
+        _stage_event("consult_moa", invocation, "advisors", advisors=2)
+    )
+    ctx.stage_event_queue.put_nowait(
+        _stage_event(
+            "consult_moa",
+            invocation,
+            "complete",
+            "success",
+            advisors=2,
+        )
+    )
+
+    task = asyncio.create_task(runner.send_tool_stage_embeds())
+    await asyncio.wait_for(adapter.blocked.wait(), timeout=2.0)
+
+    await asyncio.wait_for(asyncio.sleep(0.5), timeout=2.0)
+    assert task.done() is False
+
+    intermediate_attempts_while_wedged = [
+        record
+        for record in adapter.ok_sends + adapter.ok_edits
+        if record.get("ok")
+        and record["stage"].get("stage") == _WedgedIntermediateAdapter.WEDGE_STAGE
+        and record["stage"].get("invocation_id") == invocation
+    ]
+    assert len(intermediate_attempts_while_wedged) == 0
+
+    terminal_attempts_while_wedged = [
+        record
+        for record in adapter.ok_sends + adapter.ok_edits
+        if record.get("ok")
+        and record["stage"].get("terminal")
+        and record["stage"].get("invocation_id") == invocation
+    ]
+    assert terminal_attempts_while_wedged == []
+
+    ctx._current_flag["value"] = False
+    adapter.release.set()
+    await asyncio.wait_for(task, timeout=2.0)
+
+    intermediate_deliveries = [
+        record
+        for record in adapter.ok_sends + adapter.ok_edits
+        if record.get("ok")
+        and record["stage"].get("stage") == _WedgedIntermediateAdapter.WEDGE_STAGE
+        and record["stage"].get("invocation_id") == invocation
+    ]
+    assert len(intermediate_deliveries) == 1
+
+    terminal_deliveries = [
+        record
+        for record in adapter.ok_sends + adapter.ok_edits
+        if record.get("ok")
+        and record["stage"].get("terminal")
+        and record["stage"].get("invocation_id") == invocation
+    ]
+    assert len(terminal_deliveries) == 1
+    assert terminal_deliveries[-1]["stage"]["stage"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_drain_harvest_timeout_pins_delivery_no_retry(monkeypatch):
+    """Harvest timeout pins the live task; no duplicate retry."""
+    from gateway.run import TurnRunner
+
+    monkeypatch.setattr(TurnRunner, "_STAGE_DELIVERY_RECOVER_TIMEOUT", 0.2)
+
+    adapter = _WedgedTerminalAdapter()
+    ctx = _stage_ctx(adapter)
+    runner = TurnRunner(_StubGatewayRunner(), ctx)
+    ctx.stage_event_queue.put_nowait(
+        _stage_event("consult_moa", "inv-harvest-timeout", "starting")
+    )
+    ctx.stage_event_queue.put_nowait(
+        _stage_event(
+            "consult_moa",
+            "inv-harvest-timeout",
+            "complete",
+            "success",
+            advisors=2,
+        )
+    )
+
+    task = asyncio.create_task(runner.send_tool_stage_embeds())
+    await asyncio.wait_for(adapter.blocked.wait(), timeout=2.0)
+
+    await asyncio.wait_for(asyncio.sleep(0.5), timeout=2.0)
+    assert task.done() is False
+
+    terminal_attempts_while_wedged = [
+        record
+        for record in adapter.ok_sends + adapter.ok_edits
+        if record.get("ok")
+        and record["stage"].get("terminal")
+        and record["stage"].get("invocation_id") == "inv-harvest-timeout"
+    ]
+    assert terminal_attempts_while_wedged == []
+
+    detached = getattr(runner, "_stage_delivery_detached_tasks", set())
+    pinned = [t for t in detached if not t.done()]
+    assert len(pinned) == 1
+
+    ctx._current_flag["value"] = False
+    adapter.release.set()
+    await asyncio.wait_for(task, timeout=2.0)
+
+    terminal_deliveries = [
+        record
+        for record in adapter.ok_sends + adapter.ok_edits
+        if record.get("ok")
+        and record["stage"].get("terminal")
+        and record["stage"].get("invocation_id") == "inv-harvest-timeout"
+    ]
+    assert len(terminal_deliveries) == 1
+
+
+@pytest.mark.asyncio
+async def test_drain_unknown_timeout_pins_delivery_no_retry(monkeypatch):
+    """Cancel with a live delivery pins UNKNOWN immediately; no duplicate retry."""
+    from gateway.run import TurnRunner
+
+    monkeypatch.setattr(TurnRunner, "_STAGE_DELIVERY_RECOVER_TIMEOUT", 0.2)
+
+    adapter = _WedgedTerminalAdapter()
+    ctx = _stage_ctx(adapter)
+    runner = TurnRunner(_StubGatewayRunner(), ctx)
+    ctx.stage_event_queue.put_nowait(
+        _stage_event("consult_moa", "inv-unknown", "starting")
+    )
+    ctx.stage_event_queue.put_nowait(
+        _stage_event(
+            "consult_moa",
+            "inv-unknown",
+            "complete",
+            "success",
+            advisors=2,
+        )
+    )
+
+    task = asyncio.create_task(runner.send_tool_stage_embeds())
+    await asyncio.wait_for(adapter.blocked.wait(), timeout=2.0)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    terminal_attempts_while_wedged = [
+        record
+        for record in adapter.ok_sends + adapter.ok_edits
+        if record.get("ok")
+        and record["stage"].get("terminal")
+        and record["stage"].get("invocation_id") == "inv-unknown"
+    ]
+    assert terminal_attempts_while_wedged == []
+
+    detached = getattr(runner, "_stage_delivery_detached_tasks", set())
+    pinned = [t for t in detached if not t.done()]
+    assert len(pinned) == 1
+
+    adapter.release.set()
+    await asyncio.wait_for(pinned[0], timeout=2.0)
+
+    terminal_deliveries = [
+        record
+        for record in adapter.ok_sends + adapter.ok_edits
+        if record.get("ok")
+        and record["stage"].get("terminal")
+        and record["stage"].get("invocation_id") == "inv-unknown"
+    ]
+    assert len(terminal_deliveries) == 1
+
+
+@pytest.mark.asyncio
+async def test_drain_terminal_failure_retries_exactly_once_in_normal_path():
+    """Known terminal failure in the normal path is retried exactly once."""
+    adapter = _FastFailTerminalAdapter()
+    ctx = _stage_ctx(adapter)
+    ctx.stage_event_queue.put_nowait(
+        _stage_event("consult_moa", "inv-normal-retry", "starting")
+    )
+    ctx.stage_event_queue.put_nowait(
+        _stage_event(
+            "consult_moa",
+            "inv-normal-retry",
+            "complete",
+            "success",
+            advisors=2,
+        )
+    )
+
+    await _run_drain(ctx, expected_deliveries=3)
+
     terminal_attempts = [
         record
         for record in adapter.sends + adapter.edits
         if record["stage"].get("terminal")
-        and record["stage"].get("invocation_id") == "inv-failed-terminal"
+        and record["stage"].get("invocation_id") == "inv-normal-retry"
     ]
     assert len(terminal_attempts) == 2
     assert all(not record.get("ok") for record in terminal_attempts)
 
 
 @pytest.mark.asyncio
-async def test_drain_cancel_delivers_queued_terminal(monkeypatch):
-    """Teardown cancel must not drop a terminal event queued during idle sleep."""
+async def test_drain_terminal_second_failure_has_no_third_attempt():
+    """FAILED_FINAL after attempt 2 must not spawn a third delivery."""
+    adapter = _FastFailTerminalAdapter()
+    ctx = _stage_ctx(adapter)
+    ctx.stage_event_queue.put_nowait(
+        _stage_event("consult_moa", "inv-no-third", "starting")
+    )
+    ctx.stage_event_queue.put_nowait(
+        _stage_event(
+            "consult_moa",
+            "inv-no-third",
+            "complete",
+            "success",
+            advisors=2,
+        )
+    )
+
+    await _run_drain(ctx, expected_deliveries=3)
+
+    terminal_attempts = [
+        record
+        for record in adapter.sends + adapter.edits
+        if record["stage"].get("terminal")
+        and record["stage"].get("invocation_id") == "inv-no-third"
+    ]
+    assert len(terminal_attempts) == 2
+
+
+@pytest.mark.asyncio
+async def test_drain_cancel_while_blocked_creates_no_new_deliveries():
+    """Cancellation flush must not claim or deliver queued events."""
+    from gateway.run import TurnRunner
+
+    adapter = _BlockingTerminalStageAdapter()
+    ctx = _stage_ctx(adapter)
+    runner = TurnRunner(_StubGatewayRunner(), ctx)
+    claim_calls = {"count": 0}
+    real_claim = runner._claim_tool_stage_delivery
+
+    def counting_claim(*args, **kwargs):
+        claim_calls["count"] += 1
+        return real_claim(*args, **kwargs)
+
+    runner._claim_tool_stage_delivery = counting_claim
+
+    ctx.stage_event_queue.put_nowait(
+        _stage_event("consult_moa", "inv-cancel-no-flush", "starting")
+    )
+    ctx.stage_event_queue.put_nowait(
+        _stage_event(
+            "consult_moa",
+            "inv-cancel-no-flush",
+            "complete",
+            "success",
+            advisors=2,
+        )
+    )
+
+    task = asyncio.create_task(runner.send_tool_stage_embeds())
+    await asyncio.wait_for(adapter.blocked.wait(), timeout=2.0)
+    claims_before_cancel = claim_calls["count"]
+    attempts_before_cancel = len(adapter.sends) + len(adapter.edits)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert claim_calls["count"] == claims_before_cancel
+    assert len(adapter.sends) + len(adapter.edits) == attempts_before_cancel
+
+    adapter.release.set()
+    detached = getattr(runner, "_stage_delivery_detached_tasks", set())
+    pinned = [t for t in detached if not t.done()]
+    if pinned:
+        await asyncio.wait_for(pinned[0], timeout=2.0)
+
+    terminal_deliveries = [
+        record
+        for record in adapter.ok_sends + adapter.ok_edits
+        if record.get("ok")
+        and record["stage"].get("terminal")
+        and record["stage"].get("invocation_id") == "inv-cancel-no-flush"
+    ]
+    assert len(terminal_deliveries) == 1
+    assert claim_calls["count"] == claims_before_cancel
+
+
+@pytest.mark.asyncio
+async def test_drain_cancel_during_idle_sleep_creates_no_deliveries(monkeypatch):
+    """Teardown cancel during idle sleep must not create deliveries from the queue."""
     from gateway.run import TurnRunner
 
     adapter = _RecordingStageAdapter()
@@ -1028,7 +1450,9 @@ async def test_drain_cancel_delivers_queued_terminal(monkeypatch):
     task = asyncio.create_task(runner.send_tool_stage_embeds())
     await asyncio.wait_for(sleep_entered.wait(), timeout=2.0)
 
-    ctx.stage_event_queue.put_nowait(_stage_event("consult_moa", "inv-cancel", "starting"))
+    ctx.stage_event_queue.put_nowait(
+        _stage_event("consult_moa", "inv-cancel", "starting")
+    )
     ctx.stage_event_queue.put_nowait(
         _stage_event("consult_moa", "inv-cancel", "complete", "success", advisors=2)
     )
@@ -1037,15 +1461,8 @@ async def test_drain_cancel_delivers_queued_terminal(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    terminal_delivered = any(
-        s.get("ok") and s["stage"].get("terminal") for s in adapter.ok_sends
-    ) or any(e.get("ok") and e["stage"].get("terminal") for e in adapter.ok_edits)
-    assert terminal_delivered
-    assert any(
-        s.get("ok") and s["stage"].get("status") == "success" for s in adapter.ok_sends
-    ) or any(
-        e.get("ok") and e["stage"].get("status") == "success" for e in adapter.ok_edits
-    )
+    assert adapter.ok_sends == []
+    assert adapter.ok_edits == []
 
 
 @pytest.mark.asyncio

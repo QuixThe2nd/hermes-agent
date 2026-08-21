@@ -5367,6 +5367,9 @@ class TurnRunner:
         return to_deliver
 
     _STAGE_DELIVERY_RECOVER_TIMEOUT = 10.0
+    _STAGE_OUTCOME_DELIVERED = "delivered"
+    _STAGE_OUTCOME_FAILED = "failed"
+    _STAGE_OUTCOME_UNKNOWN = "unknown"
 
     async def _deliver_tool_stage_event(
         self, event: dict, embed_msg_ids: Dict[str, str]
@@ -5415,105 +5418,249 @@ class TurnRunner:
             embed_msg_ids.pop(invocation, None)
             return False
 
-    async def _deliver_stage_event_shielded(
+    _STAGE_STATE_EMPTY = "empty"
+    _STAGE_STATE_IN_FLIGHT = "in_flight"
+    _STAGE_STATE_DELIVERED = "delivered"
+    _STAGE_STATE_FAILED = "failed"
+    _STAGE_STATE_FAILED_FINAL = "failed_final"
+    _STAGE_STATE_UNKNOWN = "unknown"
+
+    @staticmethod
+    def _fresh_stage_delivery_record() -> dict:
+        return {"state": TurnRunner._STAGE_STATE_EMPTY, "attempts": 0, "task": None}
+
+    def _sync_consume_stage_delivery_task(self, record: dict) -> None:
+        task = record.get("task")
+        if task is None or not task.done():
+            return
+        try:
+            delivered = bool(task.result())
+        except Exception:
+            delivered = False
+        if delivered:
+            record["state"] = self._STAGE_STATE_DELIVERED
+        elif record["attempts"] >= 2:
+            record["state"] = self._STAGE_STATE_FAILED_FINAL
+        else:
+            record["state"] = self._STAGE_STATE_FAILED
+        record["task"] = None
+
+    def _pin_stage_delivery_task(self, task: asyncio.Task) -> None:
+        detached = getattr(self, "_stage_delivery_detached_tasks", None)
+        if detached is None:
+            detached = self._stage_delivery_detached_tasks = set()
+        detached.add(task)
+
+        def _release_detached(t: asyncio.Task) -> None:
+            if t is not task:
+                return
+            if not t.cancelled():
+                t.exception()
+            detached.discard(t)
+
+        task.add_done_callback(_release_detached)
+
+    def _claim_tool_stage_delivery(
         self,
         event: dict,
         embed_msg_ids: Dict[str, str],
-        outcome_holder: Optional[dict] = None,
-    ) -> bool:
-        """Deliver under shield; on cancel recover the true outcome before re-raising.
+        records: Dict[str, dict],
+        *,
+        retry: bool = False,
+    ) -> Optional[asyncio.Task]:
+        """Synchronous claim — the only ``create_task`` site for stage deliveries."""
+        invocation = str(event.get("invocation_id") or "")
+        if not invocation:
+            return None
 
-        Teardown can cancel the drain task while the adapter await is still
-        in flight. Shielding keeps the delivery task running so a post-side-
-        effect / pre-return race cannot lose the success outcome and trigger a
-        duplicate send on flush.
-        """
+        record = records.setdefault(invocation, self._fresh_stage_delivery_record())
+
+        if record["state"] == self._STAGE_STATE_UNKNOWN:
+            task = record.get("task")
+            if task is not None and not task.done():
+                return None
+
+        self._sync_consume_stage_delivery_task(record)
+
+        if retry:
+            if (
+                record["state"] != self._STAGE_STATE_FAILED
+                or record["attempts"] != 1
+            ):
+                return None
+        else:
+            if record["state"] in (
+                self._STAGE_STATE_DELIVERED,
+                self._STAGE_STATE_FAILED_FINAL,
+            ):
+                record = records[invocation] = self._fresh_stage_delivery_record()
+            elif record["state"] == self._STAGE_STATE_FAILED:
+                record = records[invocation] = self._fresh_stage_delivery_record()
+            elif record["state"] == self._STAGE_STATE_UNKNOWN:
+                task = record.get("task")
+                if task is not None and not task.done():
+                    return None
+                record = records[invocation] = self._fresh_stage_delivery_record()
+            else:
+                task = record.get("task")
+                if (
+                    record["state"] == self._STAGE_STATE_IN_FLIGHT
+                    and task is not None
+                    and not task.done()
+                ):
+                    return None
+
+        record["attempts"] += 1
         task = asyncio.create_task(
             self._deliver_tool_stage_event(event, embed_msg_ids)
         )
+        record["task"] = task
+        record["state"] = self._STAGE_STATE_IN_FLIGHT
+        return task
 
-        def _observe_delivery_task_outcome() -> Optional[str]:
-            if not task.done() or task.cancelled():
-                return None
+    async def _harvest_tool_stage_delivery(
+        self, task: asyncio.Task, record: dict
+    ) -> str:
+        """Bounded harvest via ``asyncio.wait`` — never cancels the delivery task."""
+        done, _pending = await asyncio.wait(
+            {task}, timeout=self._STAGE_DELIVERY_RECOVER_TIMEOUT
+        )
+        if task in done:
             try:
-                delivered = task.result()
+                delivered = bool(task.result())
             except Exception:
-                return "failed"
-            return "delivered" if delivered else "failed"
+                delivered = False
+            if delivered:
+                record["state"] = self._STAGE_STATE_DELIVERED
+                record["task"] = None
+                return self._STAGE_OUTCOME_DELIVERED
+            if record["attempts"] >= 2:
+                record["state"] = self._STAGE_STATE_FAILED_FINAL
+                record["task"] = None
+                return self._STAGE_OUTCOME_FAILED
+            record["state"] = self._STAGE_STATE_FAILED
+            record["task"] = None
+            return self._STAGE_OUTCOME_FAILED
 
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            outcome = "unknown"
-            try:
-                delivered = await asyncio.wait_for(
-                    asyncio.shield(task),
-                    timeout=self._STAGE_DELIVERY_RECOVER_TIMEOUT,
+        record["state"] = self._STAGE_STATE_UNKNOWN
+        record["task"] = task
+        self._pin_stage_delivery_task(task)
+        return self._STAGE_OUTCOME_UNKNOWN
+
+    def _handle_stage_delivery_cancel(
+        self, task: asyncio.Task, record: dict
+    ) -> None:
+        """Fully synchronous cancel handler — no awaits, no new deliveries."""
+        if task.done():
+            self._sync_consume_stage_delivery_task(record)
+        else:
+            record["state"] = self._STAGE_STATE_UNKNOWN
+            record["task"] = task
+            self._pin_stage_delivery_task(task)
+
+    def _invocation_has_live_unknown_delivery(
+        self, records: Dict[str, dict], invocation_id: str
+    ) -> bool:
+        if not invocation_id:
+            return False
+        record = records.get(invocation_id)
+        if record is None or record["state"] != self._STAGE_STATE_UNKNOWN:
+            return False
+        task = record.get("task")
+        return task is not None and not task.done()
+
+    async def _drain_parked_tool_stage_events(
+        self,
+        embed_msg_ids: Dict[str, str],
+        records: Dict[str, dict],
+        parked: Dict[str, list],
+    ) -> None:
+        """Deliver parked events once their invocation's UNKNOWN pin resolves."""
+        if not parked:
+            return
+        for invocation in list(parked.keys()):
+            if self._invocation_has_live_unknown_delivery(records, invocation):
+                continue
+            events = parked.pop(invocation, [])
+            for event in events:
+                await self._process_tool_stage_event(
+                    event, embed_msg_ids, records, parked
                 )
-                outcome = "delivered" if delivered else "failed"
-            except TimeoutError:
-                detached = getattr(self, "_stage_delivery_detached_tasks", None)
-                if detached is None:
-                    detached = self._stage_delivery_detached_tasks = set()
-                detached.add(task)
 
-                def _release_detached(t: asyncio.Task) -> None:
-                    if not t.cancelled():
-                        t.exception()
-                    detached.discard(t)
+    async def _process_tool_stage_event(
+        self,
+        event: dict,
+        embed_msg_ids: Dict[str, str],
+        records: Dict[str, dict],
+        parked: Optional[Dict[str, list]] = None,
+    ) -> None:
+        invocation = str(event.get("invocation_id") or "")
+        if (
+            parked is not None
+            and invocation
+            and self._invocation_has_live_unknown_delivery(records, invocation)
+        ):
+            parked.setdefault(invocation, []).append(event)
+            return
 
-                task.add_done_callback(_release_detached)
-            except asyncio.CancelledError:
-                observed = _observe_delivery_task_outcome()
-                if observed is not None:
-                    outcome = observed
-                raise
-            except Exception:
-                observed = _observe_delivery_task_outcome()
-                if observed is not None:
-                    outcome = observed
-                raise
-            finally:
-                if outcome_holder is not None:
-                    outcome_holder["outcome"] = outcome
+        task = self._claim_tool_stage_delivery(event, embed_msg_ids, records)
+        if task is None:
+            return
+
+        record = records[str(event.get("invocation_id") or "")]
+        try:
+            outcome = await self._harvest_tool_stage_delivery(task, record)
+        except asyncio.CancelledError:
+            self._handle_stage_delivery_cancel(task, record)
             raise
 
-    async def _flush_deliver_stage_event(
-        self, event: dict, embed_msg_ids: Dict[str, str]
-    ) -> None:
-        """Deliver one flush event with shielded cancel recovery."""
-        ctx = self._ctx
-        outcome_holder: dict = {}
-        try:
-            await self._deliver_stage_event_shielded(
-                event, embed_msg_ids, outcome_holder
+        if (
+            outcome == self._STAGE_OUTCOME_FAILED
+            and event.get("terminal")
+            and record["state"] == self._STAGE_STATE_FAILED
+            and record["attempts"] == 1
+        ):
+            retry_task = self._claim_tool_stage_delivery(
+                event, embed_msg_ids, records, retry=True
             )
-        except asyncio.CancelledError:
-            outcome = outcome_holder.get("outcome", "unknown")
-            if outcome == "delivered":
-                raise
-            retry_holder: dict = {}
+            if retry_task is None:
+                return
             try:
-                await self._deliver_stage_event_shielded(
-                    event, embed_msg_ids, retry_holder
-                )
+                await self._harvest_tool_stage_delivery(retry_task, record)
             except asyncio.CancelledError:
-                retry_outcome = retry_holder.get("outcome", "unknown")
-                if retry_outcome != "delivered":
-                    ctx.stage_event_queue.put_nowait(event)
+                self._handle_stage_delivery_cancel(retry_task, record)
                 raise
-        except Exception:
-            pass
 
-    async def _flush_remaining_stage_embeds(
-        self, embed_msg_ids: Dict[str, str]
+    async def _stop_drain_remaining_stage_embeds(
+        self,
+        embed_msg_ids: Dict[str, str],
+        records: Dict[str, dict],
+        parked: Optional[Dict[str, list]] = None,
     ) -> None:
-        """Deliver terminal (or last) queued event per invocation; fail-soft."""
-        for event in self._collect_final_stage_events():
-            try:
-                await self._flush_deliver_stage_event(event, embed_msg_ids)
-            except asyncio.CancelledError:
-                raise
+        """Normal stop path: deliver terminal/last queued events via claim+harvest."""
+        if parked is None:
+            parked = {}
+        while True:
+            await self._drain_parked_tool_stage_events(
+                embed_msg_ids, records, parked
+            )
+            for event in self._collect_final_stage_events():
+                try:
+                    await self._process_tool_stage_event(
+                        event, embed_msg_ids, records, parked
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+            if not parked:
+                break
+            if any(
+                self._invocation_has_live_unknown_delivery(records, inv)
+                for inv in list(parked.keys())
+            ):
+                await asyncio.sleep(0.2)
+                continue
 
     async def send_tool_stage_embeds(self):
         ctx = self._ctx
@@ -5526,19 +5673,20 @@ class TurnRunner:
         # same tool each own exactly one message, so their updates can
         # never cross-edit each other's embed.
         embed_msg_ids: Dict[str, str] = {}
-        in_flight_event = None
-        in_flight_outcome: Optional[dict] = None
+        records: Dict[str, dict] = {}
+        parked: Dict[str, list] = {}
 
         try:
             while True:
                 if not ctx._run_still_current():
-                    try:
-                        await self._flush_remaining_stage_embeds(embed_msg_ids)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        pass
+                    await self._stop_drain_remaining_stage_embeds(
+                        embed_msg_ids, records, parked
+                    )
                     return
+
+                await self._drain_parked_tool_stage_events(
+                    embed_msg_ids, records, parked
+                )
 
                 try:
                     event = ctx.stage_event_queue.get_nowait()
@@ -5546,34 +5694,10 @@ class TurnRunner:
                     await asyncio.sleep(0.2)
                     continue
 
-                in_flight_event = event
-                in_flight_outcome = {}
-                await self._deliver_stage_event_shielded(
-                    event, embed_msg_ids, in_flight_outcome
+                await self._process_tool_stage_event(
+                    event, embed_msg_ids, records, parked
                 )
-                in_flight_event = None
-                in_flight_outcome = None
         except asyncio.CancelledError:
-            # Turn teardown cancels this task while a terminal event is still
-            # queued (often during the idle sleep) or while its send/edit await
-            # is in flight. Re-queue only when the side effect did NOT land
-            # (failed/unknown); a delivered post-side-effect/pre-return race
-            # must not flush a duplicate embed.
-            if in_flight_event is not None:
-                outcome = (
-                    in_flight_outcome.get("outcome", "unknown")
-                    if in_flight_outcome
-                    else "unknown"
-                )
-                if outcome != "delivered":
-                    ctx.stage_event_queue.put_nowait(in_flight_event)
-                in_flight_event = None
-            try:
-                await self._flush_remaining_stage_embeds(embed_msg_ids)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
             raise
 
     def voice_ack_callback(self, call_id, tool_name, args):
