@@ -2916,6 +2916,12 @@ class BasePlatformAdapter(ABC):
     # never see these calls.
     supports_status_text: bool = False
 
+    # Opt-in async-delegation typing supervisor.  Discord enables this so the
+    # typing bubble stays visible while background delegate_task work runs.
+    # Slack and other adapters keep the default False — Slack typing blocks
+    # the compose box, so this must never be enabled generically.
+    _delegation_typing_enabled: bool = False
+
     def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
         """Set or clear (``None``) the live working-state phrase for a chat.
 
@@ -3074,6 +3080,12 @@ class BasePlatformAdapter(ABC):
         # Gateway shutdown cancels these so an old gateway instance doesn't keep
         # working on a task after --replace or manual restarts.
         self._background_tasks: set[asyncio.Task] = set()
+        # Session-scoped supervisors that keep platform typing alive while
+        # async delegations run after the parent turn ends.  Keyed by
+        # session_key; lifetime is ``has_live_for_session`` only — no turn lock.
+        self._delegation_typing_tasks: Dict[str, asyncio.Task] = {}
+        # Poll interval for delegation typing supervisors (tests inject ~0.05).
+        self._delegation_typing_poll_interval: float = 2.0
         # One-shot callbacks to fire after the main response is delivered.
         # Keyed by session_key. Values are either a bare callback (legacy) or
         # a ``(generation, callback)`` tuple so GatewayRunner can make deferred
@@ -5284,6 +5296,152 @@ class BasePlatformAdapter(ABC):
         finally:
             self._typing_paused.discard(chat_id)
 
+    def _delegation_typing_active(self) -> bool:
+        """Whether the async-delegation typing supervisor may run."""
+        return (
+            getattr(self, "_delegation_typing_enabled", False)
+            and getattr(self.config, "typing_indicator", True)
+        )
+
+    def _should_restart_delegation_typing(self, session_key: str) -> bool:
+        """True when this task may start the post-turn delegation supervisor."""
+        current_task = asyncio.current_task()
+        if current_task is None:
+            return False
+        expected = getattr(self, "_expected_cancelled_tasks", None)
+        if expected is not None and current_task in expected:
+            return False
+        if self._session_tasks.get(session_key) is not current_task:
+            return False
+        if session_key in self._pending_messages:
+            return False
+        return True
+
+    async def _stop_delegation_typing(
+        self,
+        session_key: str,
+        chat_id: str | None = None,
+        *,
+        metadata=None,
+        timeout: float = 0.5,
+    ) -> None:
+        """Stop the delegation typing supervisor for a session, if any."""
+        tasks = getattr(self, "_delegation_typing_tasks", None)
+        task = tasks.get(session_key) if tasks else None
+        try:
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.sleep(0)
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            if chat_id is not None and hasattr(self, "stop_typing"):
+                try:
+                    await self._stop_typing_with_metadata(chat_id, metadata)
+                except Exception:
+                    pass
+
+    async def _ensure_delegation_typing(
+        self,
+        session_key: str,
+        chat_id: str,
+        metadata=None,
+    ) -> None:
+        """Start a delegation typing supervisor when async work is still live."""
+        if not self._delegation_typing_active():
+            return
+        current_task = asyncio.current_task()
+        expected = getattr(self, "_expected_cancelled_tasks", None)
+        if current_task is not None and expected is not None and current_task in expected:
+            return
+        from tools.async_delegation import has_live_for_session
+
+        if not has_live_for_session(session_key=session_key):
+            return
+        tasks = getattr(self, "_delegation_typing_tasks", None)
+        if tasks is None:
+            tasks = {}
+            self._delegation_typing_tasks = tasks
+        existing = tasks.get(session_key)
+        if existing is not None and not existing.done():
+            return
+
+        supervisor = asyncio.create_task(
+            self._delegation_typing_supervisor_loop(session_key, chat_id, metadata)
+        )
+        tasks[session_key] = supervisor
+
+        def _on_supervisor_done(done_task: asyncio.Task) -> None:
+            try:
+                self._background_tasks.discard(done_task)
+            except (AttributeError, TypeError):
+                pass
+            current_tasks = getattr(self, "_delegation_typing_tasks", None)
+            if current_tasks is not None and current_tasks.get(session_key) is done_task:
+                current_tasks.pop(session_key, None)
+
+        supervisor.add_done_callback(_on_supervisor_done)
+        try:
+            self._background_tasks.add(supervisor)
+        except TypeError:
+            # Tests stub create_task() with non-hashable sentinels; tolerate.
+            pass
+        # Yield once so the supervisor is scheduled before callers stop or
+        # hand off per-turn typing — otherwise an immediate cancel can win
+        # the race before the task's finally block runs.
+        await asyncio.sleep(0)
+
+    async def _delegation_typing_supervisor_loop(
+        self,
+        session_key: str,
+        chat_id: str,
+        metadata=None,
+    ) -> None:
+        """Keep platform typing alive while async delegations run for a session."""
+        from tools.async_delegation import has_live_for_session
+
+        poll_interval = getattr(self, "_delegation_typing_poll_interval", 2.0)
+        send_timeout = max(0.25, min(1.5, poll_interval - 0.25))
+        try:
+            while self._delegation_typing_active() and has_live_for_session(
+                session_key=session_key
+            ):
+                if chat_id not in getattr(self, "_typing_paused", set()):
+                    try:
+                        await asyncio.wait_for(
+                            self.send_typing(chat_id, metadata=metadata),
+                            timeout=send_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as typing_err:
+                        logger.debug(
+                            "[%s] delegation typing send_typing error (non-fatal): %s",
+                            self.name,
+                            typing_err,
+                        )
+                await asyncio.sleep(poll_interval)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if hasattr(self, "stop_typing"):
+                try:
+                    await self._stop_typing_with_metadata(chat_id, metadata)
+                except Exception:
+                    pass
+            current_task = asyncio.current_task()
+            current_tasks = getattr(self, "_delegation_typing_tasks", None)
+            if (
+                current_task is not None
+                and current_tasks is not None
+                and current_tasks.get(session_key) is current_task
+            ):
+                current_tasks.pop(session_key, None)
+
     def pause_typing_for_chat(self, chat_id: str) -> None:
         """Pause typing indicator for a chat (e.g. during approval waits).
 
@@ -6312,20 +6470,6 @@ class BasePlatformAdapter(ABC):
         # typing_task stays None; _stop_typing_refresh already no-ops on None.
         _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
         typing_task: Optional[asyncio.Task] = None
-        if getattr(self.config, "typing_indicator", True):
-            _keep_typing_kwargs: Dict[str, Any] = {"metadata": _thread_metadata}
-            try:
-                _keep_typing_sig = inspect.signature(self._keep_typing)
-            except (TypeError, ValueError):
-                _keep_typing_sig = None
-            if _keep_typing_sig is None or "stop_event" in _keep_typing_sig.parameters:
-                _keep_typing_kwargs["stop_event"] = interrupt_event
-            typing_task = asyncio.create_task(
-                self._keep_typing(
-                    event.source.chat_id,
-                    **_keep_typing_kwargs,
-                )
-            )
 
         async def _stop_typing_task() -> None:
             await self._stop_typing_refresh(
@@ -6335,6 +6479,26 @@ class BasePlatformAdapter(ABC):
             )
         
         try:
+            await self._stop_delegation_typing(
+                session_key,
+                event.source.chat_id,
+                metadata=_thread_metadata,
+            )
+            if getattr(self.config, "typing_indicator", True):
+                _keep_typing_kwargs: Dict[str, Any] = {"metadata": _thread_metadata}
+                try:
+                    _keep_typing_sig = inspect.signature(self._keep_typing)
+                except (TypeError, ValueError):
+                    _keep_typing_sig = None
+                if _keep_typing_sig is None or "stop_event" in _keep_typing_sig.parameters:
+                    _keep_typing_kwargs["stop_event"] = interrupt_event
+                typing_task = asyncio.create_task(
+                    self._keep_typing(
+                        event.source.chat_id,
+                        **_keep_typing_kwargs,
+                    )
+                )
+
             await self._run_processing_hook("on_processing_start", event)
 
             # Call the handler (this can take a while with tool calls)
@@ -6997,6 +7161,12 @@ class BasePlatformAdapter(ABC):
                 # Leave _active_sessions[session_key] populated — the drain
                 # task's own lifecycle will clean it up.
             else:
+                if self._should_restart_delegation_typing(session_key):
+                    await self._ensure_delegation_typing(
+                        session_key,
+                        event.source.chat_id,
+                        metadata=_thread_metadata,
+                    )
                 # Clean up session tracking.  Guard-match both deletes so a
                 # reset-like command that already swapped in its own
                 # command_guard (and cancelled us) can't be accidentally
