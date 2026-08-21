@@ -16,6 +16,23 @@ def _isolate_env(tmp_path, monkeypatch):
     yield hermes_home
 
 
+@pytest.fixture(autouse=True)
+def _restore_plugin_modules():
+    prefixes = ("plugins.quota_channels", "hermes_cli.plugins")
+    saved = {k: m for k, m in sys.modules.items() if k.startswith(prefixes)}
+    yield
+    for key in list(sys.modules):
+        if key.startswith(prefixes):
+            del sys.modules[key]
+    sys.modules.update(saved)
+    for key, mod in saved.items():
+        if "." in key:
+            parent_name, attr = key.rsplit(".", 1)
+            parent = sys.modules.get(parent_name)
+            if parent is not None:
+                setattr(parent, attr, mod)
+
+
 def _minimal_quota_config():
     return {
         "quota_channels": {

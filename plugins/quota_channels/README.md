@@ -34,9 +34,31 @@ quota_channels:
     zai: true
     cursor: true
     grok: true
+  # Optional — disabled by default; omit entirely for pre-1.1 behavior
+  token_usage:
+    enabled: false
+    category_id: "YOUR_TOKEN_CATEGORY_CHANNEL_ID"
+    channel_ids:
+      codex: "VOICE_CHANNEL_ID"
+      zai: "VOICE_CHANNEL_ID"
+      cursor: "VOICE_CHANNEL_ID"
+      # kimi/grok: no account-wide token API — static "no token API" label only
 ```
 
 `enabled_providers` may also be a list, e.g. `["codex", "kimi"]`.
+
+## Token usage channels (optional)
+
+When `token_usage.enabled: true`, a separate category and voice channels show **rolling 7-day consumed tokens** (`<Provider>: 226.6M tok/7d`). Token provider fetches are **quota-gated** — they run only on ticks where the quota gate is open (`did_quota`), at most every `quota_interval_seconds`. The token category label (`Token Usage • Updated: …`) refreshes **every tick**, same bucketed freshness as the Quotas category.
+
+| Provider | Source | Notes |
+|----------|--------|-------|
+| Codex | `GET …/wham/profiles/me` → sum latest 7 calendar-day `stats.daily_usage_buckets` | Stats may lag ~1 day (`stats_as_of`) |
+| z.ai | `GET …/model-usage` with UTC `startTime`/`endTime` as `yyyy-MM-dd HH:mm:ss` | HTTP 200 with empty body is an error, not zero |
+| Cursor | `POST …/GetAggregatedUsageEvents` (epoch-ms strings, now−7d..now) | Total = input + output only; cache tokens excluded |
+| Kimi, Grok | — | Static `<Provider>: no token API`; **no** token-related provider HTTP call |
+
+Per-provider isolation: fetch/parse/rename failures are independent (`updated` / `unchanged` / `unsupported` / `skipped` / `failed`). Transient fetch/auth/parse errors **preserve the prior channel name** (no rename to zero or placeholder). The token phase still runs when individual quota providers fail; a quota-phase exception is re-raised after tokens run (historical CLI behavior). Missing `token_usage.channel_ids` entries for an enabled provider → `skipped`, not an error.
 
 Enable the toolset for sessions that should call the tool:
 

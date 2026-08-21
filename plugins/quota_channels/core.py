@@ -9,8 +9,9 @@ import struct
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -41,6 +42,20 @@ GROK_USAGE_URL = (
 TOKEN_URL = "https://auth.openai.com/oauth/token"
 XAI_TOKEN_URL = "https://auth.x.ai/oauth2/token"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+
+CODEX_PROFILE_URL = "https://chatgpt.com/backend-api/wham/profiles/me"
+ZAI_MODEL_USAGE_URL = "https://api.z.ai/api/monitor/usage/model-usage"
+CURSOR_AGG_USAGE_URL = (
+    "https://api2.cursor.sh/aiserver.v1.DashboardService/GetAggregatedUsageEvents"
+)
+
+# Providers whose subscription usage APIs expose percentages/credits only —
+# no account-wide consumed-token endpoint exists, so their token channels are
+# static labels and must never trigger a token-related network request.
+TOKEN_UNSUPPORTED_PROVIDERS = frozenset({"kimi", "grok"})
+
+TOKEN_CATEGORY_PREFIX = "Token Usage"
+TOKEN_WINDOW_DAYS = 7
 
 STATE_FILENAME = "quota_channels_state.json"
 
@@ -506,6 +521,8 @@ def validate_quota_config(section: Mapping[str, Any]) -> dict:
             "quota_channels requires at least one enabled provider with a channel id"
         )
 
+    token_usage = validate_token_usage_config(section.get("token_usage"), enabled)
+
     return {
         "guild_id": str(guild_id),
         "category_id": str(category_id),
@@ -517,6 +534,57 @@ def validate_quota_config(section: Mapping[str, Any]) -> dict:
         "post_quota_delay_seconds": int(
             section.get("post_quota_delay_seconds", DEFAULT_POST_QUOTA_DELAY_SECONDS)
         ),
+        "token_usage": token_usage,
+    }
+
+
+def validate_token_usage_config(
+    section: Any, enabled: Mapping[str, bool]
+) -> Optional[dict]:
+    """Validate the optional token_usage sub-section.
+
+    Reuses the top-level enabled_providers decision: a provider disabled for
+    quotas is disabled for token channels too. Absent or disabled sections
+    validate to None so pre-token_usage configs behave exactly as before.
+    """
+    if section is None:
+        return None
+    if not isinstance(section, Mapping):
+        raise QuotaChannelsError("quota_channels.token_usage must be a mapping")
+    if not bool(section.get("enabled", False)):
+        return None
+
+    category_id = section.get("category_id")
+    if not category_id:
+        raise QuotaChannelsError(
+            "quota_channels.token_usage.category_id required when token_usage is enabled"
+        )
+
+    channel_ids = section.get("channel_ids") or {}
+    if not isinstance(channel_ids, Mapping):
+        raise QuotaChannelsError("quota_channels.token_usage.channel_ids must be a mapping")
+
+    mapped: Dict[str, str] = {}
+    providers: List[Tuple[str, str, Optional[str]]] = []
+    for key, label in PROVIDER_SPECS:
+        if not enabled.get(key, False):
+            continue
+        raw = channel_ids.get(key)
+        channel_id = str(raw) if raw else None
+        if channel_id:
+            mapped[key] = channel_id
+        # Missing mappings stay None and are skipped at tick time.
+        providers.append((key, label, channel_id))
+
+    if not mapped:
+        raise QuotaChannelsError(
+            "quota_channels.token_usage requires at least one channel id when enabled"
+        )
+
+    return {
+        "category_id": str(category_id),
+        "channel_ids": mapped,
+        "providers": providers,
     }
 
 
@@ -854,6 +922,345 @@ PROVIDER_RUNNERS = {
 }
 
 
+# --- Token usage (rolling 7-day consumed tokens, optional category) ---
+
+
+def _error_text(exc: BaseException) -> str:
+    if isinstance(exc, QuotaChannelsError):
+        return str(exc)
+    return f"{type(exc).__name__}: {exc}"
+
+
+def redact_secrets(text: str, secrets: Sequence[Any]) -> str:
+    out = text
+    for secret in secrets:
+        if secret:
+            out = out.replace(str(secret), "[redacted]")
+    return out
+
+
+def format_compact_tokens(count: int) -> str:
+    # compact token counts: "226.6M", "45.6M", "950.0K", "1.2B"
+    if count >= 1_000_000_000:
+        return f"{count / 1_000_000_000:.1f}B"
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.1f}M"
+    if count >= 1_000:
+        return f"{count / 1_000:.1f}K"
+    return str(count)
+
+
+def format_token_name(label: str, tokens_7d: int) -> str:
+    return f"{label}: {format_compact_tokens(tokens_7d)} tok/7d"
+
+
+def unsupported_token_name(label: str) -> str:
+    return f"{label}: no token API"
+
+
+def fetch_codex_profile(
+    access: str,
+    http_fn: HttpFn = default_http,
+) -> Tuple[int, str]:
+    req = urllib.request.Request(
+        CODEX_PROFILE_URL,
+        headers={"Authorization": f"Bearer {access}", "User-Agent": "codex-cli"},
+    )
+    return http_text(req, http_fn=http_fn)
+
+
+def parse_codex_profile_tokens(
+    text: str, now_fn: NowFn = time.time
+) -> int:
+    """Sum the latest seven calendar-day buckets from wham/profiles/me.
+
+    Buckets carry `start_date` (ISO date) and `tokens`; metadata.stats_as_of
+    can lag about a day, so the total is near-real-time, not exact.
+    """
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise QuotaChannelsError("codex: invalid profile payload JSON") from exc
+    if not isinstance(payload, dict):
+        raise QuotaChannelsError("codex: invalid profile payload JSON")
+    buckets = (payload.get("stats") or {}).get("daily_usage_buckets")
+    if not isinstance(buckets, list) or not buckets:
+        raise QuotaChannelsError(
+            f"no daily_usage_buckets in codex profile payload: {text[:200]}"
+        )
+    today = datetime.fromtimestamp(now_fn(), tz=timezone.utc).date()
+    cutoff = (today - timedelta(days=TOKEN_WINDOW_DAYS - 1)).isoformat()
+    total = 0
+    for bucket in buckets:
+        if not isinstance(bucket, Mapping):
+            raise QuotaChannelsError(
+                "codex: invalid daily_usage_buckets entry in profile payload"
+            )
+        if (bucket.get("start_date") or "") < cutoff:
+            continue
+        try:
+            total += int(bucket.get("tokens") or 0)
+        except (TypeError, ValueError) as exc:
+            raise QuotaChannelsError(
+                "codex: invalid tokens in daily_usage_buckets entry"
+            ) from exc
+    return total
+
+
+def fetch_zai_model_usage(
+    api_key: str,
+    http_fn: HttpFn = default_http,
+    now_fn: NowFn = time.time,
+) -> Tuple[int, str]:
+    # startTime/endTime must be exact UTC "yyyy-MM-dd HH:mm:ss" with the
+    # space percent-encoded; anything else is a 500, and a bare request
+    # returns HTTP 200 with an empty body.
+    now = datetime.fromtimestamp(now_fn(), tz=timezone.utc)
+    start = now - timedelta(days=TOKEN_WINDOW_DAYS)
+    fmt = "%Y-%m-%d %H:%M:%S"
+    query = urllib.parse.urlencode(
+        {
+            "startTime": start.strftime(fmt),
+            "endTime": now.strftime(fmt),
+        },
+        quote_via=urllib.parse.quote,
+    )
+    req = urllib.request.Request(
+        f"{ZAI_MODEL_USAGE_URL}?{query}",
+        headers={"Authorization": api_key, "User-Agent": "hermes-quota-channel"},
+    )
+    return http_text(req, http_fn=http_fn)
+
+
+def parse_zai_model_usage(text: str) -> int:
+    # An HTTP-200 empty or malformed body is an error, never a silent zero.
+    if not text.strip():
+        raise QuotaChannelsError("z.ai: model-usage response body empty")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise QuotaChannelsError("z.ai: invalid model-usage payload JSON") from exc
+    if not isinstance(payload, dict):
+        raise QuotaChannelsError("z.ai: invalid model-usage payload JSON")
+    if payload.get("code") != 200:
+        raise QuotaChannelsError(f"z.ai: model-usage error response: {text[:200]}")
+    total = ((payload.get("data") or {}).get("totalUsage") or {}).get(
+        "totalTokensUsage"
+    )
+    if total is None:
+        raise QuotaChannelsError(
+            f"z.ai: no totalUsage.totalTokensUsage in model-usage payload: {text[:200]}"
+        )
+    try:
+        return int(total)
+    except (TypeError, ValueError) as exc:
+        raise QuotaChannelsError(
+            "z.ai: invalid totalUsage.totalTokensUsage in model-usage payload"
+        ) from exc
+
+
+def cursor_agg_usage_body(now_ms: int) -> Dict[str, str]:
+    # Cursor requires epoch milliseconds as STRINGS; second-precision values
+    # return an empty payload.
+    start_ms = now_ms - TOKEN_WINDOW_DAYS * 86_400_000
+    return {"startDate": str(start_ms), "endDate": str(now_ms)}
+
+
+def fetch_cursor_aggregated_usage(
+    access: str,
+    http_fn: HttpFn = default_http,
+    now_fn: NowFn = time.time,
+) -> Tuple[int, str]:
+    req = urllib.request.Request(
+        CURSOR_AGG_USAGE_URL,
+        data=json.dumps(cursor_agg_usage_body(int(now_fn() * 1000))).encode(),
+        headers={
+            "Authorization": f"Bearer {access}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "hermes-quota-channel",
+        },
+        method="POST",
+    )
+    return http_text(req, http_fn=http_fn)
+
+
+def parse_cursor_aggregated_usage(text: str) -> int:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise QuotaChannelsError(
+            "cursor: invalid aggregated usage payload JSON"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise QuotaChannelsError("cursor: invalid aggregated usage payload JSON")
+    input_tokens = payload.get("totalInputTokens")
+    output_tokens = payload.get("totalOutputTokens")
+    if input_tokens is None or output_tokens is None:
+        raise QuotaChannelsError(
+            f"cursor: no token totals in aggregated usage payload: {text[:200]}"
+        )
+    # cache read/write tokens are deliberately excluded from the total
+    try:
+        return int(input_tokens) + int(output_tokens)
+    except (TypeError, ValueError) as exc:
+        raise QuotaChannelsError(
+            "cursor: invalid token totals in aggregated usage payload"
+        ) from exc
+
+
+def run_codex_token_provider(
+    http_fn: HttpFn = default_http,
+    now_fn: NowFn = time.time,
+) -> Tuple[str, int]:
+    store = load_store()
+    toks = store.get("providers", {}).get("openai-codex", {}).get("tokens", {})
+    access = toks.get("access_token")
+    if not access:
+        raise QuotaChannelsError("no openai-codex access token in hermes auth store")
+    try:
+        status, text = fetch_codex_profile(access, http_fn=http_fn)
+        if status == 401:
+            access = refresh_codex_tokens(store, http_fn=http_fn)
+            status, text = fetch_codex_profile(access, http_fn=http_fn)
+        if status != 200:
+            raise QuotaChannelsError(
+                f"codex profile endpoint returned {status}: {text[:200]}"
+            )
+        total = parse_codex_profile_tokens(text, now_fn=now_fn)
+    except Exception as exc:
+        raise QuotaChannelsError(
+            redact_secrets(_error_text(exc), (access, toks.get("refresh_token")))
+        ) from exc
+    return format_token_name("Codex", total), total
+
+
+def run_zai_token_provider(
+    http_fn: HttpFn = default_http,
+    now_fn: NowFn = time.time,
+) -> Tuple[str, int]:
+    key = zai_api_key()
+    try:
+        status, text = fetch_zai_model_usage(key, http_fn=http_fn, now_fn=now_fn)
+        if status != 200:
+            raise QuotaChannelsError(
+                f"z.ai model-usage endpoint returned {status}: {text[:200]}"
+            )
+        total = parse_zai_model_usage(text)
+    except Exception as exc:
+        raise QuotaChannelsError(redact_secrets(_error_text(exc), (key,))) from exc
+    return format_token_name("z.ai", total), total
+
+
+def run_cursor_token_provider(
+    http_fn: HttpFn = default_http,
+    now_fn: NowFn = time.time,
+) -> Tuple[str, int]:
+    access = cursor_access_token()
+    try:
+        status, text = fetch_cursor_aggregated_usage(
+            access, http_fn=http_fn, now_fn=now_fn
+        )
+        if status == 401:
+            raise QuotaChannelsError(
+                "cursor aggregated-usage endpoint returned 401: re-run `agent login` "
+                "to refresh Cursor CLI auth"
+            )
+        if status != 200:
+            raise QuotaChannelsError(
+                f"cursor aggregated-usage endpoint returned {status}: {text[:200]}"
+            )
+        total = parse_cursor_aggregated_usage(text)
+    except Exception as exc:
+        raise QuotaChannelsError(redact_secrets(_error_text(exc), (access,))) from exc
+    return format_token_name("Cursor", total), total
+
+
+TOKEN_RUNNERS = {
+    "codex": run_codex_token_provider,
+    "zai": run_zai_token_provider,
+    "cursor": run_cursor_token_provider,
+}
+
+
+def token_category_name(last_success: float, now_fn: NowFn = time.time) -> str:
+    return f"{TOKEN_CATEGORY_PREFIX} \u2022 {quota_label(now_fn() - last_success)}"
+
+
+def run_token_provider(
+    key: str,
+    label: str,
+    channel_id: str,
+    headers: dict,
+    http_fn: HttpFn = default_http,
+    now_fn: NowFn = time.time,
+) -> dict:
+    if key in TOKEN_UNSUPPORTED_PROVIDERS:
+        try:
+            rename = rename_channel(
+                channel_id,
+                unsupported_token_name(label),
+                headers,
+                http_fn=http_fn,
+            )
+        except Exception as exc:
+            return {"status": "failed", "error": _error_text(exc)}
+        return {"status": "unsupported", "rename": rename}
+
+    runner = TOKEN_RUNNERS[key]
+    try:
+        name, tokens_7d = runner(http_fn=http_fn, now_fn=now_fn)
+    except Exception as exc:
+        # Transient fetch/auth/parse failure keeps the prior channel name —
+        # never rename to a zero or placeholder label on the back of an error.
+        return {"status": "failed", "error": _error_text(exc)}
+    try:
+        rename = rename_channel(channel_id, name, headers, http_fn=http_fn)
+    except Exception as exc:
+        return {"status": "failed", "name": name, "error": _error_text(exc)}
+    status = "updated" if rename == "renamed" else "unchanged"
+    return {"status": status, "tokens_7d": tokens_7d, "rename": rename}
+
+
+def run_token_tick(
+    token_config: dict,
+    *,
+    last_success: float,
+    headers: dict,
+    http_fn: HttpFn = default_http,
+    now_fn: NowFn = time.time,
+    did_quota: bool,
+) -> dict:
+    """Fetch/rename token channels (quota-gated) and refresh the category label.
+
+    Each provider — fetch, parse, and Discord rename — is isolated; one
+    failure never blocks the providers after it.
+    """
+    providers: Dict[str, Any] = {}
+    if did_quota:
+        for key, label, channel_id in token_config["providers"]:
+            if not channel_id:
+                providers[label] = {"status": "skipped"}
+                continue
+            providers[label] = run_token_provider(
+                key, label, channel_id, headers, http_fn=http_fn, now_fn=now_fn
+            )
+
+    result: Dict[str, Any] = {"did_run": did_quota, "providers": providers}
+    try:
+        result["category"] = rename_channel(
+            token_config["category_id"],
+            token_category_name(last_success, now_fn=now_fn),
+            headers,
+            skip_on_429=True,
+            http_fn=http_fn,
+        )
+    except Exception as exc:
+        result["category"] = "failed"
+        result["category_error"] = _error_text(exc)
+    return result
+
+
 def plan_position_moves(
     entries: Sequence[Tuple[str, str, int]],
     guild_channels: Sequence[Mapping[str, Any]],
@@ -998,49 +1405,81 @@ def run_tick(
 
     headers = discord_headers()
 
-    if did_quota:
-        entries: List[Tuple[str, str, float]] = []
-        for key, label, channel_id in config["providers"]:
-            try:
-                prov_label, reset_secs, channel_name, rename = run_provider_quota(
-                    key, channel_id, headers, http_fn=http_fn, now_fn=now_fn
+    # The quota/category phase keeps its historical fail-hard behavior, but a
+    # failure here (e.g. an intermittent sort or category rename error) must
+    # not block the token phase — capture it, run tokens, then re-raise so
+    # callers observe exactly the failure they did before token_usage existed.
+    quota_error: Optional[BaseException] = None
+    category_status: Optional[str] = None
+
+    try:
+        if did_quota:
+            entries: List[Tuple[str, str, float]] = []
+            for key, label, channel_id in config["providers"]:
+                try:
+                    prov_label, reset_secs, channel_name, rename = run_provider_quota(
+                        key, channel_id, headers, http_fn=http_fn, now_fn=now_fn
+                    )
+                except Exception as exc:
+                    if isinstance(exc, QuotaChannelsError):
+                        msg = str(exc)
+                    else:
+                        msg = f"{type(exc).__name__}: {exc}"
+                    provider_results[label] = {"error": msg}
+                    continue
+                provider_results[prov_label] = {
+                    "remaining": _remaining_from_name(channel_name, prov_label),
+                    "reset_seconds": reset_secs,
+                    "rename": rename,
+                }
+                entries.append((label, channel_id, reset_secs))
+            if entries:
+                sorted_channels = sort_voice_channels(
+                    config, entries, headers, http_fn=http_fn
                 )
-            except Exception as exc:
-                if isinstance(exc, QuotaChannelsError):
-                    msg = str(exc)
-                else:
-                    msg = f"{type(exc).__name__}: {exc}"
-                provider_results[label] = {"error": msg}
-                continue
-            provider_results[prov_label] = {
-                "remaining": _remaining_from_name(channel_name, prov_label),
-                "reset_seconds": reset_secs,
-                "rename": rename,
-            }
-            entries.append((label, channel_id, reset_secs))
-        if entries:
-            sorted_channels = sort_voice_channels(
-                config, entries, headers, http_fn=http_fn
-            )
-            last = save_state(now_fn=now_fn)
+                last = save_state(now_fn=now_fn)
 
-    category_status = update_category(
-        config["category_id"], last, headers, http_fn=http_fn, now_fn=now_fn
-    )
-
-    if did_quota:
-        sleep_fn(config["post_quota_delay_seconds"])
         category_status = update_category(
             config["category_id"], last, headers, http_fn=http_fn, now_fn=now_fn
         )
 
-    return {
+        if did_quota:
+            sleep_fn(config["post_quota_delay_seconds"])
+            category_status = update_category(
+                config["category_id"], last, headers, http_fn=http_fn, now_fn=now_fn
+            )
+    except Exception as exc:
+        quota_error = exc
+
+    token_result: Optional[dict] = None
+    token_config = config.get("token_usage")
+    if token_config:
+        try:
+            token_result = run_token_tick(
+                token_config,
+                last_success=last,
+                headers=headers,
+                http_fn=http_fn,
+                now_fn=now_fn,
+                did_quota=did_quota,
+            )
+        except Exception as exc:
+            # Never let a token-phase bug mask or replace the quota result.
+            token_result = {"error": _error_text(exc)}
+
+    if quota_error is not None:
+        raise quota_error
+
+    result: Dict[str, Any] = {
         "success": True,
         "did_quota": did_quota,
         "providers": provider_results,
         "category": category_status,
         "sorted": sorted_channels,
     }
+    if token_result is not None:
+        result["token_usage"] = token_result
+    return result
 
 
 def _remaining_from_name(channel_name: str, label: str) -> Any:
