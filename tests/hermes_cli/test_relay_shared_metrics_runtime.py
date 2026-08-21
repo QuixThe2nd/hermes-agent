@@ -1623,6 +1623,71 @@ def test_subagent_agent_boundary_closes_its_own_scope(
     )
 
 
+def test_subagent_agent_boundary_tool_status_callback_binding(
+    direct_runtime,
+    monkeypatch,
+):
+    from run_agent import AIAgent
+    from tools.tool_status import emit_tool_status
+
+    coordinator = relay_runtime.SESSION_COORDINATOR
+    profile_key = relay_runtime.current_profile_key()
+
+    def run_child(child_agent, session_id):
+        lease = coordinator.acquire_conversation(
+            profile_key=profile_key,
+            session_id=session_id,
+            platform="cli",
+        )
+        turn = coordinator.begin_turn(
+            lease,
+            turn_id=f"{session_id}-turn",
+            task_id=f"{session_id}-task",
+        )
+        try:
+            AIAgent.run_conversation(child_agent, "private", task_id=f"{session_id}-task")
+        finally:
+            coordinator.end_turn(turn, outcome="success")
+            coordinator.release_conversation(lease)
+            coordinator.finalize_conversation(
+                profile_key=profile_key,
+                session_id=session_id,
+            )
+
+    emit_results: list[bool] = []
+
+    def probe(*_args, **_kwargs):
+        emit_results.append(emit_tool_status("probe"))
+        return {"final_response": "done", "completed": True, "interrupted": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", probe)
+
+    base_ns = dict(
+        platform="subagent",
+        _session_db=None,
+        _conversation_root_id=lambda: "parent",
+    )
+
+    run_child(
+        SimpleNamespace(session_id="no-callback", _parent_session_id="parent", **base_ns),
+        "no-callback",
+    )
+    assert emit_results == [False]
+
+    received: list[str] = []
+    run_child(
+        SimpleNamespace(
+            session_id="with-callback",
+            _parent_session_id="parent",
+            _emit_status=received.append,
+            **base_ns,
+        ),
+        "with-callback",
+    )
+    assert emit_results == [False, True]
+    assert received == ["probe"]
+
+
 
 
 
