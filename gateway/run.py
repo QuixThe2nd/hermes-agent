@@ -5367,6 +5367,7 @@ class TurnRunner:
         return to_deliver
 
     _STAGE_DELIVERY_RECOVER_TIMEOUT = 10.0
+    _STAGE_STOP_DRAIN_TIMEOUT = 1.0
     _STAGE_OUTCOME_DELIVERED = "delivered"
     _STAGE_OUTCOME_FAILED = "failed"
     _STAGE_OUTCOME_UNKNOWN = "unknown"
@@ -5640,7 +5641,10 @@ class TurnRunner:
         """Normal stop path: deliver terminal/last queued events via claim+harvest."""
         if parked is None:
             parked = {}
+        deadline = time.monotonic() + self._STAGE_STOP_DRAIN_TIMEOUT
         while True:
+            if time.monotonic() >= deadline:
+                return
             await self._drain_parked_tool_stage_events(
                 embed_msg_ids, records, parked
             )
@@ -5659,6 +5663,8 @@ class TurnRunner:
                 self._invocation_has_live_unknown_delivery(records, inv)
                 for inv in list(parked.keys())
             ):
+                if time.monotonic() >= deadline:
+                    return
                 await asyncio.sleep(0.2)
                 continue
 

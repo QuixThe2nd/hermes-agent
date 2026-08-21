@@ -1254,6 +1254,104 @@ async def test_drain_harvest_timeout_pins_delivery_no_retry(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_stop_drain_unknown_pin_bounded_returns_without_teardown_block(
+    monkeypatch,
+):
+    """Stop drain must return on UNKNOWN pin within _STAGE_STOP_DRAIN_TIMEOUT."""
+    from gateway.run import TurnRunner
+
+    monkeypatch.setattr(TurnRunner, "_STAGE_DELIVERY_RECOVER_TIMEOUT", 0.2)
+    monkeypatch.setattr(TurnRunner, "_STAGE_STOP_DRAIN_TIMEOUT", 0.3)
+
+    adapter = _WedgedIntermediateAdapter()
+    ctx = _stage_ctx(adapter)
+    runner = TurnRunner(_StubGatewayRunner(), ctx)
+    invocation = "inv-stop-drain-timeout"
+    ctx.stage_event_queue.put_nowait(
+        _stage_event("consult_moa", invocation, "starting")
+    )
+    ctx.stage_event_queue.put_nowait(
+        _stage_event("consult_moa", invocation, "advisors", advisors=2)
+    )
+    ctx.stage_event_queue.put_nowait(
+        _stage_event(
+            "consult_moa",
+            invocation,
+            "complete",
+            "success",
+            advisors=2,
+        )
+    )
+
+    task = asyncio.create_task(runner.send_tool_stage_embeds())
+    verify_no_exception_leak = False
+    try:
+        await asyncio.wait_for(adapter.blocked.wait(), timeout=2.0)
+
+        await asyncio.wait_for(asyncio.sleep(0.5), timeout=2.0)
+        assert task.done() is False
+
+        ctx._current_flag["value"] = False
+        await asyncio.wait_for(task, timeout=3.0)
+
+        intermediate_side_effects = [
+            record
+            for record in adapter.ok_sends + adapter.ok_edits
+            if record.get("ok")
+            and record["stage"].get("stage") == _WedgedIntermediateAdapter.WEDGE_STAGE
+            and record["stage"].get("invocation_id") == invocation
+        ]
+        assert intermediate_side_effects == []
+        assert adapter.blocked.is_set()
+
+        intermediate_attempts = [
+            record
+            for record in adapter.sends + adapter.edits
+            if record["stage"].get("stage") == _WedgedIntermediateAdapter.WEDGE_STAGE
+            and record["stage"].get("invocation_id") == invocation
+        ]
+        assert len(intermediate_attempts) == 0
+
+        terminal_attempts = [
+            record
+            for record in adapter.sends + adapter.edits
+            if record["stage"].get("terminal")
+            and record["stage"].get("invocation_id") == invocation
+        ]
+        assert terminal_attempts == []
+
+        detached = getattr(runner, "_stage_delivery_detached_tasks", set())
+        pinned = [t for t in detached if not t.done()]
+        assert len(detached) == 1
+        assert len(pinned) == 1
+        verify_no_exception_leak = True
+    finally:
+        adapter.release.set()
+        detached = getattr(runner, "_stage_delivery_detached_tasks", None) or set()
+        for delivery_task in list(detached):
+            if not delivery_task.done():
+                try:
+                    await asyncio.wait_for(delivery_task, timeout=2.0)
+                except asyncio.TimeoutError:
+                    pass
+        if not task.done():
+            try:
+                await asyncio.wait_for(task, timeout=2.0)
+            except asyncio.TimeoutError:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+    if verify_no_exception_leak:
+        detached = getattr(runner, "_stage_delivery_detached_tasks", set())
+        for delivery_task in detached:
+            assert delivery_task.done()
+            assert delivery_task.exception() is None
+
+
+@pytest.mark.asyncio
 async def test_drain_unknown_timeout_pins_delivery_no_retry(monkeypatch):
     """Cancel with a live delivery pins UNKNOWN immediately; no duplicate retry."""
     from gateway.run import TurnRunner
