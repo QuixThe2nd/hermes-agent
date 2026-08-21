@@ -105,6 +105,23 @@ def test_expired_turn_lease_does_not_block(db_path):
     assert snap.idle is True
 
 
+def test_dispatched_delegation_blocks(db_path):
+    db = SessionDB(db_path=db_path)
+    now = time.time()
+    db._conn.execute(
+        """
+        INSERT INTO async_delegations
+            (delegation_id, origin_session, state, dispatched_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("delegation-dispatched", "sess-1", "dispatched", now, now),
+    )
+    db._conn.commit()
+    snap = evaluate_idle(idle_minutes=8, db_path=db_path, now=now)
+    assert snap.idle is False
+    assert any(b.code == "live_delegation" for b in snap.blockers)
+
+
 def test_running_delegation_blocks(db_path):
     db = SessionDB(db_path=db_path)
     now = time.time()
@@ -149,6 +166,38 @@ def test_terminal_delegation_state_does_not_block(db_path):
         VALUES (?, ?, ?, ?, ?)
         """,
         ("delegation-done", "sess-1", "completed", now, now),
+    )
+    db._conn.commit()
+    snap = evaluate_idle(idle_minutes=8, db_path=db_path, now=now)
+    assert snap.idle is True
+
+
+def test_error_delegation_state_does_not_block(db_path):
+    db = SessionDB(db_path=db_path)
+    now = time.time()
+    db._conn.execute(
+        """
+        INSERT INTO async_delegations
+            (delegation_id, origin_session, state, dispatched_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("delegation-error", "sess-1", "error", now, now),
+    )
+    db._conn.commit()
+    snap = evaluate_idle(idle_minutes=8, db_path=db_path, now=now)
+    assert snap.idle is True
+
+
+def test_unknown_delegation_state_does_not_block(db_path):
+    db = SessionDB(db_path=db_path)
+    now = time.time()
+    db._conn.execute(
+        """
+        INSERT INTO async_delegations
+            (delegation_id, origin_session, state, dispatched_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("delegation-unknown", "sess-1", "unknown", now, now),
     )
     db._conn.commit()
     snap = evaluate_idle(idle_minutes=8, db_path=db_path, now=now)

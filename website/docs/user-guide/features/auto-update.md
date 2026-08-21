@@ -70,7 +70,7 @@ Signals:
 - recent message activity inside the configured idle window
 - active compression locks
 - live session turn leases (`session_turn_leases.expires_at > now`)
-- live delegated agents (`async_delegations.state IN ('running','finalizing')`)
+- live delegated agents (`async_delegations.state IN ('dispatched','running','finalizing')`)
 
 Missing or unreadable `state.db` fails **closed** as a quiet deferral. Lock contention or an in-flight manual update (`read_live_update`) also defer quietly.
 

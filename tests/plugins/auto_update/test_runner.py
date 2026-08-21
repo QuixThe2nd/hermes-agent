@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import subprocess
+import time
 
 import pytest
 
 from hermes_cli.update_lock import UpdateHolder
+from hermes_state import SessionDB
 from plugins.auto_update.idle import IdleBlocker, IdleSnapshot
 from plugins.auto_update.runner import (
     UPDATE_APPLY_ARGV,
@@ -324,6 +326,104 @@ def test_runner_live_turn_lease_defers_without_updater(home, monkeypatch):
     assert outcome.code == 0
     assert outcome.reason.startswith("not_idle")
     assert sentinel.read_bytes() == b"UNCHANGED"
+
+
+def test_runner_dispatched_delegation_defers_with_real_evaluator(home, monkeypatch):
+    monkeypatch.setattr(
+        "plugins.auto_update.runner.plugin_explicitly_disabled", lambda: False
+    )
+    monkeypatch.setattr(
+        "plugins.auto_update.runner.load_auto_update_config",
+        lambda: {"enabled": True, "idle_minutes": 8, "notify_on_success": "", "notify_on_failure": ""},
+    )
+    monkeypatch.setattr("plugins.auto_update.runner.read_live_update", lambda: None)
+    sentinel = home / "auto-update" / "sentinel.bin"
+    sentinel.parent.mkdir(parents=True, exist_ok=True)
+    sentinel.write_bytes(b"UNCHANGED")
+
+    db_path = home / "state.db"
+    db = SessionDB(db_path=db_path)
+    now = time.time()
+    db._conn.execute(
+        """
+        INSERT INTO async_delegations
+            (delegation_id, origin_session, state, dispatched_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("delegation-dispatched", "sess-1", "dispatched", now, now),
+    )
+    db._conn.commit()
+    row_before = db._conn.execute(
+        """
+        SELECT delegation_id, origin_session, state, dispatched_at, updated_at
+        FROM async_delegations
+        WHERE delegation_id = ?
+        """,
+        ("delegation-dispatched",),
+    ).fetchone()
+    user_version_before = db._conn.execute("PRAGMA user_version").fetchone()[0]
+
+    outcome = run_scheduled_update(
+        run_cmd=lambda argv: pytest.fail("must not invoke updater"),
+    )
+    assert outcome.code == 0
+    assert outcome.reason == "not_idle:live_delegation"
+    assert sentinel.read_bytes() == b"UNCHANGED"
+
+    row_after = db._conn.execute(
+        """
+        SELECT delegation_id, origin_session, state, dispatched_at, updated_at
+        FROM async_delegations
+        WHERE delegation_id = ?
+        """,
+        ("delegation-dispatched",),
+    ).fetchone()
+    user_version_after = db._conn.execute("PRAGMA user_version").fetchone()[0]
+    assert row_after == row_before
+    assert row_after[2] == "dispatched"
+    assert user_version_after == user_version_before
+
+
+def test_runner_dispatched_delegation_pre_apply_recheck_defer(home, monkeypatch):
+    monkeypatch.setattr(
+        "plugins.auto_update.runner.plugin_explicitly_disabled", lambda: False
+    )
+    monkeypatch.setattr(
+        "plugins.auto_update.runner.load_auto_update_config",
+        lambda: {"enabled": True, "idle_minutes": 8, "notify_on_success": "", "notify_on_failure": ""},
+    )
+    monkeypatch.setattr("plugins.auto_update.runner.read_live_update", lambda: None)
+
+    db_path = home / "state.db"
+    SessionDB(db_path=db_path)
+    now = time.time()
+    updater_calls: list[str] = []
+
+    def run_cmd(argv):
+        updater_calls.append(argv[-1])
+        if argv[-1] == "--yes":
+            pytest.fail("must not invoke apply")
+        db = SessionDB(db_path=db_path)
+        db._conn.execute(
+            """
+            INSERT INTO async_delegations
+                (delegation_id, origin_session, state, dispatched_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            ("delegation-dispatched-mid", "sess-1", "dispatched", now, now),
+        )
+        db._conn.commit()
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout="⚕ Update available: 1 commit behind origin/main.\n",
+            stderr="",
+        )
+
+    outcome = run_scheduled_update(run_cmd=run_cmd)
+    assert outcome.code == 0
+    assert outcome.reason == "not_idle_before_apply:live_delegation"
+    assert updater_calls == ["--check"]
 
 
 def test_runner_live_delegation_defers_without_updater(home, monkeypatch):

@@ -145,7 +145,7 @@ def _has_live_delegation(conn: sqlite3.Connection) -> bool:
         """
         SELECT 1
         FROM async_delegations
-        WHERE state IN ('running', 'finalizing')
+        WHERE state IN ('dispatched', 'running', 'finalizing')
         LIMIT 1
         """
     ).fetchone()
