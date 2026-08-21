@@ -1242,7 +1242,6 @@ def plan_position_moves(
     entries: Sequence[Tuple[str, str, int]],
     guild_channels: Sequence[Mapping[str, Any]],
 ) -> List[dict]:
-    ordered = sorted(entries, key=lambda item: item[2])
     channel_ids = {cid for _, cid, _ in entries}
     positions: Dict[str, Any] = {}
     for channel in guild_channels:
@@ -1254,6 +1253,18 @@ def plan_position_moves(
             f"expected {len(entries)} managed voice channels in guild, "
             f"found {len(positions)}"
         )
+
+    def sort_key(item: Tuple[str, str, Any]) -> Tuple[Any, ...]:
+        _, cid, key = item
+        if isinstance(key, tuple):
+            group, value = key
+        else:
+            group, value = 0, key
+        if group == 0 and value is None:
+            return (0, float("inf"), positions[cid])
+        return (group, value, 0)
+
+    ordered = sorted(entries, key=sort_key)
     slots = sorted(positions.values())
     moves: List[dict] = []
     for (_, cid, _), slot in zip(ordered, slots):
@@ -1391,7 +1402,9 @@ def run_tick(
 
     try:
         if did_quota:
+            token_config = config.get("token_usage")
             entries: List[Tuple[str, str, Any]] = []
+            quota_succeeded = False
             for key, label, channel_id in config["providers"]:
                 try:
                     prov_label, reset_secs, channel_name, rename = run_provider_quota(
@@ -1403,25 +1416,30 @@ def run_tick(
                     else:
                         msg = f"{type(exc).__name__}: {exc}"
                     provider_results[label] = {"error": msg}
+                    if token_config:
+                        entries.append((label, channel_id, (0, None)))
                     continue
+                quota_succeeded = True
                 provider_results[prov_label] = {
                     "remaining": _remaining_from_name(channel_name, prov_label),
                     "reset_seconds": reset_secs,
                     "rename": rename,
                 }
                 entries.append((label, channel_id, (0, reset_secs)))
-            if entries:
-                token_config = config.get("token_usage")
-                if token_config:
-                    for key, tok_label, tok_channel_id in token_config["providers"]:
-                        if tok_channel_id:
-                            entries.append(
-                                (tok_label, tok_channel_id, (1, _PROVIDER_ORDER[key]))
-                            )
+            has_token_channels = False
+            if token_config:
+                for key, tok_label, tok_channel_id in token_config["providers"]:
+                    if tok_channel_id:
+                        has_token_channels = True
+                        entries.append(
+                            (tok_label, tok_channel_id, (1, _PROVIDER_ORDER[key]))
+                        )
+            if entries and (quota_succeeded or has_token_channels):
                 sorted_channels = sort_voice_channels(
                     config, entries, headers, http_fn=http_fn
                 )
-                last = save_state(now_fn=now_fn)
+                if quota_succeeded:
+                    last = save_state(now_fn=now_fn)
 
         category_status = update_category(
             config["category_id"], last, headers, http_fn=http_fn, now_fn=now_fn

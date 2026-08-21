@@ -80,3 +80,40 @@ class TestPlanPositionMoves:
         ]
         managed_ids = {move["id"] for move in moves}
         assert "unmanaged" not in managed_ids
+
+    def test_failed_quota_sentinel_after_success_before_tokens(self):
+        entries = [
+            ("Codex", "q_ok", (0, 7200)),
+            ("Kimi", "q_fail", (0, None)),
+            ("Codex", "t1", (1, 0)),
+        ]
+        guild_channels = [
+            {"id": "q_ok", "position": 10},
+            {"id": "t1", "position": 20},
+            {"id": "q_fail", "position": 30},
+        ]
+        moves = plan_position_moves(entries, guild_channels)
+        assert moves == [
+            {"id": "q_fail", "position": 20},
+            {"id": "t1", "position": 30},
+        ]
+
+    def test_multiple_failed_quota_preserves_relative_order(self):
+        entries = [
+            ("Codex", "q_ok", (0, 3600)),
+            ("Kimi", "q_fail_a", (0, None)),
+            ("z.ai", "q_fail_b", (0, None)),
+            ("Codex", "t1", (1, 0)),
+        ]
+        guild_channels = [
+            {"id": "q_ok", "position": 10},
+            {"id": "t1", "position": 20},
+            {"id": "q_fail_a", "position": 25},
+            {"id": "q_fail_b", "position": 27},
+        ]
+        moves = plan_position_moves(entries, guild_channels)
+        assert moves == [
+            {"id": "q_fail_a", "position": 20},
+            {"id": "q_fail_b", "position": 25},
+            {"id": "t1", "position": 27},
+        ]

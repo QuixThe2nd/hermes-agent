@@ -564,6 +564,178 @@ class TestMergedCategoryOrdering:
         assert move_ids == {"301", "302", "304", "305"}
         assert "999" not in move_ids
 
+    def test_failed_quota_sorted_before_token_channels(self, monkeypatch, tmp_path):
+        """Verifier probe: failed quota at 30, success at 10, token at 20."""
+        _write_tick_credentials(monkeypatch, tmp_path)
+        section = _base_section(
+            enabled_providers=["codex", "kimi"],
+            channel_ids={"codex": "301", "kimi": "302"},
+            token_usage=_token_section(
+                channel_ids={"codex": "401", "kimi": "", "zai": "", "cursor": "", "grok": ""}
+            ),
+        )
+        config = validate_quota_config(section)
+
+        def fake_run_provider(key, channel_id, headers, http_fn=None, now_fn=None):
+            if key == "codex":
+                raise QuotaChannelsError("codex quota fetch failed")
+            return "Kimi", 3600, "Kimi: 80% \u2022 1h left", "renamed"
+
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.run_provider_quota", fake_run_provider
+        )
+        save_calls = []
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.save_state",
+            lambda now_fn=None: save_calls.append(True) or self.LAST_SUCCESS,
+        )
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.load_state",
+            lambda: {"last_quota_success": 0},
+        )
+
+        guild_channels = [
+            {"id": "302", "position": 10},
+            {"id": "401", "position": 20},
+            {"id": "301", "position": 30},
+            {"id": "999", "position": 40},
+        ]
+        position_patches = []
+
+        def fake_http(req, timeout=25.0):
+            url = req.full_url
+            method = _request_method(req)
+            if "profiles/me" in url:
+                body = json.dumps(
+                    {
+                        "stats": {
+                            "daily_usage_buckets": [
+                                {"start_date": "2026-08-21", "tokens": 1000}
+                            ]
+                        }
+                    }
+                ).encode()
+                return 200, body
+            if "model-usage" in url:
+                body = json.dumps(
+                    {
+                        "code": 200,
+                        "data": {"totalUsage": {"totalTokensUsage": 5000}},
+                    }
+                ).encode()
+                return 200, body
+            if method == "GET" and url.endswith("/guilds/100/channels"):
+                return 200, json.dumps(guild_channels).encode()
+            if "discord.com" in url and method == "GET":
+                return 200, json.dumps({"name": "old-name"}).encode()
+            if method == "PATCH" and url.endswith("/guilds/100/channels"):
+                position_patches.append(json.loads(req.data.decode()))
+                return 204, b""
+            if method == "PATCH":
+                return 200, json.dumps({"name": "patched"}).encode()
+            raise AssertionError((method, url))
+
+        result = run_tick(
+            config,
+            force=True,
+            sleep_fn=lambda _: None,
+            http_fn=fake_http,
+            now_fn=lambda: self.FIXED_NOW,
+        )
+
+        assert result["success"] is True
+        assert "codex quota fetch failed" in result["providers"]["Codex"]["error"]
+        assert result["providers"]["Kimi"]["remaining"] == 80
+        assert save_calls == [True]
+        assert position_patches == [
+            [
+                {"id": "301", "position": 20},
+                {"id": "401", "position": 30},
+            ]
+        ]
+        move_ids = {move["id"] for patch in position_patches for move in patch}
+        assert move_ids == {"301", "401"}
+        assert "999" not in move_ids
+
+    def test_multiple_failed_quota_preserve_order_in_tick(self, monkeypatch, tmp_path):
+        _write_tick_credentials(monkeypatch, tmp_path)
+        section = _base_section(
+            enabled_providers=["codex", "kimi", "zai"],
+            channel_ids={"codex": "301", "kimi": "302", "zai": "303"},
+            token_usage=_token_section(
+                channel_ids={
+                    "codex": "401",
+                    "kimi": "",
+                    "zai": "",
+                    "cursor": "",
+                    "grok": "",
+                }
+            ),
+        )
+        config = validate_quota_config(section)
+
+        def fake_run_provider(key, channel_id, headers, http_fn=None, now_fn=None):
+            if key == "codex":
+                return "Codex", 3600, "Codex: 90% \u2022 1h left", "renamed"
+            raise QuotaChannelsError(f"{key} quota fetch failed")
+
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.run_provider_quota", fake_run_provider
+        )
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.save_state",
+            lambda now_fn=None: self.LAST_SUCCESS,
+        )
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.load_state",
+            lambda: {"last_quota_success": 0},
+        )
+
+        guild_channels = [
+            {"id": "301", "position": 10},
+            {"id": "401", "position": 20},
+            {"id": "302", "position": 25},
+            {"id": "303", "position": 27},
+        ]
+        position_patches = []
+
+        def fake_http(req, timeout=25.0):
+            url = req.full_url
+            method = _request_method(req)
+            if "profiles/me" in url:
+                return 200, json.dumps({"stats": {"daily_usage_buckets": []}}).encode()
+            if "model-usage" in url:
+                return 200, json.dumps(
+                    {"code": 200, "data": {"totalUsage": {"totalTokensUsage": 0}}}
+                ).encode()
+            if method == "GET" and url.endswith("/guilds/100/channels"):
+                return 200, json.dumps(guild_channels).encode()
+            if "discord.com" in url and method == "GET":
+                return 200, json.dumps({"name": "old-name"}).encode()
+            if method == "PATCH" and url.endswith("/guilds/100/channels"):
+                position_patches.append(json.loads(req.data.decode()))
+                return 204, b""
+            if method == "PATCH":
+                return 200, json.dumps({"name": "patched"}).encode()
+            raise AssertionError((method, url))
+
+        result = run_tick(
+            config,
+            force=True,
+            sleep_fn=lambda _: None,
+            http_fn=fake_http,
+            now_fn=lambda: self.FIXED_NOW,
+        )
+
+        assert result["success"] is True
+        assert position_patches == [
+            [
+                {"id": "302", "position": 20},
+                {"id": "303", "position": 25},
+                {"id": "401", "position": 27},
+            ]
+        ]
+
 
 class TestFormatting:
     @pytest.mark.parametrize(
