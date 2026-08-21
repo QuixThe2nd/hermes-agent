@@ -178,4 +178,3 @@ class FakeCursorCloud:
         monkeypatch.setattr(cursor_agent_tool, "create_agent_with_timeout_dedupe", _create_agent_with_timeout_dedupe)
         monkeypatch.setattr(cursor_agent_tool, "poll_cloud_run", _poll_cloud_run)
         monkeypatch.setattr(cursor_agent_tool, "_http_request", _http_request)
-
