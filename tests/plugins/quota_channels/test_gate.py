@@ -7,6 +7,7 @@ import json
 import pytest
 
 from plugins.quota_channels.core import (
+    QuotaChannelsError,
     quota_due,
     run_tick,
     save_state,
@@ -158,3 +159,84 @@ class TestRunTickGate:
         )
         run_tick(config, force=False, sleep_fn=lambda s: slept.append(s), now_fn=lambda: 1_000_000_000.0)
         assert slept == []
+
+    def test_mixed_provider_failure_isolation(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        config = validate_quota_config(
+            {
+                "guild_id": "guild",
+                "category_id": "cat",
+                "channel_ids": {"codex": "ch1", "kimi": "ch2"},
+                "enabled_providers": ["codex", "kimi"],
+            }
+        )
+
+        def fake_run_provider(key, channel_id, headers, http_fn=None, now_fn=None):
+            if key == "codex":
+                return "Codex", 2, "Codex: 50% \u2022 2d left", "renamed"
+            raise QuotaChannelsError("kimi boom")
+
+        sort_entries = []
+
+        def fake_sort(cfg, entries, headers, http_fn=None):
+            sort_entries.extend(entries)
+            return False
+
+        save_calls = []
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.run_provider_quota", fake_run_provider
+        )
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.sort_voice_channels", fake_sort
+        )
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.update_category", lambda *a, **k: "renamed"
+        )
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.discord_headers", lambda: {"Authorization": "Bot x"}
+        )
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.save_state",
+            lambda now_fn=None: save_calls.append(True) or 123,
+        )
+
+        result = run_tick(config, force=True, sleep_fn=lambda _: None)
+        assert result["success"] is True
+        assert result["providers"]["Codex"]["remaining"] == 50
+        assert "kimi boom" in result["providers"]["Kimi"]["error"]
+        assert save_calls == [True]
+        assert len(sort_entries) == 1
+        assert sort_entries[0][0] == "Codex"
+
+    def test_all_providers_fail_skips_state_and_sort(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        def fake_run_provider(*args, **kwargs):
+            raise QuotaChannelsError("solo boom")
+
+        sort_called = []
+        save_called = []
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.run_provider_quota", fake_run_provider
+        )
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.sort_voice_channels",
+            lambda *a, **k: sort_called.append(True) or False,
+        )
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.update_category", lambda *a, **k: "renamed"
+        )
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.discord_headers", lambda: {"Authorization": "Bot x"}
+        )
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.save_state",
+            lambda now_fn=None: save_called.append(True) or 123,
+        )
+
+        result = run_tick(_minimal_config(), force=True, sleep_fn=lambda _: None)
+        assert result["success"] is True
+        assert "solo boom" in result["providers"]["Codex"]["error"]
+        assert save_called == []
+        assert sort_called == []
+        assert result["sorted"] is False

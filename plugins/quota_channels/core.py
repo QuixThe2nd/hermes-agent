@@ -396,21 +396,31 @@ def parse_grok_usage(
         if config is None:
             raise QuotaChannelsError("grok: no config message in billing response")
 
-        used_pct = None
+        ratio_present = False
+        used_pct = 0.0
         period_end = 0
+        usage_period_type = None
         for field, wire, val in pb_fields(config):
             if field == 1 and wire == 5:
+                ratio_present = True
                 used_pct = struct.unpack("<f", val.to_bytes(4, "little"))[0]
             elif field == 5 and wire == 2:
                 for tfield, twire, tval in pb_fields(val):
                     if tfield == 1 and twire == 0:
                         period_end = tval
-        if used_pct is None:
-            raise QuotaChannelsError("grok: no credit_usage_percent in billing config")
-
-        remaining = round(100 - used_pct)
+            elif field == 8 and wire == 2:
+                for sfield, swire, sval in pb_fields(val):
+                    if sfield == 1 and swire == 0:
+                        usage_period_type = sval
         reset_secs = max(0.0, period_end - now_fn())
-        return remaining, reset_secs
+        if ratio_present:
+            remaining = round(100 - used_pct)
+            return remaining, reset_secs
+        if usage_period_type in (1, 2) and period_end > 0:
+            return 100, reset_secs
+        raise QuotaChannelsError(
+            "grok: no usage percentage or reset timestamp in billing config"
+        )
     except QuotaChannelsError:
         raise
     except (IndexError, struct.error, ValueError, TypeError, KeyError) as exc:
@@ -991,19 +1001,28 @@ def run_tick(
     if did_quota:
         entries: List[Tuple[str, str, float]] = []
         for key, label, channel_id in config["providers"]:
-            prov_label, reset_secs, channel_name, rename = run_provider_quota(
-                key, channel_id, headers, http_fn=http_fn, now_fn=now_fn
-            )
+            try:
+                prov_label, reset_secs, channel_name, rename = run_provider_quota(
+                    key, channel_id, headers, http_fn=http_fn, now_fn=now_fn
+                )
+            except Exception as exc:
+                if isinstance(exc, QuotaChannelsError):
+                    msg = str(exc)
+                else:
+                    msg = f"{type(exc).__name__}: {exc}"
+                provider_results[label] = {"error": msg}
+                continue
             provider_results[prov_label] = {
                 "remaining": _remaining_from_name(channel_name, prov_label),
                 "reset_seconds": reset_secs,
                 "rename": rename,
             }
             entries.append((label, channel_id, reset_secs))
-        sorted_channels = sort_voice_channels(
-            config, entries, headers, http_fn=http_fn
-        )
-        last = save_state(now_fn=now_fn)
+        if entries:
+            sorted_channels = sort_voice_channels(
+                config, entries, headers, http_fn=http_fn
+            )
+            last = save_state(now_fn=now_fn)
 
     category_status = update_category(
         config["category_id"], last, headers, http_fn=http_fn, now_fn=now_fn

@@ -86,3 +86,7 @@ When the `quota_channels` toolset is enabled, the model may call:
 - **`quota_channels_tick`** — one tick; optional `force: true` bypasses the quota gate.
 
 Returns compact JSON, e.g. `{"success":true,"did_quota":true,"providers":{...},"category":"renamed","sorted":false}`.
+
+When Grok's billing config omits the usage ratio (proto3 default 0) and carries a valid current usage-period marker (config field 8 type 1 or 2) with a valid reset timestamp, the Grok voice channel is renamed to `Grok: 100% • Nd left`. If the ratio is absent without that evidence, the provider fails honestly with an error instead of fabricating a percentage.
+
+Per-provider failures are isolated: a failing provider appears as `{"error": "..."}` under `providers` in debug JSON and does not block other providers. If every provider fails on a quota run, state is not advanced and channel sorting is skipped.

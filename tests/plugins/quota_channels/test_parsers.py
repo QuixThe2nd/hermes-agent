@@ -11,6 +11,7 @@ import pytest
 
 from plugins.quota_channels.core import (
     QuotaChannelsError,
+    _remaining_from_name,
     fetch_codex_usage,
     fetch_cursor_usage,
     fetch_grok_usage,
@@ -69,6 +70,53 @@ def _pb_varint_field(field: int, value: int) -> bytes:
 def _build_grok_grpc_body(used_pct: float, period_end: int) -> bytes:
     timestamp = _pb_varint_field(1, period_end)
     config = _pb_float32(1, used_pct) + _pb_length_delimited(5, timestamp)
+    message = _pb_length_delimited(1, config)
+    return b"\x00" + len(message).to_bytes(4, "big") + message
+
+
+def _build_grok_timestamp_message(epoch_seconds: int, nanos: int = 278414000) -> bytes:
+    return _pb_varint_field(1, epoch_seconds) + _pb_varint_field(2, nanos)
+
+
+def _build_grok_current_config(
+    period_start: int,
+    period_end: int,
+    *,
+    period_type: int = 2,
+    include_field8: bool = True,
+    include_period_end: bool = True,
+) -> bytes:
+    ts_start = _build_grok_timestamp_message(period_start)
+    ts_end = _build_grok_timestamp_message(period_end)
+    config = (
+        _pb_length_delimited(2, b"")
+        + _pb_length_delimited(3, b"")
+        + _pb_length_delimited(4, ts_start)
+    )
+    if include_period_end:
+        config += _pb_length_delimited(5, ts_end)
+    if include_field8:
+        summary = (
+            _pb_varint_field(1, period_type)
+            + _pb_length_delimited(2, ts_start)
+            + _pb_length_delimited(3, ts_end)
+        )
+        config += _pb_length_delimited(8, summary)
+    config += (
+        _pb_varint_field(11, 1)
+        + _pb_length_delimited(12, b"")
+        + _pb_varint_field(13, 1)
+    )
+    return config
+
+
+def _build_grok_current_grpc_body(period_start: int, period_end: int) -> bytes:
+    config = _build_grok_current_config(period_start, period_end)
+    message = _pb_length_delimited(1, config)
+    return b"\x00" + len(message).to_bytes(4, "big") + message
+
+
+def _wrap_grok_config(config: bytes) -> bytes:
     message = _pb_length_delimited(1, config)
     return b"\x00" + len(message).to_bytes(4, "big") + message
 
@@ -198,6 +246,103 @@ class TestParseGrokUsage:
         assert remaining == 76
         assert reset_secs == 86400 * 4
         assert format_grok_name(remaining, reset_secs) == "Grok: 76% \u2022 4d left"
+
+    def test_current_payload_omitted_ratio_defaults_to_zero_used(self):
+        period_end = int(datetime(2026, 8, 30, tzinfo=timezone.utc).timestamp())
+        period_start = period_end - 86400 * 7
+        body = _build_grok_current_grpc_body(period_start, period_end)
+        now = period_end - 86400 * 4
+        remaining, reset_secs = parse_grok_usage(body, now_fn=lambda: now)
+        assert remaining == 100
+        assert reset_secs == 86400 * 4
+        assert format_grok_name(remaining, reset_secs) == "Grok: 100% \u2022 4d left"
+
+    def test_current_payload_period_type_one_defaults_to_zero_used(self):
+        period_end = int(datetime(2026, 8, 30, tzinfo=timezone.utc).timestamp())
+        period_start = period_end - 86400 * 7
+        config = _build_grok_current_config(period_start, period_end, period_type=1)
+        body = _wrap_grok_config(config)
+        now = period_end - 86400 * 2
+        remaining, reset_secs = parse_grok_usage(body, now_fn=lambda: now)
+        assert remaining == 100
+        assert reset_secs == 86400 * 2
+
+    def test_current_payload_provider_integration(self, monkeypatch, tmp_path):
+        auth = tmp_path / "auth.json"
+        auth.write_text(
+            json.dumps(
+                {
+                    "providers": {
+                        "xai-oauth": {
+                            "tokens": {"access_token": "grok-tok", "refresh_token": "grok-ref"}
+                        }
+                    }
+                }
+            )
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        period_end = int(datetime(2026, 8, 28, tzinfo=timezone.utc).timestamp())
+        period_start = period_end - 86400 * 7
+        body = _build_grok_current_grpc_body(period_start, period_end)
+
+        def fake_http(req, timeout=25.0):
+            if "GetGrokCreditsConfig" in req.full_url:
+                return 200, body
+            raise AssertionError(req.full_url)
+
+        name, reset_secs, label = run_grok_provider(
+            http_fn=fake_http, now_fn=lambda: period_end - 86400 * 3
+        )
+        assert label == "Grok"
+        assert name == "Grok: 100% \u2022 3d left"
+        assert reset_secs == 86400 * 3
+
+    def test_remaining_from_name_grok_percent(self):
+        assert _remaining_from_name("Grok: 76% \u2022 4d left", "Grok") == 76
+
+    def test_reset_without_field8_marker_raises(self):
+        period_end = int(datetime(2026, 8, 30, tzinfo=timezone.utc).timestamp())
+        period_start = period_end - 86400 * 7
+        config = _build_grok_current_config(
+            period_start, period_end, include_field8=False
+        )
+        body = _wrap_grok_config(config)
+        with pytest.raises(QuotaChannelsError):
+            parse_grok_usage(body, now_fn=lambda: period_end - 86400)
+
+    def test_invalid_field8_period_type_raises(self):
+        period_end = int(datetime(2026, 8, 30, tzinfo=timezone.utc).timestamp())
+        period_start = period_end - 86400 * 7
+        config = _build_grok_current_config(
+            period_start, period_end, period_type=7
+        )
+        body = _wrap_grok_config(config)
+        with pytest.raises(QuotaChannelsError):
+            parse_grok_usage(body, now_fn=lambda: period_end - 86400)
+
+    def test_field8_marker_without_reset_raises(self):
+        period_end = int(datetime(2026, 8, 30, tzinfo=timezone.utc).timestamp())
+        period_start = period_end - 86400 * 7
+        config = _build_grok_current_config(
+            period_start, period_end, include_period_end=False
+        )
+        body = _wrap_grok_config(config)
+        with pytest.raises(QuotaChannelsError):
+            parse_grok_usage(body, now_fn=lambda: period_end - 86400)
+
+    def test_config_without_percent_or_period_end_raises(self):
+        config = (
+            _pb_length_delimited(2, b"")
+            + _pb_length_delimited(3, b"")
+            + _pb_varint_field(11, 1)
+        )
+        message = _pb_length_delimited(1, config)
+        body = b"\x00" + len(message).to_bytes(4, "big") + message
+        with pytest.raises(
+            QuotaChannelsError,
+            match="no usage percentage or reset timestamp",
+        ):
+            parse_grok_usage(body)
 
 
 class TestMockedProviderFetch:
