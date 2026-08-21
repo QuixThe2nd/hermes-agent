@@ -1,17 +1,47 @@
 #!/usr/bin/env python3
-"""Delegate dev tasks to the Cursor Agent CLI as a subprocess.
+"""Delegate dev tasks to a Cursor My Machines Cloud Agent.
 
 Gating
 ------
 The tool registers only when the Cursor Agent CLI binary is available on
-PATH (``agent``) or as an executable at ``~/.local/bin/agent``.
+PATH (``agent``) or as an executable at ``~/.local/bin/agent``. The binary
+is used to start a short-lived My Machines worker for ``workdir``.
 
-Log format
-----------
-Stdout is streamed to ``<HERMES_HOME>/cursor-runs/<timestamp>-<pid>.jsonl``
-as newline-delimited JSON (stream-json). Each line is one event from the
-Cursor Agent run; the handler parses assistant text, delegation records,
-and session metadata from that log after a successful exit.
+Credentials
+-----------
+``CURSOR_API_KEY`` is loaded from
+``Path.home() / ".hermes/secrets/cursor-cloud.env"`` (on this host that is
+``/root/.hermes/secrets/cursor-cloud.env``). Tests inject an alternate path
+by monkeypatching ``CURSOR_CLOUD_ENV_PATH``. The parent Hermes HTTP client
+holds the key. The worker process and its descendants never receive
+``CURSOR_API_KEY`` — they authenticate with the existing Cursor machine login
+already used by local ``agent``. The key is never placed in argv,
+log files, worker env, or the tool result. A missing or empty key fails
+clearly — there is no silent fallback to the local CLI or to
+``os.environ``.
+
+Backend
+-------
+The handler resolves ``workdir``'s ``origin`` remote to a live-verified
+HTTPS GitHub URL (local / ``file://`` / non-GitHub hosts are rejected),
+preflights ``agent status --format json`` in that sanitized env (a missing
+login returns ``Cursor My Machines worker is not authenticated; run agent
+login`` and never suggests putting the API key in worker env/argv), starts
+a unique short-lived
+``agent worker --name … --worker-dir … --idle-release-timeout 0 start``
+for that checkout, POSTs ``/v1/agents`` with ``env.type=machine``, and
+polls the run until a terminal Cloud Agent status. ``force`` does not
+enable pushes or PRs. ``startingRef`` is sent only when that branch exists
+on the origin remote.
+
+Authority and no-push
+---------------------
+Workdir authority matches the existing local executor: a same-user coding
+agent is not a hard sandbox and can reach this user's Git/SSH credentials.
+API ``autoCreatePR: false``, a prompt-level no-push instruction, and
+process-local Git overrides are defense-in-depth only. Operators must use
+isolated scratch clones or worktrees for protected repos. The caller's
+``.git/config`` is not rewritten.
 """
 
 from __future__ import annotations
@@ -19,16 +49,23 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
+import sys
+import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
-from tools.agent_cli_runner import run_agent_cli
+from tools.agent_cli_runner import _terminate_process, run_agent_cli
+from tools.environments.local import build_subprocess_env
 from tools.registry import registry
+from tools.tool_status import emit_tool_status
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -37,6 +74,47 @@ DEFAULT_TIMEOUT_SECONDS = 0  # 0 = no wall-clock limit; stall watchdog still app
 MIN_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 1800
 STALL_WATCHDOG_SECONDS = 600
+
+CURSOR_API_BASE = "https://api.cursor.com"
+CURSOR_CLOUD_ENV_PATH = Path.home() / ".hermes" / "secrets" / "cursor-cloud.env"
+SUPPORTED_ORIGIN_HOSTS = frozenset({"github.com"})
+NO_PUSH_PROMPT_PREFIX = (
+    "Do not git push, create a pull request, or request reviewers. "
+    "Keep all changes local to this machine checkout.\n\n"
+)
+POST_TIMEOUT_SECONDS = 30.0
+HTTP_TIMEOUT_SECONDS = 30.0
+POLL_INTERVAL_SECONDS = 2.0
+WORKER_LOG_MAX_BYTES = 256 * 1024
+WORKER_READY_ATTEMPTS = 5
+WORKER_READY_DELAY_SECONDS = 0.5
+WORKER_IDLE_RELEASE_TIMEOUT = "0"
+WORKER_STATUS_TIMEOUT_SECONDS = 15.0
+WORKER_AUTH_ERROR = (
+    "Cursor My Machines worker is not authenticated; run agent login"
+)
+NO_PUSH_PUSHURL = "disabled://hermes-no-push"
+TERMINAL_RUN_STATUSES = frozenset({"FINISHED", "ERROR", "CANCELLED", "EXPIRED"})
+_NO_PUSH_ENV_KEYS = frozenset({
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITLAB_TOKEN",
+    "GL_TOKEN",
+    "GITLAB_PRIVATE_TOKEN",
+    "BITBUCKET_TOKEN",
+    "BITBUCKET_USERNAME",
+    "BITBUCKET_APP_PASSWORD",
+    "AZURE_DEVOPS_EXT_PAT",
+    "SYSTEM_ACCESSTOKEN",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    "SSH_AUTH_SOCK",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_CREDENTIAL_HELPER",
+    "GIT_CONFIG_PARAMETERS",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +391,739 @@ def parse_cursor_agent_log(log_text: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Cloud Agent: secrets, origin, worker, HTTP
+# ---------------------------------------------------------------------------
+
+
+class CursorCloudError(Exception):
+    """User-visible Cloud Agent failure that is safe to put in the tool result."""
+
+
+class CursorApiKeyError(CursorCloudError):
+    """CURSOR_API_KEY is missing or empty. No silent fallback."""
+
+
+class UnsupportedOriginError(CursorCloudError):
+    """workdir origin cannot be used as a Cloud Agent repo URL."""
+
+
+def _redact_secret(text: str, secret: Optional[str]) -> str:
+    if not text or not secret:
+        return text
+    return text.replace(secret, "***")
+
+
+def load_cursor_api_key(path: Optional[Path] = None) -> str:
+    """Load ``CURSOR_API_KEY`` from the Cursor Cloud secrets file.
+
+    Does not consult ``os.environ``. Missing file / missing / empty key
+    raises :class:`CursorApiKeyError`. The value is never logged.
+    """
+    env_path = Path(path) if path is not None else CURSOR_CLOUD_ENV_PATH
+    if not env_path.is_file():
+        raise CursorApiKeyError(
+            f"CURSOR_API_KEY is missing. Create {env_path} containing "
+            "CURSOR_API_KEY=<key> (no silent fallback)."
+        )
+    try:
+        raw_text = env_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise CursorApiKeyError(
+            f"CURSOR_API_KEY could not be read from {env_path}"
+        ) from exc
+
+    key: Optional[str] = None
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[len("export ") :].strip()
+        if not stripped.startswith("CURSOR_API_KEY="):
+            continue
+        raw = stripped.split("=", 1)[1].strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
+            raw = raw[1:-1]
+        key = raw.strip()
+        break
+
+    if not key:
+        raise CursorApiKeyError(
+            f"CURSOR_API_KEY is missing or empty in {env_path} "
+            "(no silent fallback)."
+        )
+    return key
+
+
+def _https_github_repo_url(host: str, path: str) -> str:
+    host = (host or "").strip().lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host not in SUPPORTED_ORIGIN_HOSTS:
+        raise UnsupportedOriginError(
+            f"unsupported git host {host!r}; only HTTPS GitHub origins are supported"
+        )
+    parts = [part for part in path.strip("/").split("/") if part]
+    if len(parts) < 2:
+        raise UnsupportedOriginError("git origin is not owner/repo")
+    owner, repo = parts[0], parts[1]
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    if not owner or not repo:
+        raise UnsupportedOriginError("git origin is not owner/repo")
+    return f"https://{host}/{owner}/{repo}"
+
+
+def normalize_git_origin(raw: str) -> str:
+    """Normalize a git remote URL to a live-verified HTTPS GitHub repo URL.
+
+    Rejects local paths, ``file://`` origins, and non-GitHub hosts.
+    Cursor v1 create accepts GitHub repo URLs; other hosts are not claimed.
+    """
+    value = (raw or "").strip()
+    if not value:
+        raise UnsupportedOriginError("git origin is empty")
+
+    lowered = value.lower()
+    if lowered.startswith("file:") or lowered.startswith("file://"):
+        raise UnsupportedOriginError("local file:// origins are not supported")
+    if re.match(r"^[A-Za-z]:[\\/]", value):
+        raise UnsupportedOriginError("local path origins are not supported")
+    if value.startswith("/") or value.startswith("./") or value.startswith("../"):
+        raise UnsupportedOriginError("local path origins are not supported")
+    if value in {".", ".."}:
+        raise UnsupportedOriginError("local path origins are not supported")
+
+    if "://" not in value:
+        scp = re.match(r"^(?:[^@/\s]+@)?([^:/\s]+):(.+)$", value)
+        if not scp:
+            raise UnsupportedOriginError("git origin is not a supported HTTPS repo URL")
+        return _https_github_repo_url(scp.group(1), scp.group(2))
+
+    parsed = urlparse(value)
+    scheme = (parsed.scheme or "").lower()
+    if scheme == "file":
+        raise UnsupportedOriginError("local file:// origins are not supported")
+    if scheme not in {"https", "http", "ssh", "git"}:
+        raise UnsupportedOriginError(
+            f"unsupported git origin scheme {scheme!r}; only HTTPS GitHub origins are supported"
+        )
+    host = parsed.hostname or ""
+    if not host:
+        raise UnsupportedOriginError("git origin is missing a hostname")
+    return _https_github_repo_url(host, parsed.path)
+
+
+def resolve_workdir_origin(workdir: str) -> str:
+    """Read ``origin`` from ``workdir`` and normalize it to HTTPS GitHub."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", workdir, "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise UnsupportedOriginError("could not read git origin from workdir") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"
+        raise UnsupportedOriginError(f"workdir has no usable git origin: {detail}")
+    return normalize_git_origin(proc.stdout.strip())
+
+
+def _remote_has_branch(workdir: str, ref: str, remote: str = "origin") -> bool:
+    """Return True when *ref* exists as a branch on *remote* (live ls-remote)."""
+    if not ref or ref == "HEAD" or "/" in remote:
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "-C", workdir, "ls-remote", "--heads", remote, f"refs/heads/{ref}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if proc.returncode != 0:
+        return False
+    expected = f"refs/heads/{ref}"
+    for line in (proc.stdout or "").splitlines():
+        # ls-remote: "<sha>\trefs/heads/<name>"
+        parts = line.split("\t", 1)
+        if len(parts) == 2 and parts[1].strip() == expected:
+            return True
+    return False
+
+
+def resolve_workdir_starting_ref(workdir: str) -> Optional[str]:
+    """Return HEAD's branch name only when that branch exists on origin.
+
+    Local-only branches are omitted: Cloud Agents reject a ``startingRef``
+    that is not present on the remote (HTTP 400).
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", workdir, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    ref = (proc.stdout or "").strip()
+    if not ref or ref == "HEAD":
+        return None
+    if not _remote_has_branch(workdir, ref):
+        return None
+    return ref
+
+
+def new_machine_name() -> str:
+    return f"hermes-{uuid.uuid4().hex[:12]}"
+
+
+def new_agent_id() -> str:
+    return f"bc-{uuid.uuid4()}"
+
+
+def build_worker_command(binary: str, name: str, workdir: str) -> List[str]:
+    """Argv for a short-lived My Machines worker. Never includes the API key.
+
+    Cursor CLI requires worker options *before* the subcommand:
+    ``agent worker --name … --worker-dir … --idle-release-timeout … start``.
+    """
+    return [
+        binary,
+        "worker",
+        "--name",
+        name,
+        "--worker-dir",
+        workdir,
+        "--idle-release-timeout",
+        WORKER_IDLE_RELEASE_TIMEOUT,
+        "start",
+    ]
+
+
+def apply_worker_no_push_env(env: Dict[str, str]) -> Dict[str, str]:
+    """Defense-in-depth Git overrides for the worker process only.
+
+    Uses ``GIT_CONFIG_*`` env overrides so the caller's ``.git/config`` is not
+    written. This is not a sandbox: a same-user agent can still reach this
+    user's Git/SSH credentials, matching the existing local executor.
+    """
+    for key in list(env):
+        if key.upper() in _NO_PUSH_ENV_KEYS:
+            env.pop(key, None)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "never"
+    extras = (
+        ("remote.origin.pushurl", NO_PUSH_PUSHURL),
+        ("credential.helper", ""),
+    )
+    try:
+        count = int(env.get("GIT_CONFIG_COUNT") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    if count < 0:
+        count = 0
+    for offset, (config_key, config_value) in enumerate(extras):
+        env[f"GIT_CONFIG_KEY_{count + offset}"] = config_key
+        env[f"GIT_CONFIG_VALUE_{count + offset}"] = config_value
+    env["GIT_CONFIG_COUNT"] = str(count + len(extras))
+    return env
+
+
+def build_worker_env() -> Dict[str, str]:
+    """Sanitized worker env. Never includes ``CURSOR_API_KEY``.
+
+    The worker authenticates with the existing Cursor machine login used by
+    local ``agent``. Git overrides are defense-in-depth, not containment.
+    """
+    env = build_subprocess_env(scrub_secrets=True)
+    if not env.get("HOME"):
+        env["HOME"] = str(Path.home())
+    local_bin = str(Path.home() / ".local" / "bin")
+    env["PATH"] = local_bin + os.pathsep + env.get("PATH", "")
+    env = apply_worker_no_push_env(env)
+    env.pop("CURSOR_API_KEY", None)
+    return env
+
+
+def worker_env_contains_cursor_api_key(env: Optional[Dict[str, str]] = None) -> bool:
+    """Spawn a real child with *env* and report whether ``CURSOR_API_KEY`` is set.
+
+    Used by tests to prove the worker environment cannot see the parent key.
+    """
+    probe_env = dict(env if env is not None else build_worker_env())
+    script = (
+        "import os, sys\n"
+        "sys.stdout.write('present' if os.environ.get('CURSOR_API_KEY') else 'absent')\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        env=probe_env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    return proc.stdout.strip() == "present"
+
+
+def diagnose_agent_status(
+    returncode: int,
+    stdout: str,
+    stderr: str = "",
+) -> Optional[str]:
+    """Return the allowlisted auth error, or ``None`` if authenticated.
+
+    Never includes raw CLI output, API-key advice, or status payload fields.
+    """
+    del stderr  # inspected only for presence; never copied into errors
+    if returncode != 0:
+        return WORKER_AUTH_ERROR
+    text = (stdout or "").strip()
+    if not text:
+        return WORKER_AUTH_ERROR
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return WORKER_AUTH_ERROR
+    if not isinstance(payload, dict):
+        return WORKER_AUTH_ERROR
+    flag = payload.get("isAuthenticated")
+    status = str(payload.get("status") or "").strip().lower()
+    if flag is True or status == "authenticated":
+        return None
+    return WORKER_AUTH_ERROR
+
+
+def preflight_worker_auth(binary: str, env: Dict[str, str]) -> None:
+    """Require an existing Cursor CLI login before spawning the worker.
+
+    Runs ``agent status --format json`` in the same sanitized worker env.
+    Does not inject ``CURSOR_API_KEY`` and never suggests doing so.
+    """
+    try:
+        proc = subprocess.run(
+            [binary, "status", "--format", "json"],
+            capture_output=True,
+            text=True,
+            timeout=WORKER_STATUS_TIMEOUT_SECONDS,
+            check=False,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError, TimeoutError):
+        raise CursorCloudError(WORKER_AUTH_ERROR)
+    error = diagnose_agent_status(proc.returncode, proc.stdout or "", proc.stderr or "")
+    if error:
+        raise CursorCloudError(error)
+
+
+def build_create_agent_payload(
+    *,
+    task: str,
+    repo_url: str,
+    machine_name: str,
+    agent_id: str,
+    model: Optional[str] = None,
+    starting_ref: Optional[str] = None,
+    force: bool = True,
+) -> Dict[str, Any]:
+    """POST /v1/agents body. ``force`` must not enable pushes or PRs."""
+    del force  # reserved; never maps to autoCreatePR / workOnCurrentBranch / pushes
+    payload: Dict[str, Any] = {
+        "prompt": {"text": f"{NO_PUSH_PROMPT_PREFIX}{task}"},
+        "name": machine_name,
+        "agentId": agent_id,
+        "env": {"type": "machine", "name": machine_name},
+        "repos": [{"url": repo_url}],
+        "autoCreatePR": False,
+        "skipReviewerRequest": True,
+        "workOnCurrentBranch": False,
+    }
+    if starting_ref:
+        payload["repos"][0]["startingRef"] = starting_ref
+    model_name = str(model or "").strip()
+    if model_name:
+        payload["model"] = {"id": model_name}
+    return payload
+
+
+def _emit_progress_notice(message: str) -> bool:
+    """Emit a mid-tool status line through the generic tool-status context.
+
+    Bound on CLI/gateway conversation turns (``invoke_tool`` /
+    ``run_conversation``). Unbound dispatch is a no-op — the exact URL still
+    lands in the tool result. No platform imports and no conversation-message
+    mutation.
+    """
+    return emit_tool_status(message)
+
+
+def _http_request(
+    method: str,
+    path: str,
+    *,
+    api_key: str,
+    json_body: Optional[Dict[str, Any]] = None,
+    timeout: float = HTTP_TIMEOUT_SECONDS,
+    params: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """Authenticated Cloud Agents API call.
+
+    The key is never logged. Failures are raised as fresh exceptions with no
+    ``__cause__`` / ``__context__`` so httpx request/Authorization objects
+    cannot leak through exception chains.
+    """
+    import httpx
+
+    url = f"{CURSOR_API_BASE}{path}"
+    timeout_msg: Optional[str] = None
+    error_msg: Optional[str] = None
+    parsed: Any = None
+    succeeded = False
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            response = client.request(
+                method,
+                url,
+                auth=(api_key, ""),
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+                json=json_body,
+                params=params,
+            )
+            response.raise_for_status()
+            if not response.content:
+                parsed = {}
+            else:
+                parsed = response.json()
+            succeeded = True
+    except httpx.TimeoutException:
+        timeout_msg = f"Cursor Cloud Agent request timed out: {method} {path}"
+    except httpx.HTTPStatusError as exc:
+        status = "?"
+        body = ""
+        try:
+            if exc.response is not None:
+                status = exc.response.status_code
+                body = (exc.response.text or "")[:300]
+        except Exception:
+            body = ""
+        detail = f"HTTP {status}"
+        if body:
+            detail = f"{detail}: {body}"
+        error_msg = _redact_secret(
+            f"Cursor Cloud Agent API error ({method} {path}): {detail}", api_key
+        )
+    except Exception as exc:
+        error_msg = _redact_secret(
+            f"Cursor Cloud Agent API error ({method} {path}): {type(exc).__name__}",
+            api_key,
+        )
+    if succeeded:
+        return parsed
+    if timeout_msg:
+        raise TimeoutError(timeout_msg)
+    raise CursorCloudError(error_msg or f"Cursor Cloud Agent API error ({method} {path})")
+
+
+def extract_progress_url(agent_obj: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(agent_obj, dict):
+        return None
+    url = agent_obj.get("url")
+    if isinstance(url, str) and url.strip():
+        return url.strip()
+    return None
+
+
+def dedupe_created_agent(
+    items: Any,
+    *,
+    agent_id: str,
+    machine_name: str,
+    repo_url: str,
+) -> Optional[Dict[str, Any]]:
+    """Find an agent created by a timed-out POST before retrying."""
+    if not isinstance(items, list):
+        return None
+    repo_normalized = repo_url.rstrip("/").lower()
+    by_id: Optional[Dict[str, Any]] = None
+    by_name: Optional[Dict[str, Any]] = None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("id") or "")
+        if item_id == agent_id:
+            by_id = item
+            break
+        if str(item.get("name") or "") != machine_name:
+            continue
+        env = item.get("env") if isinstance(item.get("env"), dict) else {}
+        if str(env.get("type") or "") != "machine":
+            continue
+        if str(env.get("name") or "") not in {"", machine_name}:
+            continue
+        repos = item.get("repos")
+        if isinstance(repos, list) and repos:
+            first = repos[0] if isinstance(repos[0], dict) else {}
+            item_repo = str(first.get("url") or "").rstrip("/").lower()
+            if item_repo and item_repo != repo_normalized:
+                continue
+        by_name = item
+    return by_id or by_name
+
+
+def create_agent_with_timeout_dedupe(
+    payload: Dict[str, Any],
+    *,
+    api_key: str,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """POST /v1/agents; on timeout, list/dedupe before a single retry."""
+    agent_id = str(payload.get("agentId") or "")
+    machine_name = str(payload.get("name") or "")
+    repos = payload.get("repos") if isinstance(payload.get("repos"), list) else []
+    repo_url = ""
+    if repos and isinstance(repos[0], dict):
+        repo_url = str(repos[0].get("url") or "")
+
+    def _from_create(body: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        if not isinstance(body, dict):
+            raise CursorCloudError("Cursor Cloud Agent create returned a non-object")
+        agent = body.get("agent") if isinstance(body.get("agent"), dict) else None
+        run = body.get("run") if isinstance(body.get("run"), dict) else None
+        if agent is None:
+            raise CursorCloudError("Cursor Cloud Agent create response missing agent")
+        if run is None:
+            run_id = agent.get("latestRunId")
+            if not run_id:
+                raise CursorCloudError("Cursor Cloud Agent create response missing run")
+            run = {"id": run_id, "agentId": agent.get("id"), "status": "CREATING"}
+        return agent, run
+
+    try:
+        return _from_create(
+            _http_request(
+                "POST",
+                "/v1/agents",
+                api_key=api_key,
+                json_body=payload,
+                timeout=POST_TIMEOUT_SECONDS,
+            )
+        )
+    except TimeoutError:
+        logger.info("Cursor Cloud Agent POST timed out; listing agents to dedupe")
+    except CursorCloudError as exc:
+        if "HTTP 409" not in str(exc):
+            raise
+        logger.info("Cursor Cloud Agent POST conflict; listing agents to dedupe")
+
+    listed = _http_request(
+        "GET",
+        "/v1/agents",
+        api_key=api_key,
+        params={"limit": 50, "includeArchived": False},
+        timeout=HTTP_TIMEOUT_SECONDS,
+    )
+    items = listed.get("items") if isinstance(listed, dict) else None
+    found = dedupe_created_agent(
+        items, agent_id=agent_id, machine_name=machine_name, repo_url=repo_url
+    )
+    if found is not None:
+        agent_id_found = str(found.get("id") or agent_id)
+        detail = found
+        if not extract_progress_url(detail) or not detail.get("latestRunId"):
+            try:
+                fetched = _http_request(
+                    "GET",
+                    f"/v1/agents/{agent_id_found}",
+                    api_key=api_key,
+                    timeout=HTTP_TIMEOUT_SECONDS,
+                )
+                if isinstance(fetched, dict):
+                    detail = fetched
+            except CursorCloudError:
+                pass
+        run_id = detail.get("latestRunId")
+        run = {
+            "id": run_id,
+            "agentId": detail.get("id") or agent_id_found,
+            "status": detail.get("status") or "CREATING",
+        }
+        return detail, run
+
+    return _from_create(
+        _http_request(
+            "POST",
+            "/v1/agents",
+            api_key=api_key,
+            json_body=payload,
+            timeout=POST_TIMEOUT_SECONDS,
+        )
+    )
+
+
+def is_terminal_run_status(status: Any) -> bool:
+    return str(status or "").strip().upper() in TERMINAL_RUN_STATUSES
+
+
+def _check_interrupted() -> bool:
+    try:
+        from tools.interrupt import is_interrupted
+
+        return is_interrupted()
+    except Exception:
+        return False
+
+
+def cancel_cloud_run(agent_id: str, run_id: str, api_key: str) -> None:
+    if not agent_id or not run_id:
+        return
+    try:
+        _http_request(
+            "POST",
+            f"/v1/agents/{agent_id}/runs/{run_id}/cancel",
+            api_key=api_key,
+            json_body={},
+            timeout=HTTP_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        logger.debug("Cursor Cloud Agent cancel failed", exc_info=True)
+
+
+def poll_cloud_run(
+    *,
+    agent_id: str,
+    run_id: str,
+    api_key: str,
+    timeout_seconds: int,
+    started_mono: float,
+) -> Dict[str, Any]:
+    """Poll GET /v1/agents/{id}/runs/{runId} until a terminal status."""
+    last: Dict[str, Any] = {"id": run_id, "agentId": agent_id, "status": "CREATING"}
+    while True:
+        if _check_interrupted():
+            cancel_cloud_run(agent_id, run_id, api_key)
+            last["status"] = "CANCELLED"
+            last["_local_error"] = "interrupted"
+            return last
+        if timeout_seconds > 0 and (time.monotonic() - started_mono) >= timeout_seconds:
+            cancel_cloud_run(agent_id, run_id, api_key)
+            last["status"] = last.get("status") or "CANCELLED"
+            last["_local_error"] = "timeout"
+            return last
+
+        try:
+            last = _http_request(
+                "GET",
+                f"/v1/agents/{agent_id}/runs/{run_id}",
+                api_key=api_key,
+                timeout=HTTP_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as exc:
+            raise CursorCloudError(str(exc)) from None
+        if not isinstance(last, dict):
+            raise CursorCloudError("Cursor Cloud Agent poll returned a non-object")
+        status = str(last.get("status") or "").strip().upper()
+        last["status"] = status
+        if is_terminal_run_status(status):
+            return last
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+class MachineWorker:
+    """Unique short-lived My Machines worker with bounded log + pg cleanup."""
+
+    def __init__(
+        self,
+        *,
+        binary: str,
+        name: str,
+        workdir: str,
+        log_path: Path,
+    ) -> None:
+        self.binary = binary
+        self.name = name
+        self.workdir = workdir
+        self.log_path = log_path
+        self.cmd = build_worker_command(binary, name, workdir)
+        self.env = build_worker_env()
+        self.proc: Optional[subprocess.Popen] = None
+        self.pgid: Optional[int] = None
+        self._reader: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        preflight_worker_auth(self.binary, self.env)
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.proc = subprocess.Popen(
+            self.cmd,
+            cwd=self.workdir,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=self.env,
+        )
+        try:
+            getpgid = getattr(os, "getpgid", None)
+            if getpgid is not None:
+                self.pgid = getpgid(self.proc.pid)  # windows-footgun: ok — getattr-gated POSIX pgid
+        except (OSError, ProcessLookupError, AttributeError):
+            self.pgid = None
+        self._reader = threading.Thread(target=self._read_bounded_log, daemon=True)
+        self._reader.start()
+        self._wait_until_ready()
+
+    def _wait_until_ready(self) -> None:
+        for _ in range(max(1, WORKER_READY_ATTEMPTS)):
+            if self.proc is not None and self.proc.poll() is not None:
+                raise CursorCloudError(
+                    f"Cursor My Machines worker exited early with code {self.proc.returncode}"
+                )
+            time.sleep(WORKER_READY_DELAY_SECONDS)
+
+    def _read_bounded_log(self) -> None:
+        assert self.proc is not None and self.proc.stdout is not None
+        written = 0
+        try:
+            with open(self.log_path, "wb") as log_file:
+                while True:
+                    try:
+                        chunk = self.proc.stdout.read1(4096)
+                    except (OSError, ValueError):
+                        break
+                    if not chunk:
+                        break
+                    if written < WORKER_LOG_MAX_BYTES:
+                        take = chunk[: WORKER_LOG_MAX_BYTES - written]
+                        log_file.write(take)
+                        log_file.flush()
+                        written += len(take)
+        finally:
+            try:
+                if self.proc.stdout is not None:
+                    self.proc.stdout.close()
+            except Exception:
+                pass
+
+    def cleanup(self) -> None:
+        if self.proc is None:
+            return
+        try:
+            _terminate_process(self.proc, self.pgid)
+        except Exception:
+            logger.debug("Cursor worker cleanup failed", exc_info=True)
+        if self._reader is not None:
+            self._reader.join(timeout=3.0)
+
+
+# ---------------------------------------------------------------------------
 # Subprocess helpers
 # ---------------------------------------------------------------------------
 
@@ -376,6 +1187,40 @@ def _run_and_stream(
 # Tool implementation
 # ---------------------------------------------------------------------------
 
+def _cloud_result_fields(
+    *,
+    agent: Optional[Dict[str, Any]] = None,
+    run: Optional[Dict[str, Any]] = None,
+    duration_seconds: float = 0.0,
+    log_path: Optional[str] = None,
+    progress_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    agent = agent if isinstance(agent, dict) else {}
+    run = run if isinstance(run, dict) else {}
+    agent_id = agent.get("id") or run.get("agentId")
+    run_id = run.get("id") or agent.get("latestRunId")
+    cloud_status = str(run.get("status") or "").strip().upper() or None
+    url = progress_url or extract_progress_url(agent)
+    final_report = ""
+    result_text = run.get("result")
+    if isinstance(result_text, str):
+        final_report = result_text
+    duration_ms = run.get("durationMs")
+    if isinstance(duration_ms, (int, float)) and duration_ms >= 0:
+        duration_seconds = float(duration_ms) / 1000.0
+    return {
+        "final_report": final_report,
+        "delegations": [],
+        "duration_seconds": round(float(duration_seconds), 3),
+        "session_id": agent_id,
+        "log_path": log_path,
+        "agent_id": agent_id,
+        "run_id": run_id,
+        "cloud_status": cloud_status,
+        "progress_url": url,
+    }
+
+
 def delegate_cursor_agent(
     task: str,
     workdir: str,
@@ -414,96 +1259,156 @@ def delegate_cursor_agent(
             ),
         )
 
+    try:
+        api_key = load_cursor_api_key()
+    except CursorApiKeyError as exc:
+        return _make_result(success=False, error=str(exc))
+
+    try:
+        repo_url = resolve_workdir_origin(str(workdir_path))
+    except UnsupportedOriginError as exc:
+        return _make_result(success=False, error=str(exc))
+
     clamped_timeout = _clamp_timeout_seconds(timeout_seconds)
-    model_name = str(model or "").strip()
     force_enabled = is_truthy_value(force, default=True)
+    model_name = str(model or "").strip() or None
+    starting_ref = resolve_workdir_starting_ref(str(workdir_path))
 
     log_dir = get_hermes_home() / "cursor-runs"
     log_dir.mkdir(parents=True, exist_ok=True)
     run_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    machine_name = new_machine_name()
+    agent_id = new_agent_id()
+    log_path = log_dir / f"{run_timestamp}-{os.getpid()}-{machine_name}.log"
 
-    cmd = [
-        binary,
-        "-p",
-        "--trust",
-    ]
-    if force_enabled:
-        cmd.append("--force")
-    if model_name:
-        cmd.extend(["--model", model_name])
-    cmd.extend(
-        [
-            "--output-format",
-            "stream-json",
-            str(task).strip(),
-        ]
+    payload = build_create_agent_payload(
+        task=str(task).strip(),
+        repo_url=repo_url,
+        machine_name=machine_name,
+        agent_id=agent_id,
+        model=model_name,
+        starting_ref=starting_ref,
+        force=force_enabled,
     )
+
+    worker = MachineWorker(
+        binary=binary,
+        name=machine_name,
+        workdir=str(workdir_path),
+        log_path=log_path,
+    )
+    started_mono = time.monotonic()
+    agent: Dict[str, Any] = {}
+    run: Dict[str, Any] = {}
+    progress_url: Optional[str] = None
 
     try:
-        watchdog_error, log_path, log_text, duration, returncode = _run_and_stream(
-            cmd,
-            workdir=str(workdir_path),
-            timeout_seconds=clamped_timeout,
-            log_dir=log_dir,
-            run_timestamp=run_timestamp,
+        try:
+            worker.start()
+        except Exception as exc:
+            logger.error("delegate_cursor_agent worker start failed: %s", exc, exc_info=True)
+            return _make_result(
+                success=False,
+                error=_redact_secret(str(exc), api_key),
+                duration_seconds=round(time.monotonic() - started_mono, 3),
+                log_path=str(log_path),
+            )
+
+        try:
+            agent, run = create_agent_with_timeout_dedupe(payload, api_key=api_key)
+        except TimeoutError as exc:
+            return _make_result(
+                success=False,
+                error=_redact_secret(str(exc), api_key),
+                duration_seconds=round(time.monotonic() - started_mono, 3),
+                log_path=str(log_path),
+            )
+        except CursorCloudError as exc:
+            return _make_result(
+                success=False,
+                error=_redact_secret(str(exc), api_key),
+                duration_seconds=round(time.monotonic() - started_mono, 3),
+                log_path=str(log_path),
+            )
+
+        progress_url = extract_progress_url(agent)
+        if progress_url:
+            _emit_progress_notice(f"Cursor Cloud Agent: {progress_url}")
+
+        agent_id = str(agent.get("id") or agent_id)
+        run_id = str(run.get("id") or agent.get("latestRunId") or "")
+        if not run_id:
+            return _make_result(
+                success=False,
+                error="Cursor Cloud Agent create did not return a run id",
+                **_cloud_result_fields(
+                    agent=agent,
+                    run=run,
+                    duration_seconds=time.monotonic() - started_mono,
+                    log_path=str(log_path),
+                    progress_url=progress_url,
+                ),
+            )
+
+        try:
+            run = poll_cloud_run(
+                agent_id=agent_id,
+                run_id=run_id,
+                api_key=api_key,
+                timeout_seconds=clamped_timeout,
+                started_mono=started_mono,
+            )
+        except CursorCloudError as exc:
+            return _make_result(
+                success=False,
+                error=_redact_secret(str(exc), api_key),
+                **_cloud_result_fields(
+                    agent=agent,
+                    run=run,
+                    duration_seconds=time.monotonic() - started_mono,
+                    log_path=str(log_path),
+                    progress_url=progress_url,
+                ),
+            )
+
+        fields = _cloud_result_fields(
+            agent=agent,
+            run=run,
+            duration_seconds=time.monotonic() - started_mono,
+            log_path=str(log_path),
+            progress_url=progress_url,
         )
-    except Exception as exc:
-        logger.error("delegate_cursor_agent spawn failed: %s", exc, exc_info=True)
+        local_error = run.get("_local_error")
+        cloud_status = fields.get("cloud_status")
+
+        if local_error:
+            return _make_result(success=False, error=str(local_error), **fields)
+        if cloud_status == "FINISHED":
+            return _make_result(success=True, error=None, **fields)
+        if cloud_status == "ERROR":
+            detail = fields.get("final_report") or "Cursor Cloud Agent run failed"
+            return _make_result(success=False, error=detail, **fields)
+        if cloud_status == "CANCELLED":
+            return _make_result(success=False, error="cancelled", **fields)
+        if cloud_status == "EXPIRED":
+            return _make_result(success=False, error="expired", **fields)
         return _make_result(
             success=False,
-            error=str(exc),
-            duration_seconds=0.0,
+            error=f"Cursor Cloud Agent ended with status {cloud_status}",
+            **fields,
         )
-
-    parsed = parse_cursor_agent_log(log_text)
-    base_fields = {
-        "final_report": parsed.get("final_report") or "",
-        "delegations": parsed.get("delegations") or [],
-        "duration_seconds": round(duration, 3),
-        "session_id": parsed.get("session_id"),
-        "log_path": log_path,
-    }
-
-    if parsed.get("action_required"):
-        detail = parsed["action_required"].get("detail", "")
-        return _make_result(
-            success=False,
-            error="action_required",
-            error_type="ActionRequiredError",
-            detail=detail,
-            **base_fields,
-        )
-
-    if watchdog_error:
-        return _make_result(
-            success=False,
-            error=watchdog_error,
-            **base_fields,
-        )
-
-    if returncode != 0:
-        tail = log_text.strip()[-2000:] if log_text.strip() else ""
-        return _make_result(
-            success=False,
-            error=f"Cursor Agent exited with code {returncode}" + (f": {tail}" if tail else ""),
-            **base_fields,
-        )
-
-    return _make_result(
-        success=True,
-        error=None,
-        **base_fields,
-    )
+    finally:
+        worker.cleanup()
 
 
 CURSOR_AGENT_SCHEMA = {
     "name": "delegate_cursor_agent",
     "description": (
-        "Delegate a software development task to the Cursor Agent CLI running "
-        "as a local subprocess. The CLI performs code edits, terminal commands, "
-        "and multi-step dev work inside the specified repository directory. "
-        "Stdout is captured as stream-json in a log under the Hermes home "
-        "directory. Available only when the Cursor Agent CLI binary is installed."
+        "Delegate a software development task to a Cursor My Machines Cloud "
+        "Agent on this host. Starts a short-lived worker in workdir, POSTs "
+        "/v1/agents with env.type=machine for the checkout's GitHub origin, "
+        "and waits for the run to finish. Does not open a PR or request "
+        "reviewers. Available only when the Cursor Agent CLI binary is installed."
     ),
     "parameters": {
         "type": "object",
@@ -538,8 +1443,8 @@ CURSOR_AGENT_SCHEMA = {
             "force": {
                 "type": "boolean",
                 "description": (
-                    "When true, pass --force so Cursor Agent may write files "
-                    "and run commands without interactive approval."
+                    "Accepted for compatibility. Does not enable API-side "
+                    "auto-created PRs or reviewer requests."
                 ),
                 "default": True,
             },

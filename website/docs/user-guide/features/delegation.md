@@ -423,6 +423,27 @@ directory, on docker/ssh/modal backends, or if worktree creation fails, the
 setting degrades silently to today's shared-workspace behavior — never an
 error.
 
+## Cursor My Machines (`delegate_cursor_agent`)
+
+`delegate_cursor_agent` is a separate delegation surface from `delegate_task`. It keeps the same tool name and parameter schema, and still returns a **synchronous** final JSON result after the run finishes.
+
+The backend is a [Cursor My Machines](https://cursor.com/docs/cloud-agent/self-hosted-guides/my-machines.md) Cloud Agent, not a local `agent -p` subprocess:
+
+1. Load `CURSOR_API_KEY` from `~/.hermes/secrets/cursor-cloud.env` (`Path.home() / ".hermes/secrets/cursor-cloud.env"`; on this host that is `/root/.hermes/secrets/cursor-cloud.env`). Only the parent Hermes HTTP client holds this key. A missing or empty key fails clearly — there is no fallback to `os.environ` or to the local CLI. Tests inject an alternate path via `CURSOR_CLOUD_ENV_PATH`.
+2. Resolve `workdir`'s `origin` remote to a live-verified HTTPS **GitHub** URL (`https://github.com/owner/repo`). Local paths, `file://` remotes, and non-GitHub hosts (including GitLab, Bitbucket, and Azure DevOps) are rejected. Cursor v1 create documents GitHub repo URLs; other hosts are not claimed.
+3. Preflight `agent status --format json` in the same sanitized worker env. If that status is unauthenticated, malformed, or nonzero, the tool returns `Cursor My Machines worker is not authenticated; run agent login` — it never suggests putting the long-lived API key in worker env or argv. Then start a unique short-lived worker with options **before** the subcommand: `agent worker --name … --worker-dir <workdir> --idle-release-timeout 0 start`. The worker authenticates with the existing Cursor machine login already used by local `agent`. `CURSOR_API_KEY` is **not** placed in worker env, argv, logs, or the tool result. `--mint-github-token` is not passed.
+4. `POST /v1/agents` with `env.type=machine`, the matching GitHub repo URL, `autoCreatePR=false`, `skipReviewerRequest=true`, and `workOnCurrentBranch=false`. The prompt includes a no-push instruction. `startingRef` is included **only** when that branch exists on the origin remote (`git ls-remote --heads`); a local-only branch is omitted so the API is not sent a 400. `force` does **not** enable API-side PRs or reviewer requests.
+5. If that POST times out, list existing agents and dedupe before a single retry.
+6. Poll the run through `FINISHED` / `ERROR` / `CANCELLED` / `EXPIRED`, honoring `timeout_seconds` and interrupt.
+
+**Authority:** workdir access matches the existing local executor. A same-user coding agent is not a hard sandbox and can reach this user's Git/SSH credentials. Process-local `GIT_CONFIG_*` pushurl/credential-helper overrides and the API no-PR flags are defense-in-depth only. Operators must use isolated scratch clones or worktrees for protected repos. The caller's `.git/config` is not rewritten.
+
+The result keeps the previous fields (`success`, `final_report`, `delegations`, `duration_seconds`, `session_id`, `log_path`, `error`) and adds `agent_id`, `run_id`, `cloud_status`, and the exact `progress_url` returned by the API.
+
+Mid-tool progress uses the generic `tools.tool_status` callback context bound on CLI/gateway conversation turns (`invoke_tool` / `run_conversation`). An integration test dispatches the real top-level tool through `handle_function_call` and asserts that exact `progress_url` is emitted **once before poll completion**. Unbound dispatch (direct `registry.dispatch` / cron / tests without the context) is a no-op for the live notice; `progress_url` is still in the final JSON. The seam does not import Discord or mutate conversation messages.
+
+The tool is gated on the Cursor `agent` CLI binary (`PATH` or `~/.local/bin/agent`).
+
 ## Delegation vs execute_code
 
 | Factor | delegate_task | execute_code |

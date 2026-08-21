@@ -8853,7 +8853,9 @@ class AIAgent:
             # replaces the value with the live runtime after fallback restoration.
             # Keep the scope local instead of storing ContextVar tokens on the agent,
             # which may be observed from another thread.
-            with bind_subagent_parent(self), scoped_runtime_main({}):
+            from tools.tool_status import tool_status_scope
+
+            with bind_subagent_parent(self), tool_status_scope(self._emit_status), scoped_runtime_main({}):
                 try:
                     if durable_turn_lease_thread is not None:
                         with durable_turn_lease_activity_lock:

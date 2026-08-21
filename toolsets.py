@@ -72,7 +72,7 @@ _HERMES_CORE_TOOLS = [
     "clarify",
     # Code execution + delegation
     "execute_code", "delegate_task",
-    # Cursor Agent CLI delegation (gated via check_fn on the agent binary)
+    # Cursor My Machines Cloud Agent (gated via check_fn on the agent binary)
     "delegate_cursor_agent",
     # Claude Code CLI delegation via the claude-glm wrapper (gated via
     # check_fn on the wrapper binary)
