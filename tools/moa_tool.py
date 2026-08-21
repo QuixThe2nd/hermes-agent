@@ -26,19 +26,18 @@ _MAX_REQUEST_CHARS = 120_000
 _FAILURE_PREFIXES = ("[failed:", "[skipped:")
 
 
-CONSULT_MOA_SCHEMA = {
-    "name": "consult_moa",
+MOA_ASK_SCHEMA = {
+    "name": "moa_ask",
     "description": (
-        "Consult the configured Mixture-of-Agents reference models in parallel, "
-        "then use their independent advice as private input to your own decision. "
-        "You remain the acting model and aggregator. Call this automatically, "
-        "without asking the user to choose models or approve consultation, before "
-        "stack/architecture choices, difficult-to-reverse networking/storage/auth/"
-        "security/migration decisions, when evidence conflicts, after two failed "
-        "diagnostic hypotheses, or when an independent challenge would materially "
-        "reduce risk. Skip routine checks, known runbooks, small reversible fixes, "
-        "and tasks already covered by a still-current consultation. Do not pass "
-        "secrets; summarize relevant evidence and constraints."
+        "Default MoA quick Q&A path: one focused question in a single parallel "
+        "consultation round; independent advice as private input. Use for "
+        "questions, opinions, comparing options, and quick or reversible "
+        "decisions. This is NOT a debate — prefer moa_ask unless genuine "
+        "adversarial disagreement is worth the extra cost (then use moa_debate). "
+        "You remain the acting model and aggregator. Call automatically, without "
+        "asking the user to choose models or approve consultation. Skip routine "
+        "checks, known runbooks, and tasks already covered by a still-current "
+        "consultation. Do not pass secrets."
     ),
     "parameters": {
         "type": "object",
@@ -118,7 +117,7 @@ def _advisor_status(text: str) -> str:
     return "ok"
 
 
-def consult_moa(
+def moa_ask(
     question: str,
     evidence: str | None = None,
     decision_needed: str | None = None,
@@ -143,7 +142,7 @@ def consult_moa(
     try:
         preset_name, preset = _default_preset()
     except Exception as exc:
-        logger.warning("Could not load MoA config for consult_moa: %s", exc)
+        logger.warning("Could not load MoA config for moa_ask: %s", exc)
         return tool_error("could not load the active MoA configuration", success=False)
 
     if not preset.get("enabled", True):
@@ -167,7 +166,7 @@ def consult_moa(
             max_tokens=preset.get("reference_max_tokens"),
         )
     except Exception as exc:  # Defensive: individual references already fail soft.
-        logger.warning("consult_moa reference fan-out failed: %s", exc)
+        logger.warning("moa_ask reference fan-out failed: %s", exc)
         return tool_error("MoA reference fan-out failed", success=False)
 
     advisors = []
@@ -215,10 +214,10 @@ def consult_moa(
 
 
 registry.register(
-    name="consult_moa",
+    name="moa_ask",
     toolset="moa",
-    schema=CONSULT_MOA_SCHEMA,
-    handler=lambda args, **kw: consult_moa(
+    schema=MOA_ASK_SCHEMA,
+    handler=lambda args, **kw: moa_ask(
         question=args.get("question", ""),
         evidence=args.get("evidence"),
         decision_needed=args.get("decision_needed"),

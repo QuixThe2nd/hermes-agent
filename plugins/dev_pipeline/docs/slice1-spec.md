@@ -8,7 +8,7 @@ Architecture decision record: `/root/.hermes/second-brain/2026-08-10-automated-d
 
 ### Addendum: `plan_mode` (2026-08-19)
 
-`delegate_development` accepts an optional `plan_mode` parameter: `consult` (default) uses `tools.moa_tool.consult_moa`; `debate` uses `tools.moa_debate.moa_debate` directly for multi-round adversarial planning on big or ambiguous tasks. The executor adapts debate output into the same synthesis path as consult — no reimplementation of either tool.
+`delegate_development` accepts an optional `plan_mode` parameter: `consult` (default) uses `tools.moa_tool.moa_ask`; `debate` uses `tools.moa_debate.moa_debate` directly for multi-round adversarial planning on big or ambiguous tasks. The executor adapts debate output into the same synthesis path as consult — no reimplementation of either tool.
 
 ## Goal
 
@@ -37,13 +37,13 @@ A lane may not ship unless the user can see what it is doing while it runs, with
 
 - `tools/cursor_agent_tool.py`: availability check, stream-json log handling, process-group cleanup lessons. The executor calls the Cursor CLI directly through its own attempt runner; do not import the tool handler itself.
 - `hermes_cli/kanban_db.py`: WAL + CAS claims (`claim_task`), `tasks`/`task_runs`/`task_events`, `claim_expires`, `heartbeat_claim`, `worker_pid`, `max_runtime_seconds`, `idempotency_key`, `consecutive_failures` + `max_retries`, `workspace_kind`/`workspace_path`, `block_kind` typed blockers, `task_runs.metadata` JSON. Boards: separate DB per board under `<hermes_root>/kanban/boards/<slug>/`.
-- `tools/moa_tool.py`: `consult_moa` — restored verbatim in Component 0 (it is absent from the base checkout; the restore is part of this change, and planning must go through it).
+- `tools/moa_tool.py`: `moa_ask` — restored verbatim in Component 0 (it is absent from the base checkout; the restore is part of this change, and planning must go through it).
 - `kanban_notify_subs` + gateway kanban notifier: completion/blocked notifications to the originating chat — reuse, do not rebuild.
 - `gh` CLI: authenticated on this host for PR creation. Executor uses it; attempts never see its credentials.
 
 ## Components
 
-### 0. Restore `consult_moa` (prerequisite, exact port)
+### 0. Restore `moa_ask` (prerequisite, exact port)
 
 `tools/moa_tool.py` is absent from this checkout, but `agent/moa_loop.py` is fully present and the recovered wrapper is proven compatible with this exact tree. Restore it verbatim from the Git object store:
 
@@ -52,7 +52,7 @@ git show 947bd957a:tools/moa_tool.py > tools/moa_tool.py
 git show 947bd957a:tests/tools/test_moa_tool.py > tests/tools/test_moa_tool.py
 ```
 
-Then register `consult_moa` in `toolsets.py` following the documented pattern (`_HERMES_CORE_TOOLS` + `TOOLSETS["moa"]["tools"]`, matching how `cursor_agent_tool` is gated). If the blob paths differ, locate with `git log --all --oneline -- tools/moa_tool.py`. Port exactly; do not "improve" it. Its tests must pass before any executor work begins. The planner MUST use this real `consult_moa` against the active configured preset — no roster overrides, no substitutes. (Note: `tools/moa_debate.py` is deliberately NOT part of this slice; planning uses consult, debate stays for contested decisions.)
+Then register `moa_ask` in `toolsets.py` following the documented pattern (`_HERMES_CORE_TOOLS` + `TOOLSETS["moa"]["tools"]`, matching how `cursor_agent_tool` is gated). If the blob paths differ, locate with `git log --all --oneline -- tools/moa_tool.py`. Port exactly; do not "improve" it. Its tests must pass before any executor work begins. The planner MUST use this real `moa_ask` against the active configured preset — no roster overrides, no substitutes. (Note: `tools/moa_debate.py` is deliberately NOT part of this slice; planning uses consult, debate stays for contested decisions.)
 
 ### 1. `tools/dev_pipeline_tool.py` — `delegate_development`
 
@@ -79,9 +79,9 @@ Tick loop (default 15s, config `dev_executor.tick_seconds`):
 Phases:
 
 **PLANNING**
-- Build the planning prompt: task, repo summary (file tree top levels, languages, test setup hints from common files), and a demand for a STRICT JSON plan contract (schema below). Call the configured MoA council (`consult_moa`, active preset exactly as configured — never override the roster).
+- Build the planning prompt: task, repo summary (file tree top levels, languages, test setup hints from common files), and a demand for a STRICT JSON plan contract (schema below). Call the configured MoA council (`moa_ask`, active preset exactly as configured — never override the roster).
 - Parse and validate the contract. On invalid JSON/schema: one retry with the validation errors appended. Still invalid → block the task with `block_kind='plan_invalid'` and the validator output in the task result.
-- Planning council failures: if consult_moa reports partial/degraded, proceed only if ≥2 advisors returned usable plans and the acting synthesis can produce one valid contract; otherwise block `planning_unavailable`. Record advisor statuses in task_events.
+- Planning council failures: if moa_ask reports partial/degraded, proceed only if ≥2 advisors returned usable plans and the acting synthesis can produce one valid contract; otherwise block `planning_unavailable`. Record advisor statuses in task_events.
 
 **ROUTING**
 - If contract `blocked_reasons` is non-empty → block with `block_kind` mapped from the reason (`missing_credentials`, `missing_product_input`, `infra_broken`, `acceptance_unverifiable`). Never execute.
@@ -212,5 +212,5 @@ Validation: required keys present; `lane_hint` in enum; `acceptance_commands` no
 - No new third-party dependencies. Stdlib + existing Hermes modules only.
 - Follow existing code style; type hints; docstrings on public functions.
 - Do not modify: `hermes_cli/kanban_db.py` claim logic (read-only usage), the gateway, `tools/cursor_agent_tool.py`, systemd unit of the gateway.
-- If `consult_moa` cannot be restored from the blob or its tests fail, STOP and report instead of inventing a substitute planner.
+- If `moa_ask` cannot be restored from the blob or its tests fail, STOP and report instead of inventing a substitute planner.
 - Secrets: never log tokens; evidence files must be safe to attach to PRs (redact).

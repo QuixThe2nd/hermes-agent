@@ -114,7 +114,7 @@ CONFIGURABLE_TOOLSETS = [
     ("session_search",  "🔎 Session Search",            "search past conversations"),
     ("clarify",         "❓ Clarifying Questions",      "clarify"),
     ("delegation",      "👥 Task Delegation",           "delegate_task"),
-    ("moa",             "🧠 Mixture of Agents",        "consult_moa, moa_debate"),
+    ("moa",             "🧠 Mixture of Agents",        "moa_ask, moa_debate"),
     ("cronjob",         "⏰ Cron Jobs",                 "create/list/update/pause/resume/run, with optional attached skills"),
     ("homeassistant",    "🏠 Home Assistant",           "smart home device control"),
     ("spotify",          "🎵 Spotify",                  "playback, search, playlists, library"),
