@@ -71,16 +71,32 @@ def _user_systemd_reachable() -> bool:
         return False
 
 
+def _home_owner_uid(path: Path) -> int:
+    return path.stat().st_uid
+
+
 def detect_install_scope(
     *,
     hermes_home: Path | None = None,
     euid: int | None = None,
-    gateway_system_unit_exists: Callable[[], bool] = _gateway_system_unit_exists,
-    gateway_user_unit_exists: Callable[[], bool] = _gateway_user_unit_exists,
-    user_systemd_reachable: Callable[[], bool] = _user_systemd_reachable,
-    is_linux_fn: Callable[[], bool] = is_linux,
+    gateway_system_unit_exists: Callable[[], bool] | None = None,
+    gateway_user_unit_exists: Callable[[], bool] | None = None,
+    user_systemd_reachable: Callable[[], bool] | None = None,
+    is_linux_fn: Callable[[], bool] | None = None,
+    home_owner_uid: Callable[[Path], int] | None = None,
 ) -> InstallScope | None:
     """Pick system vs user systemd scope from real install metadata."""
+    if is_linux_fn is None:
+        is_linux_fn = is_linux
+    if gateway_system_unit_exists is None:
+        gateway_system_unit_exists = _gateway_system_unit_exists
+    if gateway_user_unit_exists is None:
+        gateway_user_unit_exists = _gateway_user_unit_exists
+    if user_systemd_reachable is None:
+        user_systemd_reachable = _user_systemd_reachable
+    if home_owner_uid is None:
+        home_owner_uid = _home_owner_uid
+
     if not is_linux_fn():
         return None
 
@@ -97,8 +113,8 @@ def detect_install_scope(
         use_system = True
     else:
         try:
-            st = home.stat()
-            if st.st_uid not in (0, uid):
+            owner_uid = home_owner_uid(home)
+            if owner_uid not in (0, uid):
                 use_system = True
         except OSError:
             return None
