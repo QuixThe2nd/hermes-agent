@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from plugins.auto_update.config import default_schedule_calendar
+from plugins.auto_update.config import load_auto_update_config
 from plugins.auto_update.platform import InstallScope
 from plugins.auto_update.systemd import (
     SERVICE_NAME,
@@ -31,11 +31,7 @@ def user_scope(tmp_path) -> InstallScope:
 
 @pytest.fixture
 def cfg():
-    return {
-        "schedule": default_schedule_calendar(),
-        "randomized_delay_sec": 1800,
-        "accuracy_sec": "1s",
-    }
+    return load_auto_update_config({})
 
 
 def test_service_unit_has_no_gateway_coupling(user_scope):
@@ -54,17 +50,100 @@ def test_exec_start_quotes_paths_with_spaces():
     assert '"/opt/my hermes/bin/python"' in line
 
 
-def test_timer_renders_off_hours_schedule_with_delay(cfg):
+def test_timer_renders_every_30_minutes_schedule_with_zero_delay(cfg):
     body = render_timer_unit(
         schedule=cfg["schedule"],
         randomized_delay_sec=cfg["randomized_delay_sec"],
         accuracy_sec=cfg["accuracy_sec"],
     )
-    assert "OnCalendar=*-*-* 04,05,06,07:00:00" in body
+    assert "OnCalendar=*-*-* *:00,30:00" in body
     assert "Persistent=true" in body
-    assert "RandomizedDelaySec=1800" in body
+    assert "RandomizedDelaySec=0" in body
     assert "AccuracySec=1s" in body
     assert f"Unit={SERVICE_NAME}" in body
+
+
+def test_reconcile_partial_cfg_uses_canonical_defaults(user_scope, monkeypatch, tmp_path):
+    def fake_systemctl(args):
+        if args[-2:] == ["is-active", TIMER_NAME]:
+            return 0, "active\n", ""
+        if args[-2:] == ["is-enabled", TIMER_NAME]:
+            return 0, "enabled\n", ""
+        if args[-2:] == ["is-enabled", "hermes-auto-update.timer"]:
+            return 1, "disabled\n", ""
+        return 0, "", ""
+
+    monkeypatch.setattr(
+        "plugins.auto_update.systemd.platform_supported", lambda: True
+    )
+    monkeypatch.setattr(
+        "plugins.auto_update.systemd.detect_install_scope", lambda: user_scope
+    )
+    monkeypatch.setattr(
+        "plugins.auto_update.systemd.get_hermes_home", lambda: tmp_path / ".hermes"
+    )
+    monkeypatch.setattr(
+        "plugins.auto_update.systemd.unit_exec_start_argv",
+        lambda: ["/usr/bin/python3", "-m", "hermes_cli.main", "auto_update", "run"],
+    )
+    monkeypatch.setattr(
+        "plugins.auto_update.systemd.duplicate_scheduler_present",
+        lambda *_args, **_kwargs: False,
+    )
+    stamp_dir = tmp_path / "stamps"
+    monkeypatch.setattr(
+        "plugins.auto_update.systemd.timer_stamp_path",
+        lambda scope, timer_name=TIMER_NAME: stamp_dir / f"stamp-{timer_name}",
+    )
+
+    reconcile_units({}, enabled=True, run_systemctl=fake_systemctl)
+    timer_body = timer_unit_path(user_scope).read_text(encoding="utf-8")
+    assert "OnCalendar=*-*-* *:00,30:00" in timer_body
+    assert "RandomizedDelaySec=0" in timer_body
+    assert "AccuracySec=1s" in timer_body
+
+
+def test_reconcile_legacy_hour_window_renders_requested_schedule(
+    user_scope, monkeypatch, tmp_path
+):
+    def fake_systemctl(args):
+        if args[-2:] == ["is-active", TIMER_NAME]:
+            return 0, "active\n", ""
+        if args[-2:] == ["is-enabled", TIMER_NAME]:
+            return 0, "enabled\n", ""
+        if args[-2:] == ["is-enabled", "hermes-auto-update.timer"]:
+            return 1, "disabled\n", ""
+        return 0, "", ""
+
+    monkeypatch.setattr(
+        "plugins.auto_update.systemd.platform_supported", lambda: True
+    )
+    monkeypatch.setattr(
+        "plugins.auto_update.systemd.detect_install_scope", lambda: user_scope
+    )
+    monkeypatch.setattr(
+        "plugins.auto_update.systemd.get_hermes_home", lambda: tmp_path / ".hermes"
+    )
+    monkeypatch.setattr(
+        "plugins.auto_update.systemd.unit_exec_start_argv",
+        lambda: ["/usr/bin/python3", "-m", "hermes_cli.main", "auto_update", "run"],
+    )
+    monkeypatch.setattr(
+        "plugins.auto_update.systemd.duplicate_scheduler_present",
+        lambda *_args, **_kwargs: False,
+    )
+    stamp_dir = tmp_path / "stamps"
+    monkeypatch.setattr(
+        "plugins.auto_update.systemd.timer_stamp_path",
+        lambda scope, timer_name=TIMER_NAME: stamp_dir / f"stamp-{timer_name}",
+    )
+
+    legacy_cfg = load_auto_update_config(
+        {"schedule_start_hour": 4, "schedule_end_hour": 8}
+    )
+    reconcile_units(legacy_cfg, enabled=True, run_systemctl=fake_systemctl)
+    timer_body = timer_unit_path(user_scope).read_text(encoding="utf-8")
+    assert "OnCalendar=*-*-* 04,05,06,07:00:00" in timer_body
 
 
 def test_reconcile_idempotent_and_atomic(user_scope, cfg, monkeypatch, tmp_path):

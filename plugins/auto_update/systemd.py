@@ -13,7 +13,11 @@ from typing import Callable, Mapping, Sequence
 
 from hermes_constants import display_hermes_home, get_hermes_home
 
-from plugins.auto_update.config import default_schedule_calendar
+from plugins.auto_update.config import (
+    DEFAULT_ACCURACY_SEC,
+    DEFAULT_RANDOMIZED_DELAY_SEC,
+    default_schedule_calendar,
+)
 from plugins.auto_update.legacy import duplicate_scheduler_present, migrate_legacy_units
 from plugins.auto_update.platform import (
     InstallScope,
@@ -490,8 +494,10 @@ def reconcile_units(
     )
     timer_body = render_timer_unit(
         schedule=str(cfg.get("schedule") or default_schedule_calendar()),
-        randomized_delay_sec=int(cfg.get("randomized_delay_sec", 1800)),
-        accuracy_sec=str(cfg.get("accuracy_sec", "1s")),
+        randomized_delay_sec=int(
+            cfg.get("randomized_delay_sec", DEFAULT_RANDOMIZED_DELAY_SEC)
+        ),
+        accuracy_sec=str(cfg.get("accuracy_sec", DEFAULT_ACCURACY_SEC)),
     )
 
     changed = write_units_if_changed(

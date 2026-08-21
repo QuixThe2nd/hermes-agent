@@ -5,9 +5,10 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 DEFAULT_IDLE_MINUTES = 8
+DEFAULT_SCHEDULE_CALENDAR = "*-*-* *:00,30:00"
 DEFAULT_SCHEDULE_START_HOUR = 4
 DEFAULT_SCHEDULE_END_HOUR = 8
-DEFAULT_RANDOMIZED_DELAY_SEC = 1800
+DEFAULT_RANDOMIZED_DELAY_SEC = 0
 DEFAULT_ACCURACY_SEC = "1s"
 
 
@@ -32,14 +33,12 @@ def _coerce_int(value: Any, default: int, *, minimum: int = 0) -> int:
 def _calendar_from_hour_window(start_hour: int, end_hour: int) -> str:
     hours = list(range(start_hour, end_hour))
     if not hours:
-        hours = list(range(DEFAULT_SCHEDULE_START_HOUR, DEFAULT_SCHEDULE_END_HOUR))
+        return DEFAULT_SCHEDULE_CALENDAR
     return f"*-*-* {','.join(f'{hour:02d}' for hour in hours)}:00:00"
 
 
 def default_schedule_calendar() -> str:
-    return _calendar_from_hour_window(
-        DEFAULT_SCHEDULE_START_HOUR, DEFAULT_SCHEDULE_END_HOUR
-    )
+    return DEFAULT_SCHEDULE_CALENDAR
 
 
 def resolve_schedule(raw: Mapping[str, Any]) -> str:
