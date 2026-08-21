@@ -5432,9 +5432,14 @@ class TurnRunner:
             self._deliver_tool_stage_event(event, embed_msg_ids)
         )
 
-        def _consume_detached_exception(t: asyncio.Task) -> None:
-            if not t.cancelled():
-                t.exception()
+        def _observe_delivery_task_outcome() -> Optional[str]:
+            if not task.done() or task.cancelled():
+                return None
+            try:
+                delivered = task.result()
+            except Exception:
+                return "failed"
+            return "delivered" if delivered else "failed"
 
         try:
             return await asyncio.shield(task)
@@ -5446,14 +5451,35 @@ class TurnRunner:
                     timeout=self._STAGE_DELIVERY_RECOVER_TIMEOUT,
                 )
                 outcome = "delivered" if delivered else "failed"
-            except (asyncio.TimeoutError, TimeoutError):
-                task.add_done_callback(_consume_detached_exception)
-            if outcome_holder is not None:
-                outcome_holder["outcome"] = outcome
+            except TimeoutError:
+                detached = getattr(self, "_stage_delivery_detached_tasks", None)
+                if detached is None:
+                    detached = self._stage_delivery_detached_tasks = set()
+                detached.add(task)
+
+                def _release_detached(t: asyncio.Task) -> None:
+                    if not t.cancelled():
+                        t.exception()
+                    detached.discard(t)
+
+                task.add_done_callback(_release_detached)
+            except asyncio.CancelledError:
+                observed = _observe_delivery_task_outcome()
+                if observed is not None:
+                    outcome = observed
+                raise
+            except Exception:
+                observed = _observe_delivery_task_outcome()
+                if observed is not None:
+                    outcome = observed
+                raise
+            finally:
+                if outcome_holder is not None:
+                    outcome_holder["outcome"] = outcome
             raise
 
     async def _flush_deliver_stage_event(
-        self, event: dict, embed_msg_ids: Dict[str, str], *, allow_retry: bool
+        self, event: dict, embed_msg_ids: Dict[str, str]
     ) -> None:
         """Deliver one flush event with shielded cancel recovery."""
         ctx = self._ctx
@@ -5466,19 +5492,15 @@ class TurnRunner:
             outcome = outcome_holder.get("outcome", "unknown")
             if outcome == "delivered":
                 raise
-            if allow_retry:
-                retry_holder: dict = {}
-                try:
-                    await self._deliver_stage_event_shielded(
-                        event, embed_msg_ids, retry_holder
-                    )
-                except asyncio.CancelledError:
-                    retry_outcome = retry_holder.get("outcome", "unknown")
-                    if retry_outcome != "delivered":
-                        ctx.stage_event_queue.put_nowait(event)
-                    raise
-            else:
-                ctx.stage_event_queue.put_nowait(event)
+            retry_holder: dict = {}
+            try:
+                await self._deliver_stage_event_shielded(
+                    event, embed_msg_ids, retry_holder
+                )
+            except asyncio.CancelledError:
+                retry_outcome = retry_holder.get("outcome", "unknown")
+                if retry_outcome != "delivered":
+                    ctx.stage_event_queue.put_nowait(event)
                 raise
         except Exception:
             pass
@@ -5489,9 +5511,7 @@ class TurnRunner:
         """Deliver terminal (or last) queued event per invocation; fail-soft."""
         for event in self._collect_final_stage_events():
             try:
-                await self._flush_deliver_stage_event(
-                    event, embed_msg_ids, allow_retry=True
-                )
+                await self._flush_deliver_stage_event(event, embed_msg_ids)
             except asyncio.CancelledError:
                 raise
 

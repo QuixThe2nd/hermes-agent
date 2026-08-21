@@ -822,6 +822,42 @@ class _BlockingFailureTerminalAdapter(_RecordingStageAdapter):
         )
 
 
+class _BlockingRaiseTerminalAdapter(_RecordingStageAdapter):
+    """Blocks a terminal send/edit until release, then raises."""
+
+    def __init__(self):
+        super().__init__()
+        self.blocked = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def _raise_terminal_after_block(self, chat_id, stage, *, message_id=None):
+        self.blocked.set()
+        await self.release.wait()
+        record = {"chat_id": chat_id, "stage": dict(stage), "ok": False}
+        if message_id is None:
+            self.sends.append(record)
+        else:
+            record["message_id"] = message_id
+            self.edits.append(record)
+        raise RuntimeError("terminal boom")
+
+    async def send_tool_stage_embed(self, chat_id, stage, metadata=None, reply_to=None):
+        if stage.get("terminal"):
+            await self._raise_terminal_after_block(chat_id, stage)
+        return await super().send_tool_stage_embed(
+            chat_id, stage, metadata=metadata, reply_to=reply_to
+        )
+
+    async def edit_tool_stage_embed(self, chat_id, message_id, stage, metadata=None):
+        if stage.get("terminal"):
+            await self._raise_terminal_after_block(
+                chat_id, stage, message_id=message_id
+            )
+        return await super().edit_tool_stage_embed(
+            chat_id, message_id, stage, metadata=metadata
+        )
+
+
 def _successful_terminal_deliveries(adapter):
     return [
         record
@@ -925,11 +961,16 @@ async def test_drain_cancel_after_terminal_side_effect_is_exactly_once():
 
 
 @pytest.mark.asyncio
-async def test_drain_cancel_retries_failed_terminal_once():
+@pytest.mark.parametrize(
+    "adapter_factory",
+    [_BlockingFailureTerminalAdapter, _BlockingRaiseTerminalAdapter],
+    ids=["send_result_failure", "adapter_raises"],
+)
+async def test_drain_cancel_retries_failed_terminal_once(adapter_factory):
     """Failed in-flight terminal delivery is retried exactly once on flush."""
     from gateway.run import TurnRunner
 
-    adapter = _BlockingFailureTerminalAdapter()
+    adapter = adapter_factory()
     ctx = _stage_ctx(adapter)
     runner = TurnRunner(_StubGatewayRunner(), ctx)
     ctx.stage_event_queue.put_nowait(
