@@ -109,7 +109,7 @@ class TestSendWithReplyToMode:
         adapter, channel, ref_msg = _make_discord_adapter("off")
         adapter.truncate_message = lambda content, max_len, **kw: ["chunk1", "chunk2", "chunk3"]
 
-        await adapter.send("12345", "test content", reply_to="999")
+        await adapter.send("12345", "test content", reply_to="999", metadata={"notify": True})
 
         # Should never try to fetch the reference message
         channel.fetch_message.assert_not_called()
@@ -123,7 +123,7 @@ class TestSendWithReplyToMode:
         adapter, channel, ref_msg = _make_discord_adapter("off")
         adapter.truncate_message = lambda content, max_len, **kw: ["single chunk"]
 
-        await adapter.send("12345", "test", reply_to="999")
+        await adapter.send("12345", "test", reply_to="999", metadata={"notify": True})
 
         channel.fetch_message.assert_not_called()
         calls = channel.send.call_args_list
@@ -139,7 +139,7 @@ class TestSendWithReplyToMode:
         adapter, channel, _ = _make_discord_adapter("first")
         adapter.truncate_message = lambda content, max_len, **kw: ["chunk1", "chunk2"]
 
-        await adapter.send("12345", "test content", reply_to="999")
+        await adapter.send("12345", "test content", reply_to="999", metadata={"notify": True})
 
         channel.fetch_message.assert_not_called()
         calls = channel.send.call_args_list
@@ -312,6 +312,6 @@ class TestVoiceReplyReference:
             return MagicMock(success=True, message_id="77")
         monkeypatch.setattr(adapter, "_forum_post_file", fake_forum_post)
 
-        await adapter.send_voice("12345", str(audio), reply_to="999")
+        await adapter.send_voice("12345", str(audio), reply_to="999", metadata={"notify": True})
 
         channel.fetch_message.assert_not_called()
