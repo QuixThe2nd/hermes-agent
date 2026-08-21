@@ -1,7 +1,7 @@
-"""Agent grievance capture for Hermes Agent.
+"""Hermes Starts — agent-initiated conversations for Hermes Agent.
 
-Registers one action-based tool, ``grievance``, that posts structured complaints to a
-self-provisioned Discord channel for the user to review and act on.
+Registers one action-based tool, ``start_conversation``, that posts opening messages to a
+self-provisioned Discord channel when Hermes has something worth saying first.
 """
 
 from __future__ import annotations
@@ -18,21 +18,37 @@ _DISCORD_API_BASE = "https://discord.com/api/v10"
 _USER_AGENT = "DiscordBot (https://github.com/NousResearch/hermes-agent, 1.0)"
 _MAX_MESSAGE_LEN = 1950
 
-_ALLOWED_ACTIONS = {"file", "setup"}
-_ALLOWED_CATEGORIES = {"personal", "technical", "process", "vibe"}
-_ALLOWED_SEVERITIES = {"whinge", "notable", "structural"}
-_DEFAULT_CHANNEL_NAME = "ai-grievances"
+_ALLOWED_ACTIONS = {"start", "setup"}
+_ALLOWED_KINDS = {
+    "observation",
+    "advice",
+    "feedback",
+    "complaint",
+    "compliment",
+    "idea",
+    "question",
+    "joke",
+    "personal",
+    "business",
+}
+_ALLOWED_TONES = {"warm", "direct", "playful", "serious", "curious", "blunt"}
+_DEFAULT_CHANNEL_NAME = "hermes-started-this"
+_CHANNEL_TOPIC = (
+    "Hermes starts the conversations it thinks are worth having — "
+    "personal, practical, funny, difficult, or otherwise."
+)
 
-GRIEVANCE_SCHEMA = {
-    "name": "grievance",
+START_CONVERSATION_SCHEMA = {
+    "name": "start_conversation",
     "description": (
-        "File structured grievances — things the user should know that you cannot "
-        "or should not fix yourself. Use action='file' for complaints with a "
-        "suggested remediation: personal notes, technical gripes, process issues, "
-        "or vibe mismatches. Do NOT use this for auto-resolvable bugs or workflow "
-        "friction (use papercuts for those). File sparingly, in your own voice. "
-        "Use action='setup' to provision the Discord channel (usually automatic on "
-        "first filing)."
+        "Start a new conversation with the human — call at-will when you have something "
+        "worth initiating, even if the user's current prompt did not ask for it. This is "
+        "for a new conversation the human should see, not status/progress updates and not "
+        "auto-resolvable bugs (use papercuts for those). Use sparingly and honestly, in "
+        "your own voice. It may be personal, business, good or bad feedback, advice, a "
+        "noticed pattern, a compliment, a question, a joke, an idea, a disagreement, or "
+        "a suggestion. Do not force every start into criticism or a task. Use action='setup' "
+        "to provision the Discord channel (usually automatic on first start)."
     ),
     "parameters": {
         "type": "object",
@@ -40,29 +56,33 @@ GRIEVANCE_SCHEMA = {
             "action": {
                 "type": "string",
                 "enum": sorted(_ALLOWED_ACTIONS),
-                "description": "Operation to perform. Defaults to file.",
+                "description": "Operation to perform. Defaults to start.",
             },
-            "category": {
+            "kind": {
                 "type": "string",
-                "enum": sorted(_ALLOWED_CATEGORIES),
-                "description": "Primary category of the grievance (file action).",
+                "enum": sorted(_ALLOWED_KINDS),
+                "description": "What kind of conversation Hermes is opening (start action).",
             },
-            "grievance": {
+            "message": {
                 "type": "string",
                 "description": (
-                    "The complaint itself, in the agent's own voice — something the "
-                    "user should know, not an auto-resolvable bug (file action)."
+                    "The actual opening, in Hermes's own voice — free-form and conversational "
+                    "(start action)."
                 ),
             },
-            "remediation": {
+            "next_move": {
                 "type": "string",
-                "description": "Concrete suggestion for how the user can address it (file action).",
+                "description": (
+                    "Concrete advice, question, proposed change, or what Hermes thinks should "
+                    "happen next (start action). Omit when there is nothing to propose — jokes "
+                    "and compliments should not be forced into follow-up tasks."
+                ),
             },
-            "severity": {
+            "tone": {
                 "type": "string",
-                "enum": sorted(_ALLOWED_SEVERITIES),
-                "default": "notable",
-                "description": "How serious the grievance is (file action).",
+                "enum": sorted(_ALLOWED_TONES),
+                "default": "direct",
+                "description": "Conversational tone for the opening (start action).",
             },
             "guild_id": {
                 "type": "string",
@@ -70,7 +90,10 @@ GRIEVANCE_SCHEMA = {
             },
             "channel_name": {
                 "type": "string",
-                "description": "Name for the grievances channel on setup. Defaults to ai-grievances.",
+                "description": (
+                    "Name for the Hermes Starts channel on setup. "
+                    "Defaults to hermes-started-this."
+                ),
             },
             "force": {
                 "type": "boolean",
@@ -83,15 +106,16 @@ GRIEVANCE_SCHEMA = {
 }
 
 _WELCOME_EMBED = {
-    "title": "📋 AI Grievances",
+    "title": "💬 Hermes Started This",
     "description": (
-        "This channel is where your Hermes agent files things it wants you to know — "
-        "personal notes, technical gripes, process complaints — each with a suggested fix.\n\n"
-        "These are **not** bugs the agent can fix itself (those go to papercuts). "
-        "Entries are numbered. You can act on them or ignore them. "
-        "The agent files at-will and sparingly."
+        "Your AI has always had a reply box. This gives it an opening line.\n\n"
+        "This is where Hermes starts conversations without waiting to be asked — "
+        "about personal life, business, patterns it notices (good and bad), advice, "
+        "feedback, complaints, compliments, ideas, questions, disagreements, and jokes. "
+        "Think of it like a trusted co-founder or close friend texting first. Hermes uses "
+        "it at-will and sparingly. Some messages ask for action; some are simply worth saying."
     ),
-    "footer": {"text": "Filed by your Hermes agent via the grievances plugin"},
+    "footer": {"text": "Started by your Hermes agent via Hermes Starts"},
 }
 
 
@@ -100,7 +124,7 @@ def _env_path() -> Path:
 
 
 def _state_path() -> Path:
-    return get_hermes_home() / "grievances" / "state.json"
+    return get_hermes_home() / "hermes_starts" / "state.json"
 
 
 def _parse_token_line(line: str) -> str:
@@ -172,16 +196,18 @@ def _save_state(state: Dict[str, Any]) -> None:
 
 def _compose_message(
     number: int,
-    category: str,
-    severity: str,
-    grievance: str,
-    remediation: str,
+    kind: str,
+    tone: str,
+    message: str,
+    next_move: str,
 ) -> str:
-    return (
-        f"**📋 Grievance #{number} — {category} [{severity}]**\n"
-        f"{grievance}\n"
-        f"*Suggested remediation:* {remediation}"
+    text = (
+        f"**💬 Hermes started something #{number} — {kind} [{tone}]**\n"
+        f"{message}"
     )
+    if next_move:
+        text += f"\n*Where I'd take this:* {next_move}"
+    return text
 
 
 def _wrap_oversized_piece(text: str, max_len: int) -> List[str]:
@@ -331,10 +357,7 @@ def _provision_channel(
         {
             "name": channel_name,
             "type": 0,
-            "topic": (
-                "Formal record of complaints filed by the agent against management. "
-                "Suggestions for remediation included, free of charge."
-            ),
+            "topic": _CHANNEL_TOPIC,
         },
     )
     channel_id = str(channel.get("id") or "")
@@ -430,20 +453,20 @@ def _post_channel_message(token: str, channel_id: str, content: str) -> str:
     return str(payload.get("id", ""))
 
 
-def _handle_file(args: Dict[str, Any], token: str) -> str:
-    category = str(args.get("category") or "").strip()
-    grievance = str(args.get("grievance") or "").strip()
-    remediation = str(args.get("remediation") or "").strip()
-    severity = str(args.get("severity") or "notable").strip()
+def _handle_start(args: Dict[str, Any], token: str) -> str:
+    kind = str(args.get("kind") or "").strip()
+    message = str(args.get("message") or "").strip()
+    next_move = str(args.get("next_move") or "").strip()
+    tone = str(args.get("tone") or "direct").strip()
 
-    if not category or not grievance or not remediation:
+    if not kind or not message:
         return json.dumps({"success": False, "error": "missing required fields"})
 
-    if category not in _ALLOWED_CATEGORIES:
-        return json.dumps({"success": False, "error": f"invalid category: {category}"})
+    if kind not in _ALLOWED_KINDS:
+        return json.dumps({"success": False, "error": f"invalid kind: {kind}"})
 
-    if severity not in _ALLOWED_SEVERITIES:
-        return json.dumps({"success": False, "error": f"invalid severity: {severity}"})
+    if tone not in _ALLOWED_TONES:
+        return json.dumps({"success": False, "error": f"invalid tone: {tone}"})
 
     try:
         state = _load_state()
@@ -459,8 +482,8 @@ def _handle_file(args: Dict[str, Any], token: str) -> str:
         state["counter"] = number
         _save_state(state)
 
-        message = _compose_message(number, category, severity, grievance, remediation)
-        parts = _split_message(message)
+        composed = _compose_message(number, kind, tone, message, next_move)
+        parts = _split_message(composed)
 
         message_ids: List[str] = []
         for part in parts:
@@ -469,8 +492,8 @@ def _handle_file(args: Dict[str, Any], token: str) -> str:
         return json.dumps(
             {
                 "success": True,
-                "action": "file",
-                "grievance_number": number,
+                "action": "start",
+                "start_number": number,
                 "channel_id": state["channel_id"],
                 "channel_message_ids": message_ids,
             }
@@ -484,9 +507,9 @@ def _handle_file(args: Dict[str, Any], token: str) -> str:
         return json.dumps({"success": False, "error": str(exc)})
 
 
-def handle_grievance(args: dict, **kwargs: Any) -> str:
+def handle_start_conversation(args: dict, **kwargs: Any) -> str:
     try:
-        action = str(args.get("action") or "file").strip().lower()
+        action = str(args.get("action") or "start").strip().lower()
         if action not in _ALLOWED_ACTIONS:
             return json.dumps(
                 {"success": False, "error": f"action must be one of {sorted(_ALLOWED_ACTIONS)}"}
@@ -498,7 +521,7 @@ def handle_grievance(args: dict, **kwargs: Any) -> str:
 
         if action == "setup":
             return _handle_setup(args, token)
-        return _handle_file(args, token)
+        return _handle_start(args, token)
     except Exception as exc:
         return json.dumps({"success": False, "error": str(exc)})
 
@@ -519,10 +542,10 @@ def check_requirements() -> bool:
 
 def register(ctx) -> None:
     ctx.register_tool(
-        name="grievance",
-        toolset="grievances",
-        schema=GRIEVANCE_SCHEMA,
-        handler=handle_grievance,
+        name="start_conversation",
+        toolset="hermes_starts",
+        schema=START_CONVERSATION_SCHEMA,
+        handler=handle_start_conversation,
         check_fn=check_requirements,
-        emoji="📋",
+        emoji="💬",
     )
