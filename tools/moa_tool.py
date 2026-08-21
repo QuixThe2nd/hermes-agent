@@ -15,6 +15,7 @@ from agent.moa_loop import (
     _preset_temperature,
     _reference_messages,
     _run_references_parallel,
+    tool_stage_reporter,
 )
 from agent.redact import redact_sensitive_text
 from hermes_cli.moa_config import normalize_moa_config
@@ -122,9 +123,13 @@ def moa_ask(
     evidence: str | None = None,
     decision_needed: str | None = None,
     task_id: str | None = None,
+    session_id: str | None = None,
 ) -> str:
     """Run the default MoA references once and return their advice as JSON."""
-    del task_id  # Reserved for future progress-event correlation.
+    # task_id is turn-scoped, so the reporter mints its own per-invocation
+    # correlation id and carries task_id only as turn context. No gateway
+    # subscription (CLI, direct calls, tests) means no stage events at all.
+    report = tool_stage_reporter(session_id, task_id, "moa_ask")
 
     clean_question = str(question or "").strip()
     clean_evidence = str(evidence or "").strip()
@@ -139,24 +144,33 @@ def moa_ask(
             success=False,
         )
 
+    report("starting")
     try:
         preset_name, preset = _default_preset()
     except Exception as exc:
         logger.warning("Could not load MoA config for moa_ask: %s", exc)
+        report("complete", status="failure")
         return tool_error("could not load the active MoA configuration", success=False)
 
     if not preset.get("enabled", True):
+        report("complete", status="failure")
         return tool_error(
             f"default MoA preset '{preset_name}' is disabled", success=False
         )
 
     reference_models = list(preset.get("reference_models") or [])
     if not reference_models:
+        report("complete", status="failure")
         return tool_error(
             f"default MoA preset '{preset_name}' has no reference models",
             success=False,
         )
 
+    report(
+        "advisors",
+        advisors=len(reference_models),
+        models=len({str(slot.get("model") or "") for slot in reference_models}),
+    )
     ref_messages = _reference_messages([{"role": "user", "content": prompt}])
     try:
         outputs = _run_references_parallel(
@@ -167,6 +181,7 @@ def moa_ask(
         )
     except Exception as exc:  # Defensive: individual references already fail soft.
         logger.warning("moa_ask reference fan-out failed: %s", exc)
+        report("complete", status="failure", advisors=len(reference_models))
         return tool_error("MoA reference fan-out failed", success=False)
 
     advisors = []
@@ -197,6 +212,19 @@ def moa_ask(
         )
 
     success = usable > 0
+    report(
+        "aggregating",
+        advisors=len(reference_models),
+        usable=usable,
+        failed=failed,
+    )
+    report(
+        "complete",
+        status="success" if success and not failed else ("partial" if success else "failure"),
+        advisors=len(reference_models),
+        usable=usable,
+        failed=failed,
+    )
     return tool_result(
         success=success,
         partial=success and failed > 0,
@@ -222,6 +250,7 @@ registry.register(
         evidence=args.get("evidence"),
         decision_needed=args.get("decision_needed"),
         task_id=kw.get("task_id"),
+        session_id=kw.get("session_id"),
     ),
     check_fn=check_moa_requirements,
     emoji="🧠",

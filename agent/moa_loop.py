@@ -13,9 +13,10 @@ import logging
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, wait as _futures_wait
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 from agent.auxiliary_client import call_llm
 from agent.message_content import flatten_message_text
@@ -2451,3 +2452,107 @@ def build_moa_facade(agent, preset_name: Any = None) -> MoAClient:
         # aborted on a user interrupt (see _run_references_parallel).
         agent=agent,
     )
+
+
+# --- Structured tool stage events ---------------------------------------
+#
+# Registry tool handlers get ``task_id`` (turn-scoped: every tool call in a
+# turn shares it) and ``session_id`` dispatch kwargs but no route to the
+# agent's progress callback, so a tool cannot report per-invocation progress
+# on its own. This bus is the weakest sufficient bridge: the gateway
+# subscribes per session for the surfaces that render stage cards (Discord),
+# tools publish aggregate-only stage events, and every other surface — CLI,
+# TUI, ACP, direct calls, tests — sees nothing at all because no subscriber
+# exists. Nothing here fans out through ``tool_progress_callback``, so no
+# existing event consumer can observe these events.
+#
+# Safety contract for events placed on the bus: the payload is an allowlist
+# (tool name, stage id, optional terminal status, per-invocation correlation
+# id, and integer aggregate counts). Never a prompt, evidence, an advisor
+# answer, a config blob, or raw tool arguments.
+
+_TOOL_STAGE_LOCK = threading.Lock()
+_TOOL_STAGE_SUBSCRIBERS: dict[str, Callable[[dict], None]] = {}
+
+
+def subscribe_tool_stage_events(
+    session_id: str | None, callback: Callable[[dict], None]
+) -> Callable[[], None]:
+    """Register *callback* as the stage-event deliverer for a session.
+
+    Returns an unsubscribe callable. One subscriber per session, newest
+    wins: turns within a session are serialized, but a queued follow-up
+    recurses into a nested turn while the parent subscription is still
+    live, and without replacement the parent would double-render the
+    nested turn's events. Unsubscribing restores whatever was registered
+    before, so the parent picks its own events back up while unwinding.
+    """
+    if not session_id:
+        return lambda: None
+    with _TOOL_STAGE_LOCK:
+        previous = _TOOL_STAGE_SUBSCRIBERS.get(session_id)
+        _TOOL_STAGE_SUBSCRIBERS[session_id] = callback
+
+    def _unsubscribe() -> None:
+        with _TOOL_STAGE_LOCK:
+            if _TOOL_STAGE_SUBSCRIBERS.get(session_id) is callback:
+                if previous is None:
+                    _TOOL_STAGE_SUBSCRIBERS.pop(session_id, None)
+                else:
+                    _TOOL_STAGE_SUBSCRIBERS[session_id] = previous
+
+    return _unsubscribe
+
+
+def publish_tool_stage(session_id: str | None, event: dict) -> None:
+    """Deliver one stage event to the session's subscriber, fail-soft.
+
+    Called from tool worker threads; subscriber exceptions are swallowed
+    so progress rendering can never fail the tool that reported it.
+    """
+    if not session_id:
+        return
+    try:
+        with _TOOL_STAGE_LOCK:
+            callback = _TOOL_STAGE_SUBSCRIBERS.get(session_id)
+        if callback is None:
+            return
+        callback(event)
+    except Exception:
+        logger.debug("tool stage event delivery failed", exc_info=True)
+
+
+def tool_stage_reporter(
+    session_id: str | None, task_id: str | None, tool_name: str
+) -> Callable[..., None]:
+    """Bind a fail-soft stage reporter to one tool invocation.
+
+    ``task_id`` stays in the event as the turn correlation, but the
+    reporter mints its own per-invocation id: concurrent invocations in
+    one turn share the task_id, so it cannot alone tell their events
+    apart. Counts passed through ``**counts`` are coerced to ints and
+    anything non-numeric is dropped — the allowlist is enforced here so
+    callers cannot accidentally leak text into an event.
+    """
+    invocation_id = uuid.uuid4().hex
+
+    def report(stage: str, status: str | None = None, **counts: Any) -> None:
+        publish_tool_stage(
+            session_id,
+            {
+                "type": "tool.stage",
+                "tool": tool_name,
+                "invocation_id": invocation_id,
+                "stage": str(stage),
+                "status": status,
+                "terminal": status is not None,
+                "task_id": task_id,
+                "counts": {
+                    str(key): int(value)
+                    for key, value in counts.items()
+                    if isinstance(value, (int, float)) and not isinstance(value, bool)
+                },
+            },
+        )
+
+    return report

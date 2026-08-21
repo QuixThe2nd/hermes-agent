@@ -32,6 +32,7 @@ from agent.moa_loop import (
     _reference_messages,
     _run_reference,
     _run_references_parallel,
+    tool_stage_reporter,
 )
 from agent.redact import redact_sensitive_text
 from tools.moa_tool import (
@@ -331,9 +332,12 @@ def moa_debate(
     revision: bool = False,
     detail: str = "full",
     task_id: str | None = None,
+    session_id: str | None = None,
 ) -> str:
     """Run a bounded debate among the MoA references; return rounds as JSON."""
-    del task_id  # Reserved for future progress-event correlation.
+    # Same correlation contract as consult_moa: the reporter owns the
+    # per-invocation id, task_id rides along as turn context only.
+    report = tool_stage_reporter(session_id, task_id, "moa_debate")
 
     clean_question = str(question or "").strip()
     clean_evidence = str(evidence or "").strip()
@@ -348,24 +352,33 @@ def moa_debate(
             success=False,
         )
 
+    report("starting")
     try:
         preset_name, preset = _default_preset()
     except Exception as exc:
         logger.warning("Could not load MoA config for moa_debate: %s", exc)
+        report("complete", status="failure")
         return tool_error("could not load the active MoA configuration", success=False)
 
     if not preset.get("enabled", True):
+        report("complete", status="failure")
         return tool_error(
             f"default MoA preset '{preset_name}' is disabled", success=False
         )
     reference_models = list(preset.get("reference_models") or [])
     if not reference_models:
+        report("complete", status="failure")
         return tool_error(
             f"default MoA preset '{preset_name}' has no reference models",
             success=False,
         )
 
     # ---- Round 1: independent proposals --------------------------------
+    report(
+        "proposal",
+        advisors=len(reference_models),
+        models=len({str(slot.get("model") or "") for slot in reference_models}),
+    )
     ref_messages = _reference_messages([{"role": "user", "content": prompt}])
     try:
         outputs = _run_references_parallel(
@@ -376,6 +389,7 @@ def moa_debate(
         )
     except Exception as exc:  # Defensive: individual references already fail soft.
         logger.warning("moa_debate proposal fan-out failed: %s", exc)
+        report("complete", status="failure", advisors=len(reference_models))
         return tool_error("MoA debate proposal fan-out failed", success=False)
 
     advisors: list[dict[str, Any]] = []
@@ -400,14 +414,28 @@ def moa_debate(
 
     ok_advisors = [a for a in advisors if a["status"] == "ok"]
     any_failed = any(a["status"] != "ok" for a in advisors)
+    failed_count = sum(1 for a in advisors if a["status"] != "ok")
 
     if not ok_advisors:
+        report(
+            "complete",
+            status="failure",
+            advisors=len(reference_models),
+            failed=failed_count,
+        )
         return tool_error("all debate advisors failed in the proposal round", success=False)
 
     if len(ok_advisors) < 2:
         # Degrade to a moa_ask-shaped single-advice result. A one-sided
         # "debate" would manufacture false legitimacy.
         only = ok_advisors[0]
+        report(
+            "complete",
+            status="degraded",
+            advisors=len(reference_models),
+            usable=1,
+            failed=failed_count,
+        )
         return tool_result(
             success=True,
             partial=True,
@@ -428,6 +456,7 @@ def moa_debate(
         )
 
     # ---- Round 2: cross-critique ---------------------------------------
+    report("critique", advisors=len(ok_advisors))
     critique_tasks = []
     critic_meta: list[dict[str, Any]] = []
     for critic in ok_advisors:
@@ -490,6 +519,7 @@ def moa_debate(
     revisions: list[dict[str, Any]] = []
     rounds_completed = 2
     if revision:
+        report("revision", advisors=len(ok_advisors))
         rounds_completed = 3
         revision_tasks = []
         revision_meta: list[dict[str, Any]] = []
@@ -547,10 +577,32 @@ def moa_debate(
                 }
             )
         any_failed = any_failed or any(r["status"] != "ok" for r in revisions)
+    else:
+        # Optional round declined: report the skip explicitly so the embed
+        # shows a terminal "skipped" line instead of silently omitting a
+        # round the user may have expected.
+        report("revision_skipped", advisors=len(ok_advisors))
 
     # ---- Mechanically derived agreement data ---------------------------
     agreement = _derive_agreement(ok_advisors, critiques)
 
+    failed_count += sum(1 for c in critiques if c["status"] != "ok")
+    failed_count += sum(1 for r in revisions if r["status"] != "ok")
+    report(
+        "aggregating",
+        advisors=len(reference_models),
+        rounds=rounds_completed,
+        usable=len(ok_advisors),
+        failed=failed_count,
+    )
+    report(
+        "complete",
+        status="partial" if any_failed else "success",
+        advisors=len(reference_models),
+        rounds=rounds_completed,
+        usable=len(ok_advisors),
+        failed=failed_count,
+    )
     return tool_result(
         success=True,
         partial=any_failed,
@@ -705,6 +757,7 @@ registry.register(
         revision=bool(args.get("revision", False)),
         detail=str(args.get("detail") or "full"),
         task_id=kw.get("task_id"),
+        session_id=kw.get("session_id"),
     ),
     check_fn=check_moa_requirements,
     emoji="⚔️",
