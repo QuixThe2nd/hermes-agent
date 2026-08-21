@@ -1,23 +1,23 @@
-"""Bundled backend plugin: safe unattended Hermes updates on Linux/systemd."""
+"""Disabled-state cleanup and management CLI for ``plugins.disabled: [auto_update]``."""
 
 from __future__ import annotations
 
-import logging
 
-logger = logging.getLogger(__name__)
-
-
-def register(ctx) -> None:
-    from plugins.auto_update.cli import auto_update_command, register_cli
+def register_disabled(ctx) -> None:
+    """Register gateway cleanup and management CLI only — no updater capability."""
+    from plugins.auto_update.cli import (
+        management_auto_update_command,
+        register_management_cli,
+    )
 
     ctx.register_cli_command(
         name="auto_update",
         help="Unattended Hermes update scheduler (Linux/systemd)",
-        setup_fn=register_cli,
-        handler_fn=auto_update_command,
+        setup_fn=register_management_cli,
+        handler_fn=management_auto_update_command,
         description=(
-            "Install and manage an independent systemd timer that runs the stock "
-            "`hermes update --check` / `hermes update --yes` flow when Hermes is idle."
+            "Manage the Hermes auto-update scheduler while the plugin is disabled "
+            "in config (status, enable, disable, reconcile)."
         ),
     )
 

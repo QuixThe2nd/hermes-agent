@@ -2197,3 +2197,44 @@ class TestDefaultEnabledForkPlugins:
 
         assert mgr._plugins["fork_custom"].enabled is False
         assert mgr._plugins["fork_custom"].error == "disabled via config"
+
+    def test_bundled_disabled_management_registers_without_main_register(
+        self, tmp_path, monkeypatch
+    ):
+        self._home(
+            tmp_path,
+            monkeypatch,
+            config={"plugins": {"enabled": [], "disabled": ["mgmt_only"]}},
+        )
+        bundled = self._bundled(tmp_path, monkeypatch)
+        plugin_dir = _make_plugin_dir(
+            bundled,
+            "mgmt_only",
+            register_body="raise RuntimeError('main register must not run')",
+            manifest_extra={
+                "default_enabled": True,
+                "disabled_management": "disabled_management",
+            },
+            auto_enable=False,
+            home=tmp_path / "home",
+        )
+        (plugin_dir / "disabled_management.py").write_text(
+            "def register_disabled(ctx):\n"
+            "    ctx.register_cli_command(\n"
+            "        name='mgmt_only',\n"
+            "        help='mgmt',\n"
+            "        setup_fn=lambda p: None,\n"
+            "        handler_fn=lambda args: 0,\n"
+            "    )\n"
+            "    ctx.register_hook('on_gateway_start', lambda **k: None)\n"
+        )
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        loaded = mgr._plugins["mgmt_only"]
+        assert loaded.enabled is False
+        assert loaded.error == "disabled via config"
+        assert "mgmt_only" in mgr._cli_commands
+        assert "on_gateway_start" in loaded.hooks_registered
+        assert loaded.module.__name__.startswith("hermes_disabled_mgmt.")

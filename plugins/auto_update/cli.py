@@ -13,7 +13,6 @@ from plugins.auto_update.lifecycle import reconcile_scheduler_on_load
 from plugins.auto_update.runner import run_scheduled_update
 from plugins.auto_update.systemd import (
     ReconcileResult,
-    disable_timer,
     format_status,
     linger_warning,
     reconcile_units,
@@ -23,6 +22,25 @@ from plugins.auto_update.systemd import (
 
 def _effective_enabled() -> bool:
     return not plugin_explicitly_disabled() and load_auto_update_config()["enabled"]
+
+
+def _management_failed(result: ReconcileResult, *, want_enabled: bool) -> bool:
+    """True when reconcile did not achieve the intended scheduler state."""
+    if not result.supported:
+        return True
+    operational_warnings = [
+        w
+        for w in result.warnings
+        if w.startswith("failed to")
+        or w == "timer enabled but not active"
+    ]
+    if want_enabled:
+        if not result.enabled:
+            return True
+        return bool(operational_warnings)
+    if result.enabled or result.timer_active:
+        return True
+    return bool(operational_warnings)
 
 
 def cmd_status() -> int:
@@ -82,17 +100,20 @@ def cmd_enable() -> int:
     if result is None:
         result = reconcile_units(load_auto_update_config(), enabled=True)
     print(format_status(result))
+    if _management_failed(result, want_enabled=True):
+        return 1
     print(f"Scheduler installed under {display_hermes_home()}.")
-    return 0 if result.supported else 1
+    return 0
 
 
 def cmd_disable() -> int:
     _save_enabled_flag(False)
     result = reconcile_scheduler_on_load()
-    if result is None and platform_supported():
-        scope = detect_install_scope()
-        if scope is not None:
-            disable_timer(scope)
+    if result is None:
+        result = reconcile_units(load_auto_update_config(), enabled=False)
+    if result is not None and _management_failed(result, want_enabled=False):
+        print(format_status(result))
+        return 1
     print("Hermes auto-update disabled; timer stopped.")
     return 0
 
@@ -103,7 +124,11 @@ def cmd_reconcile() -> int:
         enabled = _effective_enabled()
         result = reconcile_units(load_auto_update_config(), enabled=enabled)
     print(format_status(result))
-    return 0 if result.supported or not platform_supported() else 1
+    if not result.supported and platform_supported():
+        return 1
+    if _management_failed(result, want_enabled=_effective_enabled()):
+        return 1
+    return 0
 
 
 def cmd_run() -> int:
@@ -113,7 +138,8 @@ def cmd_run() -> int:
     return 0 if outcome.code == 0 else outcome.code
 
 
-def register_cli(subparser: argparse.ArgumentParser) -> None:
+def register_management_cli(subparser: argparse.ArgumentParser):
+    """Register management subcommands only (no ``run`` oneshot entrypoint)."""
     subs = subparser.add_subparsers(dest="auto_update_command")
     subs.add_parser("status", help="Show scheduler and config status")
     subs.add_parser("enable", help="Enable unattended updates and install the timer")
@@ -122,6 +148,11 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         "reconcile",
         help="Rewrite systemd units idempotently (respects explicit disable)",
     )
+    return subs
+
+
+def register_cli(subparser: argparse.ArgumentParser) -> None:
+    subs = register_management_cli(subparser)
     subs.add_parser(
         "run",
         help="Run one scheduled update attempt (systemd oneshot entrypoint)",
@@ -141,6 +172,24 @@ def auto_update_command(args: argparse.Namespace) -> int:
     if sub == "run":
         return cmd_run()
     print("usage: hermes auto_update {status,enable,disable,reconcile,run}")
+    return 2
+
+
+def management_auto_update_command(args: argparse.Namespace) -> int:
+    """Handler for disabled-management CLI — no ``run`` oneshot entrypoint."""
+    sub = getattr(args, "auto_update_command", None)
+    if sub == "run":
+        print("usage: hermes auto_update {status,enable,disable,reconcile}")
+        return 2
+    if sub == "status":
+        return cmd_status()
+    if sub == "enable":
+        return cmd_enable()
+    if sub == "disable":
+        return cmd_disable()
+    if sub == "reconcile":
+        return cmd_reconcile()
+    print("usage: hermes auto_update {status,enable,disable,reconcile}")
     return 2
 
 

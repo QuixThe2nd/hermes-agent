@@ -180,6 +180,12 @@ def default_systemctl_runner(args: Sequence[str]) -> tuple[int, str, str]:
         return 1, "", str(exc)
 
 
+def _resolve_systemctl_runner(
+    run_systemctl: Callable[[Sequence[str]], tuple[int, str, str]] | None,
+) -> Callable[[Sequence[str]], tuple[int, str, str]]:
+    return run_systemctl or default_systemctl_runner
+
+
 def timer_stamp_path(scope: InstallScope, timer_name: str = TIMER_NAME) -> Path:
     if scope.system:
         base = Path("/var/lib/systemd/timers")
@@ -210,9 +216,10 @@ def _write_timer_stamp(path: Path, payload: str) -> None:
 def timer_is_active(
     scope: InstallScope,
     *,
-    run_systemctl: Callable[[Sequence[str]], tuple[int, str, str]] = default_systemctl_runner,
+    run_systemctl: Callable[[Sequence[str]], tuple[int, str, str]] | None = None,
 ) -> bool:
-    code, out, _ = run_systemctl(
+    runner = _resolve_systemctl_runner(run_systemctl)
+    code, out, _ = runner(
         build_systemctl_cmd(scope, "is-active", TIMER_NAME)
     )
     return code == 0 and out.strip() == "active"
@@ -221,21 +228,38 @@ def timer_is_active(
 def timer_is_enabled(
     scope: InstallScope,
     *,
-    run_systemctl: Callable[[Sequence[str]], tuple[int, str, str]] = default_systemctl_runner,
+    run_systemctl: Callable[[Sequence[str]], tuple[int, str, str]] | None = None,
 ) -> bool:
-    code, out, _ = run_systemctl(
+    runner = _resolve_systemctl_runner(run_systemctl)
+    code, out, _ = runner(
         build_systemctl_cmd(scope, "is-enabled", TIMER_NAME)
     )
     return code == 0 and out.strip() in {"enabled", "static"}
 
 
+def expected_timer_disable_argv(scope: InstallScope) -> list[list[str]]:
+    """Exact stop+disable argv pair for the timer unit (never the oneshot service)."""
+    return [
+        build_systemctl_cmd(scope, "stop", TIMER_NAME),
+        build_systemctl_cmd(scope, "disable", TIMER_NAME),
+    ]
+
+
 def disable_timer(
     scope: InstallScope,
     *,
-    run_systemctl: Callable[[Sequence[str]], tuple[int, str, str]] = default_systemctl_runner,
-) -> None:
+    run_systemctl: Callable[[Sequence[str]], tuple[int, str, str]] | None = None,
+) -> tuple[str, ...]:
     """Stop/disable the timer only — never stop the oneshot service."""
-    run_systemctl(build_systemctl_cmd(scope, "disable", "--now", TIMER_NAME))
+    runner = _resolve_systemctl_runner(run_systemctl)
+    warnings: list[str] = []
+    for argv in expected_timer_disable_argv(scope):
+        code, _, err = runner(argv)
+        if code != 0:
+            action = argv[-2] if len(argv) >= 2 else "control"
+            detail = err.strip() or str(code)
+            warnings.append(f"failed to {action} timer: {detail}")
+    return tuple(warnings)
 
 
 def user_linger_enabled(*, username: str | None = None) -> bool:
@@ -265,10 +289,11 @@ def reconcile_units(
     cfg: Mapping[str, object],
     *,
     enabled: bool,
-    run_systemctl: Callable[[Sequence[str]], tuple[int, str, str]] = default_systemctl_runner,
+    run_systemctl: Callable[[Sequence[str]], tuple[int, str, str]] | None = None,
     scope: InstallScope | None = None,
     write_stamp: Callable[[Path, str], None] | None = None,
 ) -> ReconcileResult:
+    runner = _resolve_systemctl_runner(run_systemctl)
     if not platform_supported():
         return ReconcileResult(
             supported=False,
@@ -293,15 +318,15 @@ def reconcile_units(
         )
 
     if not enabled:
-        disable_timer(selected, run_systemctl=run_systemctl)
+        disable_warnings = disable_timer(selected, run_systemctl=runner)
         return ReconcileResult(
             supported=True,
             scope=selected,
             changed=False,
-            enabled=False,
-            timer_active=False,
+            enabled=timer_is_enabled(selected, run_systemctl=runner),
+            timer_active=timer_is_active(selected, run_systemctl=runner),
             legacy=(),
-            warnings=(),
+            warnings=disable_warnings,
         )
 
     hermes_home = str(get_hermes_home().resolve())
@@ -321,12 +346,19 @@ def reconcile_units(
         service_body=service_body,
         timer_body=timer_body,
     )
+    warnings: list[str] = []
     if changed:
-        run_systemctl(build_systemctl_cmd(selected, "daemon-reload"))
+        code, _, err = runner(
+            build_systemctl_cmd(selected, "daemon-reload")
+        )
+        if code != 0:
+            warnings.append(
+                f"failed to daemon-reload: {err.strip() or code}"
+            )
 
-    legacy = migrate_legacy_units(selected, run_systemctl=run_systemctl)
-    warnings = list(legacy.warnings)
-    if duplicate_scheduler_present(selected, run_systemctl=run_systemctl):
+    legacy = migrate_legacy_units(selected, run_systemctl=runner)
+    warnings.extend(legacy.warnings)
+    if duplicate_scheduler_present(selected, run_systemctl=runner):
         warnings.append(
             "legacy hermes-auto-update.timer still present; refusing duplicate schedulers"
         )
@@ -341,14 +373,19 @@ def reconcile_units(
         )
 
     # Enable/start TIMER ONLY — never start the oneshot service immediately.
-    if not timer_is_enabled(selected, run_systemctl=run_systemctl):
+    if not timer_is_enabled(selected, run_systemctl=runner):
         prestamp_timer(selected, write_stamp=write_stamp)
 
-    code, _, err = run_systemctl(
+    code, _, err = runner(
         build_systemctl_cmd(selected, "enable", "--now", TIMER_NAME)
     )
     if code != 0:
         warnings.append(f"failed to enable timer: {err.strip() or code}")
+
+    enabled_state = timer_is_enabled(selected, run_systemctl=runner)
+    timer_active = timer_is_active(selected, run_systemctl=runner)
+    if enabled_state and not timer_active:
+        warnings.append("timer enabled but not active")
 
     linger = linger_warning(selected)
     if linger:
@@ -358,8 +395,8 @@ def reconcile_units(
         supported=True,
         scope=selected,
         changed=changed,
-        enabled=True,
-        timer_active=timer_is_active(selected, run_systemctl=run_systemctl),
+        enabled=enabled_state,
+        timer_active=timer_active,
         legacy=legacy.disabled_units,
         warnings=tuple(warnings),
     )

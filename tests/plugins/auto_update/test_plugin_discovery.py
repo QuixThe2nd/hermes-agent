@@ -125,9 +125,8 @@ def test_explicit_disable_wins(hermes_home, monkeypatch, tmp_path):
     loaded = mgr._plugins["auto_update"]
     assert loaded.enabled is False
     assert loaded.error == "disabled via config"
-    # plugins.disabled skips register() entirely: no CLI, no on_gateway_start
-    # hook — so it cannot stop an installed timer (documented contract).
-    assert "auto_update" not in mgr._cli_commands
+    assert "auto_update" in mgr._cli_commands
+    assert "on_gateway_start" in loaded.hooks_registered
     assert list(unit_dir.iterdir()) == []
 
 

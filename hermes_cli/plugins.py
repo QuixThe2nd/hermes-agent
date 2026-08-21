@@ -689,6 +689,29 @@ _CONFIG_SCHEMA_TYPES: Dict[str, tuple] = {
 }
 
 
+def _parse_disabled_management_field(raw: Any, key: str) -> str:
+    """Normalize the bundled-only disabled-management module stem."""
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        logger.warning(
+            "Plugin %s: disabled_management must be a module stem string; ignoring",
+            key,
+        )
+        return ""
+    stem = raw.strip()
+    if not stem:
+        return ""
+    if "/" in stem or "\\" in stem or stem.startswith("."):
+        logger.warning(
+            "Plugin %s: disabled_management %r must be a bare module stem; ignoring",
+            key,
+            raw,
+        )
+        return ""
+    return stem
+
+
 def _parse_manifest_v2_fields(data: Mapping, key: str) -> Dict[str, Any]:
     """Validate and normalize the manifest v2 fields (#64165).
 
@@ -1079,6 +1102,12 @@ class PluginManifest:
     # user-installed and project plugins (untrusted code stays behind the
     # allowlist). ``plugins.disabled`` still wins.
     default_enabled: bool = False
+    # Bundled-only: relative ``.py`` module stem (no path separators) imported
+    # when ``plugins.disabled`` skips normal ``register()``. The module must
+    # expose ``register_disabled(ctx)`` to register cleanup hooks and
+    # management CLI only — never full plugin capability. Ignored for user,
+    # project, and entry-point plugins (untrusted code stays unimported).
+    disabled_management: str = ""
     skill_namespace: str = ""
     # Declared capability ids from the manifest ``capabilities:`` list
     # (#64228). Normalized to KNOWN ids only — see
@@ -3952,6 +3981,8 @@ class PluginManager:
                 loaded = LoadedPlugin(manifest=manifest, enabled=False)
                 loaded.error = "disabled via config"
                 self._plugins[lookup_key] = loaded
+                if manifest.source == "bundled" and manifest.disabled_management:
+                    self._load_disabled_management(manifest, loaded)
                 logger.debug("Skipping disabled plugin '%s'", lookup_key)
                 continue
 
@@ -4397,6 +4428,9 @@ class PluginManager:
                 kind=kind,
                 key=key,
                 default_enabled=data.get("default_enabled", False) is True,
+                disabled_management=_parse_disabled_management_field(
+                    data.get("disabled_management"), key
+                ),
                 capabilities=_parse_declared_capabilities(
                     data.get("capabilities"), name
                 ),
@@ -4783,6 +4817,112 @@ class PluginManager:
         """Import a plugin module and call its ``register(ctx)`` function."""
         with self._discovery_lock, _plugin_home_scope(self.home_path):
             self._load_plugin_scoped(manifest)
+
+    def _load_disabled_management(
+        self, manifest: PluginManifest, loaded: LoadedPlugin
+    ) -> None:
+        """Import a bundled plugin's disabled-management module only."""
+        with self._discovery_lock, _plugin_home_scope(self.home_path):
+            self._load_disabled_management_scoped(manifest, loaded)
+
+    def _load_disabled_management_scoped(
+        self, manifest: PluginManifest, loaded: LoadedPlugin
+    ) -> None:
+        """Call ``register_disabled(ctx)`` without loading the main plugin."""
+        plugin_key = manifest.key or manifest.name
+        registration_start = len(self._registration_order)
+        try:
+            module = self._load_disabled_management_module(manifest)
+            loaded.module = module
+            register_fn = getattr(module, "register_disabled", None)
+            if register_fn is None:
+                logger.warning(
+                    "Plugin '%s' disabled_management module has no register_disabled()",
+                    plugin_key,
+                )
+                return
+            ctx = PluginContext(manifest, self)
+            register_fn(ctx)
+            registrations = [
+                registration
+                for registration in self._registration_order[registration_start:]
+                if registration.plugin_key == plugin_key and registration.active
+            ]
+            loaded.hooks_registered = [
+                registration.key
+                for registration in registrations
+                if registration.kind == "hook"
+            ]
+            loaded.commands_registered = [
+                registration.key
+                for registration in registrations
+                if registration.kind == "command"
+            ]
+            loaded.tools_registered = [
+                registration.key
+                for registration in registrations
+                if registration.kind == "tool"
+            ]
+            logger.debug(
+                "  disabled-management registered: %d hook(s), %d CLI command(s)",
+                len(loaded.hooks_registered),
+                sum(
+                    1
+                    for registration in registrations
+                    if registration.kind == "cli_command"
+                ),
+            )
+        except Exception as exc:
+            owned = [
+                registration
+                for registration in self._registration_order
+                if registration.plugin_key == plugin_key
+            ]
+            self._dispose_registrations(owned)
+            self._forget_registrations(owned)
+            self._remove_plugin_subscriptions(plugin_key)
+            logger.warning(
+                "Failed to load disabled-management for plugin '%s': %s",
+                plugin_key,
+                exc,
+                exc_info=_PLUGINS_DEBUG,
+            )
+
+    def _load_disabled_management_module(
+        self, manifest: PluginManifest
+    ) -> types.ModuleType:
+        """Import ``disabled_management`` without executing ``register()``."""
+        plugin_dir = Path(manifest.path)  # type: ignore[arg-type]
+        stem = manifest.disabled_management
+        module_file = plugin_dir / f"{stem}.py"
+        if not module_file.is_file():
+            raise FileNotFoundError(f"No {stem}.py in {plugin_dir}")
+
+        slug = self._directory_module_name(manifest).replace(".", "_")
+        module_name = f"hermes_disabled_mgmt.{slug}.{stem}"
+        stale_prefix = f"{module_name}."
+        for name in [
+            n for n in sys.modules if n == module_name or n.startswith(stale_prefix)
+        ]:
+            del sys.modules[name]
+
+        spec = importlib.util.spec_from_file_location(module_name, module_file)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot create module spec for {module_file}")
+
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            for name in [
+                n
+                for n in sys.modules
+                if n == module_name or n.startswith(stale_prefix)
+            ]:
+                del sys.modules[name]
+            raise
+        return module
 
     def _load_plugin_scoped(self, manifest: PluginManifest) -> None:
         """Load one plugin with the manager's home bound as current."""
