@@ -5366,16 +5366,19 @@ class TurnRunner:
             to_deliver.append(terminal if terminal is not None else events[-1])
         return to_deliver
 
+    _STAGE_DELIVERY_RECOVER_TIMEOUT = 10.0
+
     async def _deliver_tool_stage_event(
         self, event: dict, embed_msg_ids: Dict[str, str]
-    ) -> None:
+    ) -> bool:
+        """Return True when the adapter reported success (side effect happened)."""
         ctx = self._ctx
         adapter = ctx._stage_embed_adapter
         if adapter is None:
-            return
+            return False
         invocation = str(event.get("invocation_id") or "")
         if not invocation:
-            return
+            return False
         try:
             message_id = embed_msg_ids.get(invocation)
             if message_id is None:
@@ -5396,12 +5399,13 @@ class TurnRunner:
                 new_id = getattr(result, "message_id", None)
                 if new_id:
                     embed_msg_ids[invocation] = str(new_id)
-            else:
-                # Fail soft: forget the mapping so the NEXT event
-                # (usually the terminal one) sends a fresh embed
-                # instead of hammering a dead message id. A rendering
-                # failure must never alter the MoA tool's result.
-                embed_msg_ids.pop(invocation, None)
+                return True
+            # Fail soft: forget the mapping so the NEXT event
+            # (usually the terminal one) sends a fresh embed
+            # instead of hammering a dead message id. A rendering
+            # failure must never alter the MoA tool's result.
+            embed_msg_ids.pop(invocation, None)
+            return False
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -5409,6 +5413,75 @@ class TurnRunner:
                 "tool stage embed delivery failed: %s", e, exc_info=True
             )
             embed_msg_ids.pop(invocation, None)
+            return False
+
+    async def _deliver_stage_event_shielded(
+        self,
+        event: dict,
+        embed_msg_ids: Dict[str, str],
+        outcome_holder: Optional[dict] = None,
+    ) -> bool:
+        """Deliver under shield; on cancel recover the true outcome before re-raising.
+
+        Teardown can cancel the drain task while the adapter await is still
+        in flight. Shielding keeps the delivery task running so a post-side-
+        effect / pre-return race cannot lose the success outcome and trigger a
+        duplicate send on flush.
+        """
+        task = asyncio.create_task(
+            self._deliver_tool_stage_event(event, embed_msg_ids)
+        )
+
+        def _consume_detached_exception(t: asyncio.Task) -> None:
+            if not t.cancelled():
+                t.exception()
+
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            outcome = "unknown"
+            try:
+                delivered = await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=self._STAGE_DELIVERY_RECOVER_TIMEOUT,
+                )
+                outcome = "delivered" if delivered else "failed"
+            except (asyncio.TimeoutError, TimeoutError):
+                task.add_done_callback(_consume_detached_exception)
+            if outcome_holder is not None:
+                outcome_holder["outcome"] = outcome
+            raise
+
+    async def _flush_deliver_stage_event(
+        self, event: dict, embed_msg_ids: Dict[str, str], *, allow_retry: bool
+    ) -> None:
+        """Deliver one flush event with shielded cancel recovery."""
+        ctx = self._ctx
+        outcome_holder: dict = {}
+        try:
+            await self._deliver_stage_event_shielded(
+                event, embed_msg_ids, outcome_holder
+            )
+        except asyncio.CancelledError:
+            outcome = outcome_holder.get("outcome", "unknown")
+            if outcome == "delivered":
+                raise
+            if allow_retry:
+                retry_holder: dict = {}
+                try:
+                    await self._deliver_stage_event_shielded(
+                        event, embed_msg_ids, retry_holder
+                    )
+                except asyncio.CancelledError:
+                    retry_outcome = retry_holder.get("outcome", "unknown")
+                    if retry_outcome != "delivered":
+                        ctx.stage_event_queue.put_nowait(event)
+                    raise
+            else:
+                ctx.stage_event_queue.put_nowait(event)
+                raise
+        except Exception:
+            pass
 
     async def _flush_remaining_stage_embeds(
         self, embed_msg_ids: Dict[str, str]
@@ -5416,11 +5489,11 @@ class TurnRunner:
         """Deliver terminal (or last) queued event per invocation; fail-soft."""
         for event in self._collect_final_stage_events():
             try:
-                await self._deliver_tool_stage_event(event, embed_msg_ids)
+                await self._flush_deliver_stage_event(
+                    event, embed_msg_ids, allow_retry=True
+                )
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                pass
 
     async def send_tool_stage_embeds(self):
         ctx = self._ctx
@@ -5434,6 +5507,7 @@ class TurnRunner:
         # never cross-edit each other's embed.
         embed_msg_ids: Dict[str, str] = {}
         in_flight_event = None
+        in_flight_outcome: Optional[dict] = None
 
         try:
             while True:
@@ -5453,15 +5527,27 @@ class TurnRunner:
                     continue
 
                 in_flight_event = event
-                await self._deliver_tool_stage_event(event, embed_msg_ids)
+                in_flight_outcome = {}
+                await self._deliver_stage_event_shielded(
+                    event, embed_msg_ids, in_flight_outcome
+                )
                 in_flight_event = None
+                in_flight_outcome = None
         except asyncio.CancelledError:
             # Turn teardown cancels this task while a terminal event is still
             # queued (often during the idle sleep) or while its send/edit await
-            # is in flight. Re-queue the dequeued in-flight event so the flush
-            # path can deliver it exactly once, then propagate cancellation.
+            # is in flight. Re-queue only when the side effect did NOT land
+            # (failed/unknown); a delivered post-side-effect/pre-return race
+            # must not flush a duplicate embed.
             if in_flight_event is not None:
-                ctx.stage_event_queue.put_nowait(in_flight_event)
+                outcome = (
+                    in_flight_outcome.get("outcome", "unknown")
+                    if in_flight_outcome
+                    else "unknown"
+                )
+                if outcome != "delivered":
+                    ctx.stage_event_queue.put_nowait(in_flight_event)
+                in_flight_event = None
             try:
                 await self._flush_remaining_stage_embeds(embed_msg_ids)
             except asyncio.CancelledError:

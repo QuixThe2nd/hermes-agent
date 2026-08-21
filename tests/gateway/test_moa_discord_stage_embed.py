@@ -735,6 +735,93 @@ class _BlockingTerminalStageAdapter(_RecordingStageAdapter):
         )
 
 
+class _PostSideEffectBlockAdapter(_RecordingStageAdapter):
+    """Records a successful terminal side effect, then blocks before SendResult."""
+
+    def __init__(self):
+        super().__init__()
+        self.blocked = asyncio.Event()
+        self.release = asyncio.Event()
+        self.terminal_successful_side_effects = 0
+
+    async def _record_terminal_side_effect_and_block(
+        self, chat_id, stage, *, message_id=None, metadata=None, reply_to=None
+    ):
+        self._next_id += 1
+        msg_id = message_id or str(self._next_id)
+        record = {
+            "chat_id": chat_id,
+            "stage": dict(stage),
+            "metadata": metadata,
+            "ok": True,
+            "id": msg_id,
+        }
+        if message_id is None:
+            record["reply_to"] = reply_to
+            self.sends.append(record)
+        else:
+            record["message_id"] = message_id
+            self.edits.append(record)
+        self.terminal_successful_side_effects += 1
+        self.blocked.set()
+        await self.release.wait()
+        return SendResult(success=True, message_id=msg_id)
+
+    async def send_tool_stage_embed(self, chat_id, stage, metadata=None, reply_to=None):
+        if stage.get("terminal"):
+            return await self._record_terminal_side_effect_and_block(
+                chat_id, stage, metadata=metadata, reply_to=reply_to
+            )
+        return await super().send_tool_stage_embed(
+            chat_id, stage, metadata=metadata, reply_to=reply_to
+        )
+
+    async def edit_tool_stage_embed(self, chat_id, message_id, stage, metadata=None):
+        if stage.get("terminal"):
+            return await self._record_terminal_side_effect_and_block(
+                chat_id, stage, message_id=message_id, metadata=metadata
+            )
+        return await super().edit_tool_stage_embed(
+            chat_id, message_id, stage, metadata=metadata
+        )
+
+
+class _BlockingFailureTerminalAdapter(_RecordingStageAdapter):
+    """Blocks a terminal send/edit until release, then reports adapter failure."""
+
+    def __init__(self):
+        super().__init__()
+        self.blocked = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def _fail_terminal_after_block(self, chat_id, stage, *, message_id=None):
+        self.blocked.set()
+        await self.release.wait()
+        record = {"chat_id": chat_id, "stage": dict(stage), "ok": False}
+        if message_id is None:
+            self.sends.append(record)
+        else:
+            record["message_id"] = message_id
+            self.edits.append(record)
+        return SendResult(success=False, error="terminal boom")
+
+    async def send_tool_stage_embed(self, chat_id, stage, metadata=None, reply_to=None):
+        if stage.get("terminal"):
+            return await self._fail_terminal_after_block(chat_id, stage)
+        return await super().send_tool_stage_embed(
+            chat_id, stage, metadata=metadata, reply_to=reply_to
+        )
+
+    async def edit_tool_stage_embed(self, chat_id, message_id, stage, metadata=None):
+        if stage.get("terminal"):
+            return await self._fail_terminal_after_block(
+                chat_id, stage, message_id=message_id
+            )
+        return await super().edit_tool_stage_embed(
+            chat_id, message_id, stage, metadata=metadata
+        )
+
+
 def _successful_terminal_deliveries(adapter):
     return [
         record
@@ -786,6 +873,95 @@ async def test_drain_cancel_delivers_inflight_terminal():
         and record["stage"].get("invocation_id") != "inv-cancel-inflight"
     ]
     assert other_terminal == []
+
+
+@pytest.mark.asyncio
+async def test_drain_cancel_after_terminal_side_effect_is_exactly_once():
+    """Post-side-effect/pre-return cancel must not duplicate the terminal embed."""
+    from gateway.run import TurnRunner
+
+    adapter = _PostSideEffectBlockAdapter()
+    ctx = _stage_ctx(adapter)
+    runner = TurnRunner(_StubGatewayRunner(), ctx)
+    ctx.stage_event_queue.put_nowait(
+        _stage_event("consult_moa", "inv-post-side-effect", "starting")
+    )
+    ctx.stage_event_queue.put_nowait(
+        _stage_event(
+            "consult_moa",
+            "inv-post-side-effect",
+            "complete",
+            "success",
+            advisors=2,
+        )
+    )
+
+    task = asyncio.create_task(runner.send_tool_stage_embeds())
+    await asyncio.wait_for(adapter.blocked.wait(), timeout=2.0)
+
+    task.cancel()
+    adapter.release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert adapter.terminal_successful_side_effects == 1
+    terminal_deliveries = [
+        record
+        for record in adapter.ok_sends + adapter.ok_edits
+        if record.get("ok")
+        and record["stage"].get("terminal")
+        and record["stage"].get("invocation_id") == "inv-post-side-effect"
+    ]
+    assert len(terminal_deliveries) == 1
+    duplicate_terminal_deliveries = [
+        record
+        for record in adapter.ok_sends + adapter.ok_edits
+        if record.get("ok")
+        and record["stage"].get("terminal")
+        and record["stage"].get("invocation_id") != "inv-post-side-effect"
+    ]
+    assert duplicate_terminal_deliveries == []
+
+
+@pytest.mark.asyncio
+async def test_drain_cancel_retries_failed_terminal_once():
+    """Failed in-flight terminal delivery is retried exactly once on flush."""
+    from gateway.run import TurnRunner
+
+    adapter = _BlockingFailureTerminalAdapter()
+    ctx = _stage_ctx(adapter)
+    runner = TurnRunner(_StubGatewayRunner(), ctx)
+    ctx.stage_event_queue.put_nowait(
+        _stage_event("consult_moa", "inv-failed-terminal", "starting")
+    )
+    ctx.stage_event_queue.put_nowait(
+        _stage_event(
+            "consult_moa",
+            "inv-failed-terminal",
+            "complete",
+            "success",
+            advisors=2,
+        )
+    )
+
+    task = asyncio.create_task(runner.send_tool_stage_embeds())
+    await asyncio.wait_for(adapter.blocked.wait(), timeout=2.0)
+
+    task.cancel()
+    adapter.release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    terminal_attempts = [
+        record
+        for record in adapter.sends + adapter.edits
+        if record["stage"].get("terminal")
+        and record["stage"].get("invocation_id") == "inv-failed-terminal"
+    ]
+    assert len(terminal_attempts) == 2
+    assert all(not record.get("ok") for record in terminal_attempts)
 
 
 @pytest.mark.asyncio
