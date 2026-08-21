@@ -482,6 +482,13 @@ redundant-cast = "ignore"
 
 [tool.ruff]
 preview = true  # required for PLW1514 (unspecified-encoding) — preview rule
+exclude = [
+    # Vendored pristine third-party fixture bytes (manifest hashes and
+    # patch-application tests depend on them staying byte-identical). The
+    # fixture ships its own pyproject.toml with a strict ruff select list;
+    # without this exclude, hierarchical config discovery lints it.
+    "tests/plugins/memory/fixtures/honcho-3.0.10",
+]
 
 [tool.ruff.lint]
 # All other lints are intentionally disabled (see comment history on this
