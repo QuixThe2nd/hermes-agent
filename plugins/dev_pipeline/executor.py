@@ -41,7 +41,7 @@ from tools.agent_cli_runner import run_agent_cli
 from tools.claude_agent_tool import resolve_claude_binary
 from tools.cursor_agent_tool import resolve_cursor_agent_binary
 from tools.moa_debate import moa_debate
-from tools.moa_tool import consult_moa
+from tools.moa_tool import moa_ask
 
 # Repo root = two levels up from plugins/dev_pipeline/executor.py.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -709,7 +709,7 @@ def run_planning(
     repo_summary: str,
     *,
     plan_mode: str = "consult",
-    consult_fn: Callable[..., str] = consult_moa,
+    consult_fn: Callable[..., str] = moa_ask,
     debate_fn: Callable[..., str] = moa_debate,
 ) -> tuple[Optional[dict[str, Any]], str, list[dict[str, Any]]]:
     """Run MoA planning with one validation retry."""

@@ -1,13 +1,13 @@
 """Multi-agent debate tool: independent proposals + adversarial cross-critique.
 
-Debate variant of ``consult_moa``. Round 1 fans the question out to the
+Debate variant of ``moa_ask``. Round 1 fans the question out to the
 configured MoA reference models for independent answers. Round 2 shows each
 advisor the *other* advisors' answers — anonymized, presentation-shuffled,
 truncated, and explicitly marked as untrusted data — and forces structured
 per-answer verdicts. An optional third round lets each advisor revise its own
 position after seeing the critiques aimed at it.
 
-Design constraints (from a consult_moa design review, Aug 2026):
+Design constraints (from a moa_ask design review, Aug 2026):
 
 - The acting Hermes model remains the sole aggregator. No judge model call.
 - Fixed bounded rounds; never adaptive-until-convergence (no reliable signal,
@@ -65,16 +65,16 @@ MOA_DEBATE_SCHEMA = {
     "name": "moa_debate",
     "description": (
         "Run a bounded multi-agent debate among the configured MoA reference "
-        "models: independent proposals, then adversarial cross-critique with "
-        "structured verdicts, then an optional revision round. Use for "
-        "contested or high-stakes questions where answers could plausibly "
-        "differ — architecture choices, migration strategies, security "
-        "trade-offs, conflicting evidence. Prefer consult_moa for "
-        "straightforward advice. You remain the sole aggregator: the result "
-        "contains the raw rounds plus mechanically derived agreement data, "
-        "never a manufactured consensus answer. Post-critique agreement is "
-        "weaker evidence than independent round-1 agreement — weigh "
-        "accordingly. Do not pass secrets."
+        "models: independent proposals, adversarial cross-critique with "
+        "structured verdicts, and an optional revision round. Use ONLY when "
+        "an actual debate helps — contested or high-stakes choices, "
+        "conflicting evidence, or material disagreement where adversarial "
+        "challenge is worth the cost. For ordinary Q&A, advice, opinion "
+        "gathering, and quick decisions, use moa_ask instead. You remain the "
+        "sole aggregator: the result contains the raw rounds plus mechanically "
+        "derived agreement data, never a manufactured consensus answer. "
+        "Post-critique agreement is weaker evidence than independent round-1 "
+        "agreement — weigh accordingly. Do not pass secrets."
     ),
     "parameters": {
         "type": "object",
@@ -405,7 +405,7 @@ def moa_debate(
         return tool_error("all debate advisors failed in the proposal round", success=False)
 
     if len(ok_advisors) < 2:
-        # Degrade to a consult_moa-shaped single-advice result. A one-sided
+        # Degrade to a moa_ask-shaped single-advice result. A one-sided
         # "debate" would manufacture false legitimacy.
         only = ok_advisors[0]
         return tool_result(
@@ -422,7 +422,7 @@ def moa_debate(
             agreement={},
             guidance=(
                 "Only one advisor produced a proposal, so no debate round ran. "
-                "Treat this as a single consult_moa-style opinion, not a "
+                "Treat this as a single moa_ask-style opinion, not a "
                 "debated position."
             ),
         )
