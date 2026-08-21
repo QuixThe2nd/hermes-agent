@@ -1038,6 +1038,8 @@ class DiscordAdapter(BasePlatformAdapter):
     - Reaction-based feedback
     """
 
+    _delegation_typing_enabled = True
+
     # Discord message limits
     MAX_MESSAGE_LENGTH = 2000
     _SPLIT_THRESHOLD = 1900  # near the 2000-char split point
