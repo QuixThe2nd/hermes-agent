@@ -124,9 +124,10 @@ class TestRunTickGate:
         assert result["did_quota"] is True
         assert calls["providers"] == 1
 
-    def test_post_quota_sleep_only_after_quota(self, monkeypatch, tmp_path):
+    def test_single_category_update_per_tick(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         slept = []
+        category_calls = []
 
         monkeypatch.setattr(
             "plugins.quota_channels.core.run_provider_quota",
@@ -135,8 +136,13 @@ class TestRunTickGate:
         monkeypatch.setattr(
             "plugins.quota_channels.core.sort_voice_channels", lambda *a, **k: False
         )
+
+        def fake_update_category(*args, **kwargs):
+            category_calls.append((args, kwargs))
+            return "renamed"
+
         monkeypatch.setattr(
-            "plugins.quota_channels.core.update_category", lambda *a, **k: "renamed"
+            "plugins.quota_channels.core.update_category", fake_update_category
         )
         monkeypatch.setattr(
             "plugins.quota_channels.core.discord_headers", lambda: {"Authorization": "Bot x"}
@@ -149,14 +155,21 @@ class TestRunTickGate:
         config["post_quota_delay_seconds"] = 7
 
         run_tick(config, force=True, sleep_fn=lambda s: slept.append(s))
-        assert slept == [7]
+        assert len(category_calls) == 1
+        assert slept == []
 
-        slept.clear()
+        category_calls.clear()
         monkeypatch.setattr(
             "plugins.quota_channels.core.load_state",
             lambda: {"last_quota_success": 999_999_999},
         )
-        run_tick(config, force=False, sleep_fn=lambda s: slept.append(s), now_fn=lambda: 1_000_000_000.0)
+        run_tick(
+            config,
+            force=False,
+            sleep_fn=lambda s: slept.append(s),
+            now_fn=lambda: 1_000_000_000.0,
+        )
+        assert len(category_calls) == 1
         assert slept == []
 
     def test_mixed_provider_failure_isolation(self, monkeypatch, tmp_path):

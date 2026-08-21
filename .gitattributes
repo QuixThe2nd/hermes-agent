@@ -32,3 +32,7 @@ docker/entrypoint.sh text eol=lf
 *.html  text eol=lf
 *.svg   text eol=lf
 *.ps1   text eol=crlf
+
+# Patch files legitimately contain trailing whitespace (blank context lines
+# are a single space). Keep LF, but don't flag them in `git diff --check`.
+*.patch text eol=lf whitespace=-trailing-space

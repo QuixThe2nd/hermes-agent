@@ -11,7 +11,7 @@ A developer edition of [Hermes Agent](https://github.com/NousResearch/hermes-age
   - Delegation — one shared agent-CLI runner powers both delegate tools and the dev-pipeline build lanes
   - Delegation — `delegate_development plan_mode=debate` runs the multi-round adversarial council for planning; consult stays the default
   - Delegation — dev-pipeline review runs as a Russian-language kimi + grok dual review; `delegate_development` gains `open_pr=false` to skip the draft PR
-  - MoA — `consult_moa` and `moa_debate`, restored from the archive
+  - MoA — `moa_ask` and `moa_debate`, restored from the archive
   - Memory (Honcho) — memory tools surface backend failures (dead API keys, auth 401s, timeouts) as explicit errors instead of silently looking like "nothing stored"
 - **Plugins**
   - dev-pipeline — hand a repo + task to an automated pipeline: MoA planning, Cursor execution, mechanical verification, dual-model review, draft PR, with stage-progress messages to your chat and a status tool
@@ -24,6 +24,8 @@ A developer edition of [Hermes Agent](https://github.com/NousResearch/hermes-age
   - Discord — sessions keyed to your stable username, not your per-server nickname
   - Discord — threads renamed once, after the first reply lands, never mid-turn
   - Discord — progress updates respect each platform's real message limits
+  - Discord — only the completed turn-final answer reply-pings the user; streaming previews and interim messages stay standalone
+  - Discord — resolve_ticket propose is terminal: the confirmation embed is the reply, no follow-up message
   - Cron — lifecycle guard blocks cron-spawned commands that would restart the gateway or rewrite the live checkout (quote-aware)
   - Memory — per-turn injection skips lines already delivered earlier in the session
   - Config — API retry backoff timing

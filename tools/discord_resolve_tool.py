@@ -330,6 +330,8 @@ _SCHEMA: Dict[str, Any] = {
         "✅ and ❌, and listens for the user's reaction for timeout_minutes (default from "
         "discord.resolve_timeout_minutes in config.yaml, else 30) before stopping. "
         "✅ archives the thread (fully reversible, NEVER deletes); ❌ keeps it open. "
+        "A successful action='propose' call is terminal: the embed is the reply — end your turn immediately "
+        "with no follow-up assistant message and no further tool calls. "
         "Only use action='close' directly AFTER the user explicitly confirms in text (e.g. 'yes', 'close it')."
     ),
     "parameters": {

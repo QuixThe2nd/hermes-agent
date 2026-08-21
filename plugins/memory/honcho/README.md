@@ -34,6 +34,43 @@ echo "HONCHO_API_KEY=***" >> ~/.hermes/.env
 > memory provider — the `honcho` subcommand is registered for the active
 > provider only. On a fresh install, use `hermes memory setup honcho`.
 
+## Discord Conclusion Notifications (self-hosted patch)
+
+`discord_notifications/` ships a patch (`honcho-3.0.10-conclusion-discord.patch`)
+plus a manifest and helper script that add a `conclusion.created` webhook event
+to a **self-hosted Honcho v3.0.10** checkout and deliver it to Discord channel
+webhooks, one env var per conclusion level:
+
+- `HONCHO_DISCORD_WEBHOOK_EXPLICIT`
+- `HONCHO_DISCORD_WEBHOOK_DEDUCTIVE`
+- `HONCHO_DISCORD_WEBHOOK_INDUCTIVE`
+- `HONCHO_DISCORD_WEBHOOK_CONTRADICTION`
+
+Set only the levels you want notified; unset levels are skipped. The patch
+never logs webhook URLs.
+
+Setup (run from `discord_notifications/`):
+
+```bash
+python3 apply_patch.py --target /path/to/honcho check   # validate only
+python3 apply_patch.py --target /path/to/honcho apply   # validate, then patch
+python3 apply_patch.py --target /path/to/honcho verify  # confirm applied
+```
+
+`apply` refuses to touch the checkout unless the version is exactly v3.0.10
+and every patched file matches the manifest's pristine hashes; unrelated local
+edits (e.g. `src/llm/structured_output.py`) are left alone. After applying,
+rebuild and restart Honcho, then set the env vars above in its environment.
+
+Rollback:
+
+```bash
+python3 apply_patch.py --target /path/to/honcho rollback   # git apply -R
+```
+
+Then rebuild and restart Honcho again. The script re-verifies pristine hashes
+after reverting.
+
 ## Architecture Overview
 
 ### Two-Layer Context Injection

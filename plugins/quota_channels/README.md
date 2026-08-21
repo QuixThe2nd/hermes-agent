@@ -7,8 +7,8 @@ Discord voice-channel quota display for **Codex**, **Kimi**, **z.ai**, **Cursor*
 Each tick (typically every minute via cron):
 
 1. **Quota gate** — provider API fetches run at most every `quota_interval_seconds` (default 30 minutes) unless forced. State lives in `HERMES_HOME/quota_channels_state.json`.
-2. **On a quota run** — fetch all enabled providers, rename their voice channels (quota + token segment where supported), sort by time until reset, save state, sleep `post_quota_delay_seconds` (default 31s), then refresh the category label again.
-3. **Every tick** — update the Quotas category name with a bucketed freshness label derived from seconds since the last successful full quota run.
+2. **On a quota run** — fetch all enabled providers, rename their voice channels (quota + token segment where supported), sort by time until reset, and save state.
+3. **Every tick** — update the Quotas category name once with the absolute local timestamp of the last successful quota run and either the next scheduled run time or `Due` when the interval has elapsed. Format: `Quotas • <day/month hour:minam/pm> • Next: <hour:minam/pm|Due>`.
 
 Silent success for the headless CLI; failures print `quota-channels: <message>` and exit 1.
 
@@ -21,7 +21,7 @@ quota_channels:
   guild_id: "YOUR_GUILD_ID"
   category_id: "YOUR_CATEGORY_CHANNEL_ID"
   quota_interval_seconds: 1800   # optional, default 1800 (30 min)
-  post_quota_delay_seconds: 31   # optional, default 31
+  post_quota_delay_seconds: 31   # deprecated; ignored (kept for backward compatibility)
   channel_ids:
     codex: "VOICE_CHANNEL_ID"
     kimi: "VOICE_CHANNEL_ID"

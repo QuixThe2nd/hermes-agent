@@ -498,27 +498,34 @@ def format_grok_name(remaining: int, reset_secs: float) -> str:
     return f"Grok: {remaining}% \u2022 {format_reset_left(reset_secs)}"
 
 
-def quota_label(elapsed: float) -> str:
-    elapsed = max(0, int(elapsed))
-    if elapsed < 30:
-        return "Updated: Just Now"
-    if elapsed < 60:
-        return "Updated: 30s+"
-    if elapsed < 300:
-        return "Updated: 1m+"
-    if elapsed < 600:
-        return "Updated: 5m+"
-    if elapsed < 900:
-        return "Updated: 10m+"
-    if elapsed < 1200:
-        return "Updated: 15m+"
-    if elapsed < 1800:
-        return "Updated: 20m+"
-    return "Updated: 30m+ (Delayed)"
+def _fmt_clock(dt: datetime) -> str:
+    hour = dt.hour % 12 or 12
+    suffix = "am" if dt.hour < 12 else "pm"
+    return f"{hour}:{dt.minute:02d}{suffix}"
 
 
-def category_name(last_success: float, now_fn: NowFn = time.time) -> str:
-    return f"Quotas \u2022 {quota_label(now_fn() - last_success)}"
+def fmt_ts(epoch: float) -> str:
+    dt = datetime.fromtimestamp(epoch)
+    return f"{dt.day}/{dt.month} {_fmt_clock(dt)}"
+
+
+def fmt_time(epoch: float) -> str:
+    return _fmt_clock(datetime.fromtimestamp(epoch))
+
+
+def category_name(
+    last_success: float,
+    interval: int,
+    now_fn: NowFn = time.time,
+) -> str:
+    if last_success <= 0:
+        return "Quotas \u2022 never \u2022 Next: Due"
+    now = now_fn()
+    next_due = last_success + interval
+    ts_part = fmt_ts(last_success)
+    if now >= next_due:
+        return f"Quotas \u2022 {ts_part} \u2022 Next: Due"
+    return f"Quotas \u2022 {ts_part} \u2022 Next: {fmt_time(next_due)}"
 
 
 def normalize_enabled_providers(raw: Any) -> Dict[str, bool]:
@@ -581,6 +588,7 @@ def validate_quota_config(section: Mapping[str, Any]) -> dict:
         "quota_interval_seconds": int(
             section.get("quota_interval_seconds", DEFAULT_QUOTA_INTERVAL_SECONDS)
         ),
+        # Deprecated: accepted for backward compatibility but no longer used by run_tick.
         "post_quota_delay_seconds": int(
             section.get("post_quota_delay_seconds", DEFAULT_POST_QUOTA_DELAY_SECONDS)
         ),
@@ -1380,11 +1388,12 @@ def run_provider_quota(
 def update_category(
     category_id: str,
     last_success: float,
+    interval: int,
     headers: dict,
     http_fn: HttpFn = default_http,
     now_fn: NowFn = time.time,
 ) -> str:
-    name = category_name(last_success, now_fn=now_fn)
+    name = category_name(last_success, interval, now_fn=now_fn)
     return rename_channel(
         category_id,
         name,
@@ -1398,7 +1407,7 @@ def run_tick(
     config: dict,
     *,
     force: bool = False,
-    sleep_fn: SleepFn = time.sleep,
+    sleep_fn: SleepFn = time.sleep,  # kept for API compatibility; no longer called
     now_fn: NowFn = time.time,
     http_fn: HttpFn = default_http,
 ) -> dict:
@@ -1446,14 +1455,13 @@ def run_tick(
             last = save_state(now_fn=now_fn)
 
     category_status = update_category(
-        config["category_id"], last, headers, http_fn=http_fn, now_fn=now_fn
+        config["category_id"],
+        last,
+        interval,
+        headers,
+        http_fn=http_fn,
+        now_fn=now_fn,
     )
-
-    if did_quota:
-        sleep_fn(config["post_quota_delay_seconds"])
-        category_status = update_category(
-            config["category_id"], last, headers, http_fn=http_fn, now_fn=now_fn
-        )
 
     return {
         "success": True,

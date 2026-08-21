@@ -29,7 +29,7 @@ def configured_moa(monkeypatch):
     return config
 
 
-def test_consult_moa_uses_default_references_without_calling_aggregator(
+def test_moa_ask_uses_default_references_without_calling_aggregator(
     monkeypatch, configured_moa
 ):
     from agent.usage_pricing import CanonicalUsage
@@ -52,7 +52,7 @@ def test_consult_moa_uses_default_references_without_calling_aggregator(
     monkeypatch.setattr(moa_tool, "_run_references_parallel", fake_run)
 
     result = json.loads(
-        moa_tool.consult_moa(
+        moa_tool.moa_ask(
             question="Which architecture should we use?",
             evidence="The existing reverse proxy already supports forward auth.",
             decision_needed="Extend the proxy or deploy another stack.",
@@ -78,7 +78,7 @@ def test_consult_moa_uses_default_references_without_calling_aggregator(
     assert "Extend the proxy" in rendered
 
 
-def test_consult_moa_returns_partial_success_when_one_reference_fails(
+def test_moa_ask_returns_partial_success_when_one_reference_fails(
     monkeypatch, configured_moa
 ):
     from agent.usage_pricing import CanonicalUsage
@@ -97,7 +97,7 @@ def test_consult_moa_returns_partial_success_when_one_reference_fails(
         ],
     )
 
-    result = json.loads(moa_tool.consult_moa(question="Choose an option"))
+    result = json.loads(moa_tool.moa_ask(question="Choose an option"))
 
     assert result["success"] is True
     assert result["partial"] is True
@@ -106,7 +106,7 @@ def test_consult_moa_returns_partial_success_when_one_reference_fails(
     assert result["advisors"][1]["status"] == "failed"
 
 
-def test_consult_moa_rejects_empty_question_without_model_calls(
+def test_moa_ask_rejects_empty_question_without_model_calls(
     monkeypatch, configured_moa
 ):
     from tools import moa_tool
@@ -120,14 +120,14 @@ def test_consult_moa_rejects_empty_question_without_model_calls(
 
     monkeypatch.setattr(moa_tool, "_run_references_parallel", should_not_run)
 
-    result = json.loads(moa_tool.consult_moa(question="   "))
+    result = json.loads(moa_tool.moa_ask(question="   "))
 
     assert result["success"] is False
     assert "question" in result["error"].lower()
     assert called is False
 
 
-def test_consult_moa_rejects_disabled_default_preset(monkeypatch, configured_moa):
+def test_moa_ask_rejects_disabled_default_preset(monkeypatch, configured_moa):
     from tools import moa_tool
 
     configured_moa["moa"]["presets"]["homelab"]["enabled"] = False
@@ -137,21 +137,22 @@ def test_consult_moa_rejects_disabled_default_preset(monkeypatch, configured_moa
         lambda *_args, **_kwargs: pytest.fail("disabled preset must not run"),
     )
 
-    result = json.loads(moa_tool.consult_moa(question="Choose an option"))
+    result = json.loads(moa_tool.moa_ask(question="Choose an option"))
 
     assert result["success"] is False
     assert "disabled" in result["error"].lower()
 
 
-def test_consult_moa_is_registered_as_a_core_tool():
+def test_moa_ask_is_registered_as_a_core_tool():
     from tools import moa_tool  # noqa: F401
     from tools.registry import registry
     from toolsets import TOOLSETS, _HERMES_CORE_TOOLS
 
-    entry = registry.get_entry("consult_moa")
+    entry = registry.get_entry("moa_ask")
 
     assert entry is not None
     assert entry.toolset == "moa"
-    assert "consult_moa" in _HERMES_CORE_TOOLS
-    assert "consult_moa" in TOOLSETS["moa"]["tools"]
+    assert "moa_ask" in _HERMES_CORE_TOOLS
+    assert "moa_ask" in TOOLSETS["moa"]["tools"]
     assert entry.schema["parameters"]["required"] == ["question"]
+    assert registry.get_entry("consult_moa") is None

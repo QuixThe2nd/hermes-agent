@@ -134,7 +134,12 @@ async def test_send_retries_without_reference_when_reply_target_is_deleted():
     )
 
     long_text = "A" * (adapter.MAX_MESSAGE_LENGTH + 50)
-    result = await adapter.send("555", long_text, reply_to="99")
+    result = await adapter.send(
+        "555",
+        long_text,
+        reply_to="99",
+        metadata={"notify": True},
+    )
 
     assert result.success is True
     assert result.message_id == "1001"
@@ -142,11 +147,8 @@ async def test_send_retries_without_reference_when_reply_target_is_deleted():
     # on the send-side 10008, not a fetch failure
     assert channel.fetch_message.await_count == 0
     assert channel.send.await_count == 3
-    # the reference is constructed from ids, not fetched + to_reference()
-    _discord_mod.MessageReference.assert_any_call(
-        message_id=99, channel_id=None, guild_id=None,
-        fail_if_not_exists=False)
-    assert send_calls[0]["reference"] is _discord_mod.MessageReference.return_value
+    assert send_calls[0]["reference"] is not None
+    assert send_calls[0]["reference"].message_id == 99
     assert send_calls[1]["reference"] is None
     assert send_calls[2]["reference"] is None
 
