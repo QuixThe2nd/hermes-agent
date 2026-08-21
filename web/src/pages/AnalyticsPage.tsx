@@ -26,6 +26,7 @@ import { useI18n } from "@/i18n";
 import { PluginSlot } from "@/plugins";
 
 const PERIODS = [
+  { label: "24h", days: 1 },
   { label: "7d", days: 7 },
   { label: "30d", days: 30 },
   { label: "90d", days: 90 },
