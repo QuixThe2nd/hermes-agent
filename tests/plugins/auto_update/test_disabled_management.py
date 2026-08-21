@@ -23,6 +23,8 @@ from plugins.auto_update.lifecycle import reconcile_scheduler_on_load
 from plugins.auto_update.platform import InstallScope
 from plugins.auto_update.systemd import (
     TIMER_NAME,
+    ProbeOutcome,
+    ProbeResult,
     ReconcileResult,
     expected_timer_disable_argv,
     reconcile_units,
@@ -205,7 +207,8 @@ def test_management_cli_status_and_enable_reachable_while_disabled(
         },
     )
     monkeypatch.setattr(
-        "plugins.auto_update.cli.timer_is_active", lambda scope: False
+        "plugins.auto_update.cli.probe_timer_is_active",
+        lambda scope: ProbeResult(ProbeOutcome.FALSE),
     )
     monkeypatch.setattr(
         "plugins.auto_update.cli.reconcile_scheduler_on_load",
@@ -246,11 +249,18 @@ def test_management_cli_status_and_enable_reachable_while_disabled(
     assert "Scheduler installed" in enable_out.getvalue()
 
 
-def test_updater_run_subcommand_absent_in_disabled_management():
+def test_updater_run_subcommand_absent_in_disabled_management(monkeypatch):
     assert "run" not in _management_subcommand_names()
+
+    from unittest.mock import Mock
+
+    fail_mock = Mock(side_effect=AssertionError("run_scheduled_update must not run"))
+    monkeypatch.setattr("plugins.auto_update.cli.run_scheduled_update", fail_mock)
+
     assert management_auto_update_command(
         argparse.Namespace(auto_update_command="run")
     ) == 2
+    fail_mock.assert_not_called()
 
 
 def test_failed_enable_reports_truthful_state_and_nonzero_exit(

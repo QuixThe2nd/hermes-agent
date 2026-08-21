@@ -12,11 +12,12 @@ from plugins.auto_update.platform import detect_install_scope, platform_supporte
 from plugins.auto_update.lifecycle import reconcile_scheduler_on_load
 from plugins.auto_update.runner import run_scheduled_update
 from plugins.auto_update.systemd import (
+    ProbeOutcome,
     ReconcileResult,
     format_status,
     linger_warning,
+    probe_timer_is_active,
     reconcile_units,
-    timer_is_active,
 )
 
 
@@ -27,6 +28,8 @@ def _effective_enabled() -> bool:
 def _management_failed(result: ReconcileResult, *, want_enabled: bool) -> bool:
     """True when reconcile did not achieve the intended scheduler state."""
     if not result.supported:
+        return True
+    if not result.enabled_known or not result.timer_active_known:
         return True
     operational_warnings = [
         w
@@ -60,14 +63,20 @@ def cmd_status() -> int:
         warnings=tuple(warnings),
     )
     if result.supported and scope is not None:
+        active_probe = probe_timer_is_active(scope)
+        if active_probe.outcome == ProbeOutcome.QUERY_FAILED:
+            warnings.append(
+                f"failed to query timer active state: {active_probe.detail or 'unknown error'}"
+            )
         result = ReconcileResult(
             supported=True,
             scope=scope,
             changed=False,
             enabled=_effective_enabled(),
-            timer_active=timer_is_active(scope),
+            timer_active=active_probe.as_bool,
             legacy=(),
             warnings=tuple(warnings),
+            timer_active_known=active_probe.known,
         )
     print(format_status(result))
     print(f"  Config enabled: {'yes' if cfg['enabled'] else 'no'}")

@@ -1430,6 +1430,115 @@ class PluginState:
             atomic_json_write(self.path, data, mode=0o600)
 
 
+class DisabledPluginContext:
+    """Capability-limited context for bundled disabled-management modules.
+
+    Exposes only management CLI registration and the ``on_gateway_start`` hook.
+    """
+
+    _ALLOWED_HOOK = "on_gateway_start"
+
+    def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
+        self.manifest = manifest
+        self._manager = manager
+
+    @property
+    def plugin_id(self) -> str:
+        """Return the effective registry id used for this plugin's namespaces."""
+        return self.manifest.key or self.manifest.name
+
+    def _track(
+        self,
+        kind: str,
+        key: str,
+        release: Callable[[], None],
+    ) -> PluginRegistration:
+        return self._manager._track_registration(
+            self.manifest, kind, key, release
+        )
+
+    def _track_replacement(
+        self,
+        kind: str,
+        key: str,
+        *,
+        slot: tuple,
+        current: Any,
+        previous: Any,
+        restore: Callable[[Any], bool],
+        finalize: Optional[Callable[[], None]] = None,
+    ) -> PluginRegistration:
+        lease = replacement_coordinator.acquire(
+            slot,
+            current=current,
+            previous=previous,
+            restore=restore,
+            finalize=finalize,
+        )
+        return self._track(kind, key, lease.dispose)
+
+    @_serialized_replacement
+    def register_cli_command(
+        self,
+        name: str,
+        help: str,
+        setup_fn: Callable,
+        handler_fn: Callable | None = None,
+        description: str = "",
+    ) -> PluginRegistration:
+        """Register a CLI subcommand (e.g. ``hermes <name> ...``)."""
+        previous = self._manager._cli_commands.get(name)
+        entry = {
+            "name": name,
+            "help": help,
+            "description": description,
+            "setup_fn": setup_fn,
+            "handler_fn": handler_fn,
+            "plugin": self.manifest.name,
+            "plugin_key": self.manifest.key or self.manifest.name,
+        }
+        self._manager._cli_commands[name] = entry
+        handle = self._track_replacement(
+            "cli_command",
+            name,
+            slot=("manager_mapping", id(self._manager._cli_commands), name),
+            current=entry,
+            previous=previous,
+            restore=lambda replacement: self._manager._restore_mapping(
+                self._manager._cli_commands, name, entry, replacement
+            ),
+        )
+        logger.debug(
+            "Plugin %s disabled-management registered CLI command: %s",
+            self.manifest.name,
+            name,
+        )
+        return handle
+
+    def register_hook(self, hook_name: str, callback: Callable) -> PluginRegistration:
+        """Register the gateway-start cleanup hook only."""
+        if hook_name != self._ALLOWED_HOOK:
+            raise ValueError(
+                f"disabled-management hook {hook_name!r} is not allowed "
+                f"(only {self._ALLOWED_HOOK!r})"
+            )
+        callbacks = self._manager._hooks.setdefault(hook_name, [])
+        callbacks.append(callback)
+        handle = self._track(
+            "hook",
+            hook_name,
+            lambda: self._manager._remove_callback(
+                self._manager._hooks, hook_name, callback
+            ),
+        )
+        logger.debug(
+            "Plugin %s disabled-management registered hook: %s",
+            self.manifest.name,
+            hook_name,
+        )
+        return handle
+
+
 class PluginContext:
     """Facade given to plugins so they can register tools and hooks."""
 
@@ -4841,7 +4950,7 @@ class PluginManager:
                     plugin_key,
                 )
                 return
-            ctx = PluginContext(manifest, self)
+            ctx = DisabledPluginContext(manifest, self)
             register_fn(ctx)
             registrations = [
                 registration

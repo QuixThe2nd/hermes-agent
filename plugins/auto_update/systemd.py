@@ -7,6 +7,7 @@ import os
 import subprocess
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -29,6 +30,40 @@ SERVICE_NAME = "hermes-auto-updater.service"
 TIMER_NAME = "hermes-auto-updater.timer"
 
 
+class ProbeOutcome(Enum):
+    TRUE = "true"
+    FALSE = "false"
+    QUERY_FAILED = "query_failed"
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    outcome: ProbeOutcome
+    detail: str = ""
+
+    @property
+    def known(self) -> bool:
+        return self.outcome != ProbeOutcome.QUERY_FAILED
+
+    @property
+    def as_bool(self) -> bool:
+        return self.outcome == ProbeOutcome.TRUE
+
+
+_PROBE_DETAIL_LIMIT = 200
+_SYSTEM_ERROR_MARKERS = (
+    "failed to connect to bus",
+    "connection timed out",
+    "operation timed out",
+    "timed out after",
+    "timeoutexpired",
+    "access denied",
+    "permission denied",
+    "transport endpoint",
+    "can't connect",
+)
+
+
 @dataclass(frozen=True)
 class ReconcileResult:
     supported: bool
@@ -38,6 +73,8 @@ class ReconcileResult:
     timer_active: bool
     legacy: tuple[str, ...]
     warnings: tuple[str, ...]
+    enabled_known: bool = True
+    timer_active_known: bool = True
 
 
 def service_unit_path(scope: InstallScope) -> Path:
@@ -213,16 +250,105 @@ def _write_timer_stamp(path: Path, payload: str) -> None:
     path.write_text(payload, encoding="utf-8")
 
 
+def _normalize_probe_detail(text: str) -> str:
+    collapsed = " ".join((text or "").split())
+    if len(collapsed) > _PROBE_DETAIL_LIMIT:
+        return collapsed[: _PROBE_DETAIL_LIMIT - 3] + "..."
+    return collapsed
+
+
+def _stderr_indicates_query_failure(stderr: str, stdout: str = "") -> bool:
+    blob = f"{stderr} {stdout}".lower()
+    return any(marker in blob for marker in _SYSTEM_ERROR_MARKERS)
+
+
+def _classify_is_enabled_probe(
+    code: int, stdout: str, stderr: str
+) -> ProbeResult:
+    detail = _normalize_probe_detail(stderr)
+    if _stderr_indicates_query_failure(stderr, stdout):
+        return ProbeResult(
+            ProbeOutcome.QUERY_FAILED,
+            detail or f"exit code {code}",
+        )
+
+    text = stdout.strip().lower()
+    if code == 0 and text in {"enabled", "static"}:
+        return ProbeResult(ProbeOutcome.TRUE)
+    if code == 4:
+        return ProbeResult(ProbeOutcome.FALSE)
+    if code == 1:
+        if text in {
+            "disabled",
+            "masked",
+            "indirect",
+            "generated",
+            "transient",
+            "not-found",
+        }:
+            return ProbeResult(ProbeOutcome.FALSE)
+        if not detail:
+            return ProbeResult(ProbeOutcome.FALSE)
+        return ProbeResult(ProbeOutcome.QUERY_FAILED, detail)
+    if detail:
+        return ProbeResult(ProbeOutcome.QUERY_FAILED, detail)
+    if code != 0:
+        return ProbeResult(ProbeOutcome.QUERY_FAILED, f"exit code {code}")
+    return ProbeResult(ProbeOutcome.FALSE)
+
+
+def _classify_is_active_probe(code: int, stdout: str, stderr: str) -> ProbeResult:
+    detail = _normalize_probe_detail(stderr)
+    if _stderr_indicates_query_failure(stderr, stdout):
+        return ProbeResult(
+            ProbeOutcome.QUERY_FAILED,
+            detail or f"exit code {code}",
+        )
+
+    text = stdout.strip().lower()
+    if code == 0 and text == "active":
+        return ProbeResult(ProbeOutcome.TRUE)
+    if code in {3, 4}:
+        return ProbeResult(ProbeOutcome.FALSE)
+    if code == 1:
+        if text in {"inactive", "dead", "failed", "unknown", "not-found"}:
+            return ProbeResult(ProbeOutcome.FALSE)
+        if not detail:
+            return ProbeResult(ProbeOutcome.FALSE)
+        return ProbeResult(ProbeOutcome.QUERY_FAILED, detail)
+    if detail:
+        return ProbeResult(ProbeOutcome.QUERY_FAILED, detail)
+    if code != 0:
+        return ProbeResult(ProbeOutcome.QUERY_FAILED, f"exit code {code}")
+    return ProbeResult(ProbeOutcome.FALSE)
+
+
+def probe_timer_is_active(
+    scope: InstallScope,
+    *,
+    run_systemctl: Callable[[Sequence[str]], tuple[int, str, str]] | None = None,
+) -> ProbeResult:
+    runner = _resolve_systemctl_runner(run_systemctl)
+    code, out, err = runner(build_systemctl_cmd(scope, "is-active", TIMER_NAME))
+    return _classify_is_active_probe(code, out, err)
+
+
+def probe_timer_is_enabled(
+    scope: InstallScope,
+    *,
+    run_systemctl: Callable[[Sequence[str]], tuple[int, str, str]] | None = None,
+) -> ProbeResult:
+    runner = _resolve_systemctl_runner(run_systemctl)
+    code, out, err = runner(build_systemctl_cmd(scope, "is-enabled", TIMER_NAME))
+    return _classify_is_enabled_probe(code, out, err)
+
+
 def timer_is_active(
     scope: InstallScope,
     *,
     run_systemctl: Callable[[Sequence[str]], tuple[int, str, str]] | None = None,
 ) -> bool:
-    runner = _resolve_systemctl_runner(run_systemctl)
-    code, out, _ = runner(
-        build_systemctl_cmd(scope, "is-active", TIMER_NAME)
-    )
-    return code == 0 and out.strip() == "active"
+    return probe_timer_is_active(scope, run_systemctl=run_systemctl).as_bool
 
 
 def timer_is_enabled(
@@ -230,11 +356,28 @@ def timer_is_enabled(
     *,
     run_systemctl: Callable[[Sequence[str]], tuple[int, str, str]] | None = None,
 ) -> bool:
-    runner = _resolve_systemctl_runner(run_systemctl)
-    code, out, _ = runner(
-        build_systemctl_cmd(scope, "is-enabled", TIMER_NAME)
+    return probe_timer_is_enabled(scope, run_systemctl=run_systemctl).as_bool
+
+
+def _probe_warning(label: str, probe: ProbeResult) -> str:
+    return f"failed to query timer {label} state: {probe.detail or 'unknown error'}"
+
+
+def _reconcile_probe_fields(
+    enabled_probe: ProbeResult,
+    active_probe: ProbeResult,
+    warnings: list[str],
+) -> tuple[bool, bool, bool, bool]:
+    if enabled_probe.outcome == ProbeOutcome.QUERY_FAILED:
+        warnings.append(_probe_warning("enabled", enabled_probe))
+    if active_probe.outcome == ProbeOutcome.QUERY_FAILED:
+        warnings.append(_probe_warning("active", active_probe))
+    return (
+        enabled_probe.as_bool,
+        active_probe.as_bool,
+        enabled_probe.known,
+        active_probe.known,
     )
-    return code == 0 and out.strip() in {"enabled", "static"}
 
 
 def expected_timer_disable_argv(scope: InstallScope) -> list[list[str]]:
@@ -319,14 +462,24 @@ def reconcile_units(
 
     if not enabled:
         disable_warnings = disable_timer(selected, run_systemctl=runner)
+        warnings = list(disable_warnings)
+        enabled_probe = probe_timer_is_enabled(selected, run_systemctl=runner)
+        active_probe = probe_timer_is_active(selected, run_systemctl=runner)
+        enabled_state, active_state, enabled_known, active_known = _reconcile_probe_fields(
+            enabled_probe,
+            active_probe,
+            warnings,
+        )
         return ReconcileResult(
             supported=True,
             scope=selected,
             changed=False,
-            enabled=timer_is_enabled(selected, run_systemctl=runner),
-            timer_active=timer_is_active(selected, run_systemctl=runner),
+            enabled=enabled_state,
+            timer_active=active_state,
             legacy=(),
-            warnings=disable_warnings,
+            warnings=tuple(warnings),
+            enabled_known=enabled_known,
+            timer_active_known=active_known,
         )
 
     hermes_home = str(get_hermes_home().resolve())
@@ -373,7 +526,10 @@ def reconcile_units(
         )
 
     # Enable/start TIMER ONLY — never start the oneshot service immediately.
-    if not timer_is_enabled(selected, run_systemctl=runner):
+    enabled_probe = probe_timer_is_enabled(selected, run_systemctl=runner)
+    if enabled_probe.outcome == ProbeOutcome.QUERY_FAILED:
+        warnings.append(_probe_warning("enabled", enabled_probe))
+    elif enabled_probe.outcome == ProbeOutcome.FALSE:
         prestamp_timer(selected, write_stamp=write_stamp)
 
     code, _, err = runner(
@@ -382,9 +538,14 @@ def reconcile_units(
     if code != 0:
         warnings.append(f"failed to enable timer: {err.strip() or code}")
 
-    enabled_state = timer_is_enabled(selected, run_systemctl=runner)
-    timer_active = timer_is_active(selected, run_systemctl=runner)
-    if enabled_state and not timer_active:
+    enabled_probe = probe_timer_is_enabled(selected, run_systemctl=runner)
+    active_probe = probe_timer_is_active(selected, run_systemctl=runner)
+    enabled_state, timer_active, enabled_known, active_known = _reconcile_probe_fields(
+        enabled_probe,
+        active_probe,
+        warnings,
+    )
+    if enabled_known and enabled_state and active_known and not timer_active:
         warnings.append("timer enabled but not active")
 
     linger = linger_warning(selected)
@@ -399,7 +560,15 @@ def reconcile_units(
         timer_active=timer_active,
         legacy=legacy.disabled_units,
         warnings=tuple(warnings),
+        enabled_known=enabled_known,
+        timer_active_known=active_known,
     )
+
+
+def _format_yes_no(value: bool, *, known: bool) -> str:
+    if not known:
+        return "unknown (probe failed)"
+    return "yes" if value else "no"
 
 
 def format_status(result: ReconcileResult) -> str:
@@ -414,8 +583,8 @@ def format_status(result: ReconcileResult) -> str:
         f"  Timer unit: {TIMER_NAME}",
         f"  Service unit: {SERVICE_NAME}",
         f"  Scope: {'system' if result.scope and result.scope.system else 'user'}",
-        f"  Enabled: {'yes' if result.enabled else 'no'}",
-        f"  Timer active: {'yes' if result.timer_active else 'no'}",
+        f"  Enabled: {_format_yes_no(result.enabled, known=result.enabled_known)}",
+        f"  Timer active: {_format_yes_no(result.timer_active, known=result.timer_active_known)}",
     ]
     if result.legacy:
         lines.append(f"  Legacy units disabled: {', '.join(result.legacy)}")

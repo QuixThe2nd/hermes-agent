@@ -31,6 +31,4 @@ def register_disabled(ctx) -> None:
             reconcile_kwargs["run_systemctl"] = kwargs["run_systemctl"]
         reconcile_scheduler_on_load(**reconcile_kwargs)
 
-    register_hook = getattr(ctx, "register_hook", None)
-    if callable(register_hook):
-        register_hook("on_gateway_start", _on_gateway_start)
+    ctx.register_hook("on_gateway_start", _on_gateway_start)

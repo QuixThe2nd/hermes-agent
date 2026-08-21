@@ -90,7 +90,7 @@ auto_update:
 ```
 
 - **`enabled: false`** stops and disables the timer on the next reconcile (gateway startup hook or `hermes auto_update reconcile` / `disable`) and survives upgrades. Prefer this when you need the CLI to stay available.
-- Listing `auto_update` under **`plugins.disabled`** skips plugin registration entirely (CLI **and** the gateway-start hook), so it cannot stop an already-installed timer — run `hermes auto_update disable` or set `auto_update.enabled: false` **before** adding it to `plugins.disabled`.
+- Listing `auto_update` under **`plugins.disabled`** keeps the full plugin (tools, the `run` oneshot entrypoint, and scheduler startup) off, but a restricted bundled cleanup path still loads: the management CLI (`status`, `enable`, `disable`, `reconcile`) and a gateway-start hook that stops/disables an already-installed timer. Explicit disable therefore remains effective across gateway starts and upgrades without re-enabling the updater capability.
 - Optional `schedule_start_hour` / `schedule_end_hour` still override the default when set explicitly.
 - Empty notification strings keep success/failure quiet except for systemd journal logs.
 - Non-empty strings append one line to `$HERMES_HOME/auto-update/notifications.log` (notification failures are non-fatal).
