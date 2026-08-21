@@ -1558,7 +1558,8 @@ def _build_gateway_agent_history(
     *,
     channel_prompt: Optional[str] = None,
     inject_timestamps: bool = False,
-) -> tuple[List[Dict[str, Any]], Optional[str]]:
+    hermes_session_id: Optional[str] = None,
+) -> tuple[List[Dict[str, Any]], Optional[str], Optional[str]]:
     """Convert stored gateway transcript rows into agent replay messages.
 
     Observed Telegram group rows are returned as API-only context for the
@@ -1638,12 +1639,35 @@ def _build_gateway_agent_history(
     # tools that were killed mid-flight.
     agent_history = strip_interrupted_tool_tails(agent_history)
 
+    cursor_recovery_note: Optional[str] = None
+    if hermes_session_id:
+        try:
+            from tools.cursor_agent_tool import recover_delegate_cursor_agent_history
+
+            agent_history, cursor_recovery_note = recover_delegate_cursor_agent_history(
+                agent_history,
+                hermes_session_id=hermes_session_id,
+            )
+        except Exception as exc:
+            logger.debug("delegate_cursor_agent recovery failed: %s", exc)
+
     # Strip a dangling assistant(tool_calls) tail with no tool answers —
     # the signature of a SIGKILL mid-tool-call (e.g. the tool itself ran
     # `docker restart`/`kill` and took the gateway down before the result
     # was persisted). Without this the model re-issues the unanswered call
     # on resume and loops the restart forever (#49201).
-    agent_history = strip_dangling_tool_call_tail(agent_history)
+    # Leave an unanswered delegate_cursor_agent tail in place when recovery
+    # did not bind a receipt — orphan synthesis would mask fail-closed binding.
+    try:
+        from tools.cursor_agent_tool import _find_dangling_delegate_cursor_call
+
+        _preserve_cursor_dangling = (
+            _find_dangling_delegate_cursor_call(agent_history) is not None
+        )
+    except Exception:
+        _preserve_cursor_dangling = False
+    if not _preserve_cursor_dangling:
+        agent_history = strip_dangling_tool_call_tail(agent_history)
 
     # Strip stale dangerous-confirmation text in user messages (#59607).
     # A high-risk confirmation phrase (e.g. "confirm forced restart") that
@@ -1655,7 +1679,7 @@ def _build_gateway_agent_history(
     )
 
     observed_context = "\n".join(observed_group_context).strip() or None
-    return agent_history, observed_context
+    return agent_history, observed_context, cursor_recovery_note
 
 
 def _select_cached_agent_history(
@@ -6224,10 +6248,11 @@ class TurnRunner:
         # history and attached to the current addressed message as
         # API-only context, so persisted history stores only the real
         # addressed user turn.
-        agent_history, observed_group_context = _build_gateway_agent_history(
+        agent_history, observed_group_context, cursor_recovery_note = _build_gateway_agent_history(
             ctx.history,
             channel_prompt=ctx.channel_prompt,
             inject_timestamps=_message_timestamps_enabled(ctx.user_config),
+            hermes_session_id=ctx.session_id,
         )
 
         # FTS write-corruption guard (#50502): when message persistence
@@ -6473,6 +6498,8 @@ class TurnRunner:
             ctx.message, _persist_user_message_override = _prepare_resume_pending_message(
                 _reason, ctx.message, interactive=_interactive_resume,
             )
+            if cursor_recovery_note:
+                ctx.message = f"{cursor_recovery_note}\n\n{ctx.message}"
         elif _has_fresh_tool_tail:
             _persist_user_message_override = ctx.message
             ctx.message = (

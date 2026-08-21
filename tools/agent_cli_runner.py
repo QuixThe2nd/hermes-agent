@@ -21,7 +21,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import List, Mapping, Optional, Tuple
+from typing import Callable, List, Mapping, Optional, Tuple
 
 from tools.environments.local import build_subprocess_env
 
@@ -151,6 +151,7 @@ def run_agent_cli(
     run_timestamp: Optional[str] = None,
     log_path: Optional[Path] = None,
     env: Optional[Mapping[str, str]] = None,
+    on_complete_line: Optional[Callable[[str], None]] = None,
 ) -> Tuple[Optional[str], str, str, float, Optional[int]]:
     """Spawn the agent, stream stdout to a log file, enforce watchdogs.
 
@@ -197,9 +198,28 @@ def run_agent_cli(
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     reader_done = threading.Event()
+    line_buffer = bytearray()
+
+    def _emit_complete_lines(chunk: bytes) -> None:
+        nonlocal last_byte_mono
+        if not chunk:
+            return
+        line_buffer.extend(chunk)
+        while True:
+            try:
+                newline_index = line_buffer.index(0x0A)
+            except ValueError:
+                break
+            raw_line = bytes(line_buffer[:newline_index])
+            del line_buffer[: newline_index + 1]
+            if on_complete_line is not None:
+                try:
+                    on_complete_line(raw_line.decode("utf-8", errors="replace"))
+                except Exception:
+                    logger.debug("on_complete_line callback failed", exc_info=True)
+        last_byte_mono = time.monotonic()
 
     def _reader() -> None:
-        nonlocal last_byte_mono
         try:
             assert proc.stdout is not None
             with open(log_path, "wb") as log_file:
@@ -212,7 +232,13 @@ def run_agent_cli(
                         break
                     log_file.write(chunk)
                     log_file.flush()
-                    last_byte_mono = time.monotonic()
+                    _emit_complete_lines(chunk)
+                if line_buffer and on_complete_line is not None:
+                    try:
+                        on_complete_line(bytes(line_buffer).decode("utf-8", errors="replace"))
+                    except Exception:
+                        logger.debug("on_complete_line callback failed", exc_info=True)
+                    line_buffer.clear()
         finally:
             try:
                 if proc.stdout is not None:

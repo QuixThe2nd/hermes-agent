@@ -140,6 +140,6 @@ class TestGatewayHistoryBuildForwardsSidecar:
             {"role": "user", "content": "hi", "api_content": "hi\n\nCTX", "timestamp": 123.0},
             {"role": "assistant", "content": "hello"},
         ]
-        agent_history, _obs = _build_gateway_agent_history(history)
+        agent_history, _obs, _ = _build_gateway_agent_history(history)
         assert agent_history[0]["api_content"] == "hi\n\nCTX"
 

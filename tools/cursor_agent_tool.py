@@ -58,14 +58,31 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
 from tools.agent_cli_runner import _terminate_process, run_agent_cli
+from tools.cursor_run_receipts import (
+    CONTINUATION_PROMPT,
+    MAX_RESUME_ATTEMPTS,
+    create_receipt,
+    cursor_runs_dir,
+    finalize_receipt,
+    find_receipt_for_binding,
+    hash_prompt,
+    is_terminal_receipt,
+    make_session_id_persister,
+    read_receipt,
+    receipt_matches_binding,
+    receipt_run_lock,
+    update_receipt,
+)
 from tools.environments.local import build_subprocess_env
 from tools.registry import registry
 from tools.tool_status import emit_tool_status
+from agent.tool_dispatch_helpers import make_tool_result_message
+
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -1161,6 +1178,455 @@ def _make_result(
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _build_cursor_cli_command(
+    binary: str,
+    *,
+    task: str,
+    model: Optional[str],
+    resume_session_id: Optional[str] = None,
+    continuation: bool = False,
+) -> List[str]:
+    cmd = [binary, "-p", "--output-format", "stream-json"]
+    if model:
+        cmd.extend(["--model", model])
+    if resume_session_id:
+        cmd.append(f"--resume={resume_session_id}")
+    prompt = CONTINUATION_PROMPT if continuation else str(task).strip()
+    cmd.append(prompt)
+    return cmd
+
+
+def _sync_outcome_from_run(
+    *,
+    watchdog_error: Optional[str],
+    returncode: Optional[int],
+    parsed: Dict[str, Any],
+) -> Tuple[str, bool, Optional[str]]:
+    if parsed.get("action_required"):
+        detail = parsed["action_required"]
+        if isinstance(detail, dict):
+            msg = str(detail.get("detail") or "Action required")
+        else:
+            msg = "Action required"
+        return "action_required", False, msg
+    if watchdog_error == "interrupted":
+        return "interrupted", False, "interrupted"
+    if watchdog_error == "timeout":
+        return "timeout", False, "timeout"
+    if watchdog_error == "stalled":
+        return "stalled", False, "stalled"
+    if watchdog_error == "incomplete_output":
+        return "incomplete_output", False, "incomplete_output"
+    if watchdog_error:
+        return "error", False, watchdog_error
+    if returncode not in (0, None):
+        return "failed", False, f"Cursor Agent exited with code {returncode}"
+    if parsed.get("final_report"):
+        return "success", True, None
+    return "failed", False, "no final assistant report in Cursor Agent output"
+
+
+def _result_from_parsed_sync_run(
+    *,
+    parsed: Dict[str, Any],
+    log_path: str,
+    duration: float,
+    run_id: str,
+    attempt_id: str,
+    resumed: bool,
+    outcome: str,
+    success: bool,
+    error: Optional[str],
+) -> str:
+    return _make_result(
+        success=success,
+        final_report=parsed.get("final_report") or "",
+        delegations=parsed.get("delegations") or [],
+        duration_seconds=round(duration, 3),
+        session_id=parsed.get("session_id"),
+        log_path=log_path,
+        error=error,
+        run_id=run_id,
+        attempt_id=attempt_id,
+        resumed=resumed,
+        outcome=outcome,
+    )
+
+
+def _terminal_summary_from_result_json(result_json: str) -> Dict[str, Any]:
+    try:
+        payload = json.loads(result_json)
+    except json.JSONDecodeError:
+        return {"raw": result_json[:500]}
+    if not isinstance(payload, dict):
+        return {}
+    keep = (
+        "success",
+        "error",
+        "final_report",
+        "session_id",
+        "outcome",
+        "run_id",
+        "attempt_id",
+        "resumed",
+        "cloud_status",
+        "agent_id",
+        "run_id",
+    )
+    return {key: payload.get(key) for key in keep if key in payload}
+
+
+def _reconcile_result_from_receipt(receipt: Dict[str, Any]) -> Optional[str]:
+    terminal = receipt.get("terminal_result")
+    if isinstance(terminal, dict) and terminal.get("result_json"):
+        return str(terminal["result_json"])
+    log_path = receipt.get("log_path")
+    if isinstance(log_path, str) and log_path:
+        try:
+            log_text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            log_text = ""
+        if log_text.strip():
+            parsed = parse_cursor_agent_log(log_text)
+            outcome = receipt.get("outcome") or "success"
+            success = outcome == "success"
+            error = None if success else str(receipt.get("outcome") or "failed")
+            return _result_from_parsed_sync_run(
+                parsed=parsed,
+                log_path=log_path,
+                duration=0.0,
+                run_id=str(receipt.get("run_id") or ""),
+                attempt_id=str(receipt.get("attempt_id") or ""),
+                resumed=bool(receipt.get("resumed")),
+                outcome=str(outcome),
+                success=success,
+                error=error,
+            )
+    return None
+
+
+def run_cursor_agent_cli_with_receipt(
+    *,
+    task: str,
+    workdir: str,
+    model: Optional[str],
+    timeout_seconds: int,
+    force: bool,
+    hermes_session_id: str,
+    tool_call_id: Optional[str],
+    resume_session_id: Optional[str] = None,
+    continuation: bool = False,
+    existing_receipt_path: Optional[Path] = None,
+    existing_run_id: Optional[str] = None,
+    resume_attempt_increment: bool = False,
+) -> str:
+    """Synchronous Cursor CLI path with restart-safe receipt lifecycle."""
+    binary = resolve_cursor_agent_binary()
+    if not binary:
+        return _make_result(
+            success=False,
+            error=(
+                "Cursor Agent CLI binary not found. Install the `agent` CLI and "
+                "ensure it is on PATH or at ~/.local/bin/agent."
+            ),
+        )
+
+    clamped_timeout = _clamp_timeout_seconds(timeout_seconds)
+    log_dir = cursor_runs_dir()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    run_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    if existing_receipt_path is not None and existing_run_id:
+        receipt_path = Path(existing_receipt_path)
+        run_id = existing_run_id
+        receipt = read_receipt(receipt_path) or {}
+        attempt_id = uuid.uuid4().hex
+        update_receipt(
+            receipt_path,
+            attempt_id=attempt_id,
+            log_path=str(
+                log_dir / f"{run_timestamp}-{os.getpid()}-resume-{attempt_id}.jsonl"
+            ),
+            state="running",
+            resumed=True,
+            resume_attempts=int(receipt.get("resume_attempts") or 0)
+            + (1 if resume_attempt_increment else 0),
+        )
+    else:
+        log_path = log_dir / f"{run_timestamp}-{os.getpid()}.jsonl"
+        run_id, receipt_path = create_receipt(
+            hermes_session_id=hermes_session_id,
+            tool_call_id=tool_call_id,
+            workdir=workdir,
+            prompt_hash=hash_prompt(task),
+            log_path=str(log_path),
+            model=model,
+            force=force,
+            timeout_seconds=clamped_timeout,
+            execution_mode="cli",
+        )
+        attempt_id = str((read_receipt(receipt_path) or {}).get("attempt_id") or "")
+
+    receipt = read_receipt(receipt_path) or {}
+    log_path = Path(str(receipt.get("log_path") or ""))
+    cmd = _build_cursor_cli_command(
+        binary,
+        task=task,
+        model=model or (receipt.get("model") if isinstance(receipt.get("model"), str) else None),
+        resume_session_id=resume_session_id,
+        continuation=continuation,
+    )
+
+    persister = make_session_id_persister(receipt_path)
+    expected_session = resume_session_id or receipt.get("cursor_session_id")
+
+    def _on_line(line: str) -> None:
+        persister(line)
+        if expected_session and resume_session_id:
+            observed = parse_init_session_id(line)
+            if observed and observed != expected_session:
+                finalize_receipt(
+                    receipt_path,
+                    outcome="error",
+                    terminal_result={
+                        "error": "conflicting cursor session id on resume",
+                        "expected": expected_session,
+                        "observed": observed,
+                    },
+                )
+
+    try:
+        watchdog_error, log_path_str, log_text, duration, returncode = _run_and_stream(
+            cmd,
+            workdir=workdir,
+            timeout_seconds=clamped_timeout,
+            log_dir=log_dir,
+            run_timestamp=run_timestamp,
+            log_path=log_path,
+            on_complete_line=_on_line,
+        )
+    except Exception as exc:
+        logger.error("run_cursor_agent_cli_with_receipt failed: %s", exc, exc_info=True)
+        finalize_receipt(
+            receipt_path,
+            outcome="error",
+            terminal_result={"error": str(exc)},
+            log_path=str(log_path),
+        )
+        return _make_result(success=False, error=str(exc), run_id=run_id, attempt_id=attempt_id)
+
+    parsed = parse_cursor_agent_log(log_text)
+    if expected_session and parsed.get("session_id") and parsed["session_id"] != expected_session:
+        outcome = "error"
+        success = False
+        error = "conflicting cursor session id on resume"
+    else:
+        outcome, success, error = _sync_outcome_from_run(
+            watchdog_error=watchdog_error,
+            returncode=returncode,
+            parsed=parsed,
+        )
+
+    result_json = _result_from_parsed_sync_run(
+        parsed=parsed,
+        log_path=log_path_str,
+        duration=duration,
+        run_id=run_id,
+        attempt_id=attempt_id,
+        resumed=bool(receipt.get("resumed")) or continuation,
+        outcome=outcome,
+        success=success,
+        error=error,
+    )
+    finalize_receipt(
+        receipt_path,
+        outcome=outcome,
+        terminal_result={"result_json": result_json},
+        cursor_session_id=parsed.get("session_id") or receipt.get("cursor_session_id"),
+        log_path=log_path_str,
+        attempt_id=attempt_id,
+        resumed=bool(receipt.get("resumed")) or continuation,
+    )
+    return result_json
+
+
+def parse_init_session_id(line: str) -> Optional[str]:
+    from tools.cursor_run_receipts import parse_init_session_id as _parse
+
+    return _parse(line)
+
+
+def _find_dangling_delegate_cursor_call(
+    agent_history: List[Dict[str, Any]],
+) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    if not agent_history:
+        return None
+    last = agent_history[-1]
+    if not (
+        isinstance(last, dict)
+        and last.get("role") == "assistant"
+        and last.get("tool_calls")
+    ):
+        return None
+    pending_ids = {
+        str(call.get("id") or call.get("call_id") or "")
+        for call in (last.get("tool_calls") or [])
+    }
+    answered = {
+        str(msg.get("tool_call_id") or "")
+        for msg in agent_history
+        if msg.get("role") == "tool"
+    }
+    unanswered = [cid for cid in pending_ids if cid and cid not in answered]
+    if not unanswered:
+        return None
+    for call in last.get("tool_calls") or []:
+        function = call.get("function") or {}
+        if str(function.get("name") or "") != "delegate_cursor_agent":
+            continue
+        call_id = str(call.get("id") or call.get("call_id") or "")
+        if call_id in unanswered:
+            return last, call
+    return None
+
+
+def recover_delegate_cursor_agent_history(
+    agent_history: List[Dict[str, Any]],
+    *,
+    hermes_session_id: str,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Reconcile or resume an interrupted ``delegate_cursor_agent`` tool call."""
+    found = _find_dangling_delegate_cursor_call(agent_history)
+    if not found:
+        return agent_history, None
+    _assistant_msg, call = found
+    tool_call_id = str(call.get("id") or call.get("call_id") or "")
+    try:
+        args = json.loads(str((call.get("function") or {}).get("arguments") or "{}"))
+    except json.JSONDecodeError:
+        args = {}
+
+    match = find_receipt_for_binding(hermes_session_id, tool_call_id or None)
+    if match is None:
+        return agent_history, (
+            "[System note: An interrupted delegate_cursor_agent call has no "
+            "matching restart receipt; automatic recovery was not attempted.]"
+        )
+
+    receipt_path, receipt = match
+    if not receipt_matches_binding(
+        receipt,
+        hermes_session_id=hermes_session_id,
+        tool_call_id=tool_call_id or None,
+    ):
+        return agent_history, (
+            "[System note: delegate_cursor_agent receipt binding mismatch; "
+            "automatic recovery refused.]"
+        )
+
+    if is_terminal_receipt(receipt):
+        result_json = _reconcile_result_from_receipt(receipt)
+        if not result_json:
+            return agent_history, (
+                "[System note: delegate_cursor_agent receipt is terminal but "
+                "could not be reconciled from persisted evidence.]"
+            )
+        history = list(agent_history)
+        history.append(
+            make_tool_result_message(
+                "delegate_cursor_agent",
+                result_json,
+                tool_call_id,
+                effect_disposition="unknown",
+            )
+        )
+        return history, (
+            "[System note: Recovered a terminal delegate_cursor_agent result "
+            "from persisted run evidence without re-invoking Cursor.]"
+        )
+
+    cursor_session_id = receipt.get("cursor_session_id")
+    if not isinstance(cursor_session_id, str) or not cursor_session_id.strip():
+        return agent_history, (
+            "[System note: Interrupted delegate_cursor_agent run has no "
+            "canonical Cursor session id; automatic cold rerun was refused.]"
+        )
+
+    resume_attempts = int(receipt.get("resume_attempts") or 0)
+    if resume_attempts >= MAX_RESUME_ATTEMPTS:
+        return agent_history, (
+            "[System note: delegate_cursor_agent resume attempt cap reached; "
+            "automatic recovery refused.]"
+        )
+
+    run_id = str(receipt.get("run_id") or "")
+    with receipt_run_lock(run_id) as acquired:
+        if not acquired:
+            return agent_history, (
+                "[System note: Another Hermes process is recovering the "
+                "same delegate_cursor_agent run; this session skipped resume.]"
+            )
+        fresh = read_receipt(receipt_path)
+        if fresh is None or is_terminal_receipt(fresh):
+            result_json = _reconcile_result_from_receipt(fresh or receipt)
+            if result_json:
+                history = list(agent_history)
+                history.append(
+                    make_tool_result_message(
+                        "delegate_cursor_agent",
+                        result_json,
+                        tool_call_id,
+                        effect_disposition="unknown",
+                    )
+                )
+                return history, (
+                    "[System note: Recovered delegate_cursor_agent from "
+                    "terminal evidence while waiting for resume lock.]"
+                )
+            return agent_history, (
+                "[System note: delegate_cursor_agent receipt became terminal "
+                "without reconcilable evidence.]"
+            )
+
+        workdir = str(receipt.get("workdir") or args.get("workdir") or "")
+        if not workdir:
+            return agent_history, (
+                "[System note: delegate_cursor_agent receipt missing workdir; "
+                "automatic recovery refused.]"
+            )
+
+        result_json = run_cursor_agent_cli_with_receipt(
+            task=str(args.get("task") or ""),
+            workdir=workdir,
+            model=args.get("model"),
+            timeout_seconds=int(
+                args.get("timeout_seconds", receipt.get("timeout_seconds") or 0)
+            ),
+            force=is_truthy_value(args.get("force", receipt.get("force", True)), default=True),
+            hermes_session_id=hermes_session_id,
+            tool_call_id=tool_call_id or None,
+            resume_session_id=cursor_session_id,
+            continuation=True,
+            existing_receipt_path=receipt_path,
+            existing_run_id=run_id,
+            resume_attempt_increment=True,
+        )
+
+    history = list(agent_history)
+    history.append(
+        make_tool_result_message(
+            "delegate_cursor_agent",
+            result_json,
+            tool_call_id,
+            effect_disposition="unknown",
+        )
+    )
+    return history, (
+        "[System note: Automatically resumed an interrupted delegate_cursor_agent "
+        f"run using Cursor session {cursor_session_id}.]"
+    )
+
+
 def _run_and_stream(
     cmd: List[str],
     *,
@@ -1168,6 +1634,8 @@ def _run_and_stream(
     timeout_seconds: int,
     log_dir: Path,
     run_timestamp: str,
+    log_path: Optional[Path] = None,
+    on_complete_line: Optional[Callable[[str], None]] = None,
 ) -> Tuple[Optional[str], str, str, float, Optional[int]]:
     """Spawn the agent, stream stdout to a log file, enforce watchdogs.
 
@@ -1180,6 +1648,8 @@ def _run_and_stream(
         stall_watchdog_seconds=STALL_WATCHDOG_SECONDS,
         log_dir=log_dir,
         run_timestamp=run_timestamp,
+        log_path=log_path,
+        on_complete_line=on_complete_line,
     )
 
 
@@ -1221,6 +1691,38 @@ def _cloud_result_fields(
     }
 
 
+def _cloud_outcome_from_run(
+    *,
+    local_error: Optional[str],
+    cloud_status: Optional[str],
+) -> str:
+    if local_error == "interrupted":
+        return "interrupted"
+    if local_error == "timeout":
+        return "timeout"
+    if cloud_status == "FINISHED":
+        return "success"
+    if cloud_status == "ERROR":
+        return "failed"
+    if cloud_status == "CANCELLED":
+        return "cancelled"
+    if cloud_status == "EXPIRED":
+        return "expired"
+    if local_error:
+        return "error"
+    return "error"
+
+
+def _make_cloud_tool_result(
+    *,
+    receipt_run_id: Optional[str] = None,
+    **fields: Any,
+) -> str:
+    if receipt_run_id:
+        fields["receipt_run_id"] = receipt_run_id
+    return _make_result(**fields)
+
+
 def delegate_cursor_agent(
     task: str,
     workdir: str,
@@ -1228,8 +1730,8 @@ def delegate_cursor_agent(
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     force: bool = True,
     task_id: str | None = None,
+    tool_call_id: str | None = None,
 ) -> str:
-    del task_id  # reserved for future correlation; not used yet
 
     if not task or not str(task).strip():
         return _make_result(
@@ -1281,6 +1783,27 @@ def delegate_cursor_agent(
     agent_id = new_agent_id()
     log_path = log_dir / f"{run_timestamp}-{os.getpid()}-{machine_name}.log"
 
+    hermes_session_id = str(task_id or "").strip() or "unknown-session"
+    receipt_path: Optional[Path] = None
+    receipt_run_id: Optional[str] = None
+    cloud_run_id = ""
+    try:
+        receipt_run_id, receipt_path = create_receipt(
+            hermes_session_id=hermes_session_id,
+            tool_call_id=tool_call_id,
+            workdir=str(workdir_path),
+            prompt_hash=hash_prompt(str(task).strip()),
+            log_path=str(log_path),
+            model=model_name,
+            force=force_enabled,
+            timeout_seconds=clamped_timeout,
+            execution_mode="cloud",
+            cloud_agent_id=agent_id,
+            cloud_run_id=None,
+        )
+    except Exception as exc:
+        logger.debug("cloud receipt create failed: %s", exc)
+
     payload = build_create_agent_payload(
         task=str(task).strip(),
         repo_url=repo_url,
@@ -1302,33 +1825,66 @@ def delegate_cursor_agent(
     run: Dict[str, Any] = {}
     progress_url: Optional[str] = None
 
+    def _finalize_cloud_receipt(result_json: str, outcome: str) -> None:
+        if receipt_path is None:
+            return
+        try:
+            finalize_receipt(
+                receipt_path,
+                outcome=outcome,
+                terminal_result={"result_json": result_json},
+                log_path=str(log_path),
+                cloud_agent_id=agent_id,
+                cloud_run_id=cloud_run_id or None,
+            )
+        except Exception as exc:
+            logger.debug("cloud receipt finalize failed: %s", exc)
+
+    def _return_cloud(result: str, *, local_error: Optional[str] = None, cloud_status: Optional[str] = None) -> str:
+        outcome = _cloud_outcome_from_run(
+            local_error=local_error,
+            cloud_status=cloud_status,
+        )
+        _finalize_cloud_receipt(result, outcome)
+        return result
+
     try:
         try:
             worker.start()
         except Exception as exc:
             logger.error("delegate_cursor_agent worker start failed: %s", exc, exc_info=True)
-            return _make_result(
+            result = _make_cloud_tool_result(
                 success=False,
                 error=_redact_secret(str(exc), api_key),
                 duration_seconds=round(time.monotonic() - started_mono, 3),
                 log_path=str(log_path),
+                receipt_run_id=receipt_run_id,
             )
+            return _return_cloud(result, cloud_status="ERROR")
 
         try:
             agent, run = create_agent_with_timeout_dedupe(payload, api_key=api_key)
         except TimeoutError as exc:
-            return _make_result(
-                success=False,
-                error=_redact_secret(str(exc), api_key),
-                duration_seconds=round(time.monotonic() - started_mono, 3),
-                log_path=str(log_path),
+            return _return_cloud(
+                _make_cloud_tool_result(
+                    success=False,
+                    error=_redact_secret(str(exc), api_key),
+                    duration_seconds=round(time.monotonic() - started_mono, 3),
+                    log_path=str(log_path),
+                    receipt_run_id=receipt_run_id,
+                ),
+                local_error="timeout",
             )
         except CursorCloudError as exc:
-            return _make_result(
-                success=False,
-                error=_redact_secret(str(exc), api_key),
-                duration_seconds=round(time.monotonic() - started_mono, 3),
-                log_path=str(log_path),
+            return _return_cloud(
+                _make_cloud_tool_result(
+                    success=False,
+                    error=_redact_secret(str(exc), api_key),
+                    duration_seconds=round(time.monotonic() - started_mono, 3),
+                    log_path=str(log_path),
+                    receipt_run_id=receipt_run_id,
+                ),
+                cloud_status="ERROR",
             )
 
         progress_url = extract_progress_url(agent)
@@ -1337,17 +1893,29 @@ def delegate_cursor_agent(
 
         agent_id = str(agent.get("id") or agent_id)
         run_id = str(run.get("id") or agent.get("latestRunId") or "")
+        cloud_run_id = run_id
+        if receipt_path is not None:
+            update_receipt(
+                receipt_path,
+                cloud_agent_id=agent_id,
+                cloud_run_id=cloud_run_id or None,
+                state="running",
+            )
         if not run_id:
-            return _make_result(
-                success=False,
-                error="Cursor Cloud Agent create did not return a run id",
-                **_cloud_result_fields(
-                    agent=agent,
-                    run=run,
-                    duration_seconds=time.monotonic() - started_mono,
-                    log_path=str(log_path),
-                    progress_url=progress_url,
+            return _return_cloud(
+                _make_cloud_tool_result(
+                    success=False,
+                    error="Cursor Cloud Agent create did not return a run id",
+                    receipt_run_id=receipt_run_id,
+                    **_cloud_result_fields(
+                        agent=agent,
+                        run=run,
+                        duration_seconds=time.monotonic() - started_mono,
+                        log_path=str(log_path),
+                        progress_url=progress_url,
+                    ),
                 ),
+                cloud_status="ERROR",
             )
 
         try:
@@ -1359,16 +1927,20 @@ def delegate_cursor_agent(
                 started_mono=started_mono,
             )
         except CursorCloudError as exc:
-            return _make_result(
-                success=False,
-                error=_redact_secret(str(exc), api_key),
-                **_cloud_result_fields(
-                    agent=agent,
-                    run=run,
-                    duration_seconds=time.monotonic() - started_mono,
-                    log_path=str(log_path),
-                    progress_url=progress_url,
+            return _return_cloud(
+                _make_cloud_tool_result(
+                    success=False,
+                    error=_redact_secret(str(exc), api_key),
+                    receipt_run_id=receipt_run_id,
+                    **_cloud_result_fields(
+                        agent=agent,
+                        run=run,
+                        duration_seconds=time.monotonic() - started_mono,
+                        log_path=str(log_path),
+                        progress_url=progress_url,
+                    ),
                 ),
+                cloud_status=str((run or {}).get("status") or "ERROR"),
             )
 
         fields = _cloud_result_fields(
@@ -1382,20 +1954,40 @@ def delegate_cursor_agent(
         cloud_status = fields.get("cloud_status")
 
         if local_error:
-            return _make_result(success=False, error=str(local_error), **fields)
+            return _return_cloud(
+                _make_cloud_tool_result(success=False, error=str(local_error), receipt_run_id=receipt_run_id, **fields),
+                local_error=str(local_error),
+                cloud_status=cloud_status,
+            )
         if cloud_status == "FINISHED":
-            return _make_result(success=True, error=None, **fields)
+            return _return_cloud(
+                _make_cloud_tool_result(success=True, error=None, receipt_run_id=receipt_run_id, **fields),
+                cloud_status=cloud_status,
+            )
         if cloud_status == "ERROR":
             detail = fields.get("final_report") or "Cursor Cloud Agent run failed"
-            return _make_result(success=False, error=detail, **fields)
+            return _return_cloud(
+                _make_cloud_tool_result(success=False, error=detail, receipt_run_id=receipt_run_id, **fields),
+                cloud_status=cloud_status,
+            )
         if cloud_status == "CANCELLED":
-            return _make_result(success=False, error="cancelled", **fields)
+            return _return_cloud(
+                _make_cloud_tool_result(success=False, error="cancelled", receipt_run_id=receipt_run_id, **fields),
+                cloud_status=cloud_status,
+            )
         if cloud_status == "EXPIRED":
-            return _make_result(success=False, error="expired", **fields)
-        return _make_result(
-            success=False,
-            error=f"Cursor Cloud Agent ended with status {cloud_status}",
-            **fields,
+            return _return_cloud(
+                _make_cloud_tool_result(success=False, error="expired", receipt_run_id=receipt_run_id, **fields),
+                cloud_status=cloud_status,
+            )
+        return _return_cloud(
+            _make_cloud_tool_result(
+                success=False,
+                error=f"Cursor Cloud Agent ended with status {cloud_status}",
+                receipt_run_id=receipt_run_id,
+                **fields,
+            ),
+            cloud_status=cloud_status,
         )
     finally:
         worker.cleanup()
@@ -1462,6 +2054,7 @@ def _handle_delegate_cursor_agent(args, **kw):
         timeout_seconds=args.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
         force=is_truthy_value(args.get("force", True), default=True),
         task_id=kw.get("task_id"),
+        tool_call_id=kw.get("tool_call_id"),
     )
 
 
