@@ -1,5 +1,5 @@
 name: quota_channels
-version: 1.0.0
+version: 1.1.1
 description: "Discord voice-channel quota display for Codex, Kimi, z.ai, Cursor, and Grok usage windows."
 author: Hermes Agent
 kind: backend

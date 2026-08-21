@@ -122,8 +122,7 @@ def load_state() -> dict:
         return {}
 
 
-def save_state(now_fn: NowFn = time.time) -> int:
-    state = {"last_quota_success": int(now_fn())}
+def _write_state(state: dict) -> None:
     path = state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(
@@ -135,6 +134,14 @@ def save_state(now_fn: NowFn = time.time) -> int:
         os.replace(tmp, path)
     except OSError as exc:
         raise QuotaChannelsError(f"cannot write {path}: {exc}") from exc
+
+
+def save_state(now_fn: NowFn = time.time) -> int:
+    state = load_state()
+    if not isinstance(state, dict):
+        state = {}
+    state["last_quota_success"] = int(now_fn())
+    _write_state(state)
     return state["last_quota_success"]
 
 
@@ -461,6 +468,36 @@ def category_name(
     return f"Quotas \u2022 {ts_part} \u2022 Next: {fmt_time(next_due)}"
 
 
+TS_CHANNEL_PENDING_NAME = "pending"
+TS_CHANNELS_KEY = "ts_channels"
+
+
+def parse_last_quota_success(value: Any) -> Optional[float]:
+    """Finite positive epoch from persisted state, or None if invalid."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(ts) or ts <= 0:
+        return None
+    try:
+        datetime.fromtimestamp(ts)
+    except (OSError, OverflowError, ValueError):
+        return None
+    return ts
+
+
+def timestamp_channel_name(last_success: Any) -> str:
+    # name derives only from the persisted last-success timestamp; tick time
+    # must never leak in here
+    ts = parse_last_quota_success(last_success)
+    if ts is None:
+        return TS_CHANNEL_PENDING_NAME
+    return fmt_ts(ts)
+
+
 def normalize_enabled_providers(raw: Any) -> Dict[str, bool]:
     if raw is None:
         return {key: True for key, _ in PROVIDER_SPECS}
@@ -590,6 +627,29 @@ def fetch_channel_name(
     except json.JSONDecodeError as exc:
         raise QuotaChannelsError("discord: invalid channel response JSON") from exc
     return data.get("name")
+
+
+def fetch_channel_json(
+    channel_id: str,
+    headers: dict,
+    http_fn: HttpFn = default_http,
+) -> Optional[dict]:
+    """Full channel object, or None when the channel no longer exists (404)."""
+    req = urllib.request.Request(
+        f"https://discord.com/api/v10/channels/{channel_id}", headers=headers
+    )
+    status, text = http_text(req, http_fn=http_fn)
+    if status == 404:
+        return None
+    if status != 200:
+        raise QuotaChannelsError(
+            f"discord channel fetch returned {status}: {text[:200]}"
+        )
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise QuotaChannelsError("discord: invalid channel response JSON") from exc
+    return data if isinstance(data, dict) else None
 
 
 def rename_channel(
@@ -912,15 +972,13 @@ def apply_position_moves(
     return True
 
 
-def sort_voice_channels(
-    config: dict,
-    entries: Sequence[Tuple[str, str, int]],
+def fetch_guild_channels(
+    guild_id: str,
     headers: dict,
     http_fn: HttpFn = default_http,
-) -> bool:
+) -> List[Mapping[str, Any]]:
     req = urllib.request.Request(
-        f"https://discord.com/api/v10/guilds/{config['guild_id']}/channels",
-        headers=headers,
+        f"https://discord.com/api/v10/guilds/{guild_id}/channels", headers=headers
     )
     status, text = http_text(req, http_fn=http_fn)
     if status != 200:
@@ -931,10 +989,186 @@ def sort_voice_channels(
         guild_channels = json.loads(text)
     except json.JSONDecodeError as exc:
         raise QuotaChannelsError("discord: invalid guild channels response JSON") from exc
+    if not isinstance(guild_channels, list):
+        raise QuotaChannelsError("discord: invalid guild channels response JSON")
+    return guild_channels
+
+
+def sort_voice_channels(
+    config: dict,
+    entries: Sequence[Tuple[str, str, int]],
+    headers: dict,
+    http_fn: HttpFn = default_http,
+) -> bool:
+    guild_channels = fetch_guild_channels(
+        config["guild_id"], headers, http_fn=http_fn
+    )
     moves = plan_position_moves(entries, guild_channels)
     return apply_position_moves(
         config["guild_id"], moves, headers, http_fn=http_fn
     )
+
+
+def stored_ts_channel_id(
+    state: Mapping[str, Any],
+    category_id: str,
+) -> Optional[str]:
+    channels = state.get(TS_CHANNELS_KEY)
+    if not isinstance(channels, Mapping):
+        return None
+    stored = channels.get(str(category_id))
+    return None if stored is None else str(stored)
+
+
+def ts_channel_matches(
+    channel: Optional[Mapping[str, Any]],
+    category_id: str,
+) -> bool:
+    """The managed channel is identified by ID only, never by name."""
+    if not isinstance(channel, Mapping):
+        return False
+    if channel.get("type") != 2:
+        return False
+    return str(channel.get("parent_id") or "") == str(category_id)
+
+
+def resolve_ts_channel(
+    state: Mapping[str, Any],
+    category_id: str,
+    headers: dict,
+    http_fn: HttpFn = default_http,
+) -> Optional[str]:
+    """Stored channel ID, but only while it is still a type-2 child of the category."""
+    channel_id = stored_ts_channel_id(state, category_id)
+    if channel_id is None:
+        return None
+    channel = fetch_channel_json(channel_id, headers, http_fn=http_fn)
+    if not ts_channel_matches(channel, category_id):
+        return None
+    return channel_id
+
+
+def create_ts_channel(
+    guild_id: str,
+    name: str,
+    category_id: str,
+    headers: dict,
+    http_fn: HttpFn = default_http,
+) -> str:
+    # voice-channel creates carry exactly name/type/parent_id: Discord rejects
+    # a topic on a voice channel with 400 code 50035 CHANNEL_TOPIC_INVALID
+    req = urllib.request.Request(
+        f"https://discord.com/api/v10/guilds/{guild_id}/channels",
+        data=json.dumps(
+            {"name": name, "type": 2, "parent_id": str(category_id)}
+        ).encode(),
+        headers=headers,
+        method="POST",
+    )
+    status, text = http_text(req, http_fn=http_fn)
+    if status not in (200, 201):
+        raise QuotaChannelsError(
+            f"discord channel create returned {status}: {text[:200]}"
+        )
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise QuotaChannelsError(
+            "discord: invalid channel create response JSON"
+        ) from exc
+    if not isinstance(data, dict) or not data.get("id"):
+        raise QuotaChannelsError("discord channel create response missing id")
+    return str(data["id"])
+
+
+def persist_ts_channel_id(category_id: str, channel_id: str) -> None:
+    state = load_state()
+    if not isinstance(state, dict):
+        state = {}
+    channels = state.get(TS_CHANNELS_KEY)
+    if not isinstance(channels, dict):
+        channels = {}
+    channels[str(category_id)] = str(channel_id)
+    state[TS_CHANNELS_KEY] = channels
+    _write_state(state)
+
+
+def plan_ts_bottom_move(
+    channel_id: str,
+    guild_channels: Sequence[Mapping[str, Any]],
+    category_id: str,
+) -> Optional[dict]:
+    """Move for putting the managed channel last, or None if already bottom."""
+    ours = str(channel_id)
+    ours_position: Optional[int] = None
+    others: List[int] = []
+    for channel in guild_channels:
+        if not isinstance(channel, Mapping):
+            continue
+        if str(channel.get("parent_id") or "") != str(category_id):
+            continue
+        position = channel.get("position") or 0
+        if str(channel.get("id") or "") == ours:
+            ours_position = position
+        else:
+            others.append(position)
+    if not others:
+        return None  # alone under the category: nothing to move below
+    bottom = max(others)
+    if ours_position is not None and ours_position > bottom:
+        return None  # strictly below every sibling
+    return {"id": ours, "position": bottom + 1}
+
+
+def maintain_timestamp_channel(
+    config: dict,
+    headers: dict,
+    *,
+    http_fn: HttpFn = default_http,
+) -> dict:
+    """Idempotently keep one timestamp voice channel at the category bottom.
+
+    The name always derives from the persisted last_quota_success, never from
+    tick time; with no successful run yet the channel is named "pending".
+    """
+    category_id = str(config["category_id"])
+    state = load_state()
+    if not isinstance(state, dict):
+        state = {}
+    name = timestamp_channel_name(state.get("last_quota_success"))
+
+    channel_id = resolve_ts_channel(state, category_id, headers, http_fn=http_fn)
+    created = False
+    if channel_id is None:
+        channel_id = create_ts_channel(
+            config["guild_id"], name, category_id, headers, http_fn=http_fn
+        )
+        persist_ts_channel_id(category_id, channel_id)
+        created = True
+
+    rename = (
+        "unchanged"
+        if created
+        else rename_channel(channel_id, name, headers, http_fn=http_fn)
+    )
+
+    guild_channels = fetch_guild_channels(
+        config["guild_id"], headers, http_fn=http_fn
+    )
+    move = plan_ts_bottom_move(channel_id, guild_channels, category_id)
+    moved = False
+    if move is not None:
+        moved = apply_position_moves(
+            config["guild_id"], [move], headers, http_fn=http_fn
+        )
+
+    return {
+        "channel_id": channel_id,
+        "name": name,
+        "rename": rename,
+        "created": created,
+        "moved": moved,
+    }
 
 
 def quota_due(
@@ -1042,12 +1276,17 @@ def run_tick(
         now_fn=now_fn,
     )
 
+    timestamp_channel = maintain_timestamp_channel(
+        config, headers, http_fn=http_fn
+    )
+
     return {
         "success": True,
         "did_quota": did_quota,
         "providers": provider_results,
         "category": category_status,
         "sorted": sorted_channels,
+        "timestamp_channel": timestamp_channel,
     }
 
 

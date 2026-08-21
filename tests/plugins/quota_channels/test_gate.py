@@ -80,6 +80,16 @@ class TestRunTickGate:
             "plugins.quota_channels.core.load_state",
             lambda: {"last_quota_success": 1_000_000},
         )
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.maintain_timestamp_channel",
+            lambda *a, **k: {
+                "channel_id": "ts1",
+                "name": "1/1 12:00am",
+                "rename": "unchanged",
+                "created": False,
+                "moved": False,
+            },
+        )
 
         config = _minimal_config()
         now = 1_000_010.0
@@ -116,6 +126,16 @@ class TestRunTickGate:
         monkeypatch.setattr(
             "plugins.quota_channels.core.save_state", lambda now_fn=None: 123
         )
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.maintain_timestamp_channel",
+            lambda *a, **k: {
+                "channel_id": "ts1",
+                "name": "1/1 12:00am",
+                "rename": "unchanged",
+                "created": False,
+                "moved": False,
+            },
+        )
 
         result = run_tick(
             _minimal_config(),
@@ -150,6 +170,16 @@ class TestRunTickGate:
         )
         monkeypatch.setattr(
             "plugins.quota_channels.core.save_state", lambda now_fn=None: 1
+        )
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.maintain_timestamp_channel",
+            lambda *a, **k: {
+                "channel_id": "ts1",
+                "name": "1/1 12:00am",
+                "rename": "unchanged",
+                "created": False,
+                "moved": False,
+            },
         )
 
         config = _minimal_config()
@@ -212,6 +242,16 @@ class TestRunTickGate:
             "plugins.quota_channels.core.save_state",
             lambda now_fn=None: save_calls.append(True) or 123,
         )
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.maintain_timestamp_channel",
+            lambda *a, **k: {
+                "channel_id": "ts1",
+                "name": "1/1 12:00am",
+                "rename": "unchanged",
+                "created": False,
+                "moved": False,
+            },
+        )
 
         result = run_tick(config, force=True, sleep_fn=lambda _: None)
         assert result["success"] is True
@@ -245,6 +285,16 @@ class TestRunTickGate:
         monkeypatch.setattr(
             "plugins.quota_channels.core.save_state",
             lambda now_fn=None: save_called.append(True) or 123,
+        )
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.maintain_timestamp_channel",
+            lambda *a, **k: {
+                "channel_id": "ts1",
+                "name": "1/1 12:00am",
+                "rename": "unchanged",
+                "created": False,
+                "moved": False,
+            },
         )
 
         result = run_tick(_minimal_config(), force=True, sleep_fn=lambda _: None)
