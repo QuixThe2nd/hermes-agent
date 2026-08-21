@@ -172,7 +172,7 @@ def http_bin(
     return status, body
 
 
-def parse_codex_usage(text: str) -> Tuple[int, int]:
+def parse_codex_usage(text: str) -> Tuple[int, float]:
     try:
         usage = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -194,15 +194,25 @@ def parse_codex_usage(text: str) -> Tuple[int, int]:
             "codex: invalid primary_window fields in usage payload"
         ) from exc
     remaining = max(0, 100 - used)
-    days = max(0, math.ceil(reset_after / 86400))
-    return remaining, days
+    reset_secs = max(0.0, reset_after)
+    return remaining, reset_secs
 
 
-def format_codex_name(remaining: int, days: int) -> str:
-    return f"Codex: {remaining}% \u2022 {days}d left"
+def format_reset_left(seconds: float) -> str:
+    # granular reset countdown: days at 2+ days out, then hours, then minutes
+    secs = max(0, seconds)
+    if secs >= 172800:
+        return f"{math.ceil(secs / 86400)}d left"
+    if secs >= 3600:
+        return f"{math.ceil(secs / 3600)}h left"
+    return f"{max(1, math.ceil(secs / 60))}m left"
 
 
-def parse_kimi_usage(text: str, now_fn: NowFn = time.time) -> Tuple[int, int]:
+def format_codex_name(remaining: int, reset_secs: float) -> str:
+    return f"Codex: {remaining}% \u2022 {format_reset_left(reset_secs)}"
+
+
+def parse_kimi_usage(text: str, now_fn: NowFn = time.time) -> Tuple[int, float]:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -231,17 +241,17 @@ def parse_kimi_usage(text: str, now_fn: NowFn = time.time) -> Tuple[int, int]:
         raise QuotaChannelsError("kimi: invalid resetTime in usage payload")
     now = datetime.fromtimestamp(now_fn(), tz=timezone.utc)
     try:
-        days = max(0, math.ceil((reset_at - now).total_seconds() / 86400))
+        reset_secs = max(0.0, (reset_at - now).total_seconds())
     except TypeError as exc:
         raise QuotaChannelsError("kimi: invalid resetTime in usage payload") from exc
-    return remaining, days
+    return remaining, reset_secs
 
 
-def format_kimi_name(remaining: int, days: int) -> str:
-    return f"Kimi: {remaining}% \u2022 {days}d left"
+def format_kimi_name(remaining: int, reset_secs: float) -> str:
+    return f"Kimi: {remaining}% \u2022 {format_reset_left(reset_secs)}"
 
 
-def parse_zai_usage(text: str, now_fn: NowFn = time.time) -> Tuple[int, int]:
+def parse_zai_usage(text: str, now_fn: NowFn = time.time) -> Tuple[int, float]:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -267,15 +277,17 @@ def parse_zai_usage(text: str, now_fn: NowFn = time.time) -> Tuple[int, int]:
     except (AttributeError, TypeError, ValueError) as exc:
         raise QuotaChannelsError("z.ai: invalid limits fields in usage payload") from exc
     remaining = max(0, 100 - used)
-    days = max(0, math.ceil((reset_ms / 1000 - now_fn()) / 86400))
-    return remaining, days
+    reset_secs = max(0.0, reset_ms / 1000 - now_fn())
+    return remaining, reset_secs
 
 
-def format_zai_name(remaining: int, days: int) -> str:
-    return f"z.ai: {remaining}% \u2022 {days}d left"
+def format_zai_name(remaining: int, reset_secs: float) -> str:
+    return f"z.ai: {remaining}% \u2022 {format_reset_left(reset_secs)}"
 
 
-def parse_cursor_usage(text: str, now_fn: NowFn = time.time) -> Tuple[int, int, int]:
+def parse_cursor_usage(
+    text: str, now_fn: NowFn = time.time
+) -> Tuple[int, int, float]:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -293,12 +305,16 @@ def parse_cursor_usage(text: str, now_fn: NowFn = time.time) -> Tuple[int, int, 
         end_ms = float(payload.get("billingCycleEnd") or 0)
     except (TypeError, ValueError) as exc:
         raise QuotaChannelsError("cursor: invalid planUsage fields in usage payload") from exc
-    days = max(0, math.ceil((end_ms / 1000 - now_fn()) / 86400))
-    return cursor_models, other_models, days
+    reset_secs = max(0.0, end_ms / 1000 - now_fn())
+    return cursor_models, other_models, reset_secs
 
 
-def format_cursor_name(auto_remaining: int, api_remaining: int, days: int) -> str:
-    return f"Cursor: {auto_remaining}%/{api_remaining}% \u2022 {days}d left"
+def format_cursor_name(
+    auto_remaining: int, api_remaining: int, reset_secs: float
+) -> str:
+    return (
+        f"Cursor: {auto_remaining}%/{api_remaining}% \u2022 {format_reset_left(reset_secs)}"
+    )
 
 
 def pb_varint(buf: bytes, i: int) -> Tuple[int, int]:
@@ -369,7 +385,9 @@ def grpc_web_unwrap(body: bytes) -> bytes:
     return msg
 
 
-def parse_grok_usage(body_bytes: bytes, now_fn: NowFn = time.time) -> Tuple[int, int]:
+def parse_grok_usage(
+    body_bytes: bytes, now_fn: NowFn = time.time
+) -> Tuple[int, float]:
     try:
         config = None
         for field, wire, val in pb_fields(grpc_web_unwrap(body_bytes)):
@@ -391,16 +409,16 @@ def parse_grok_usage(body_bytes: bytes, now_fn: NowFn = time.time) -> Tuple[int,
             raise QuotaChannelsError("grok: no credit_usage_percent in billing config")
 
         remaining = round(100 - used_pct)
-        days = max(0, math.ceil((period_end - now_fn()) / 86400))
-        return remaining, days
+        reset_secs = max(0.0, period_end - now_fn())
+        return remaining, reset_secs
     except QuotaChannelsError:
         raise
     except (IndexError, struct.error, ValueError, TypeError, KeyError) as exc:
         raise QuotaChannelsError("grok: invalid billing response protobuf") from exc
 
 
-def format_grok_name(remaining: int, days: int) -> str:
-    return f"Grok: {remaining}% \u2022 {days}d left"
+def format_grok_name(remaining: int, reset_secs: float) -> str:
+    return f"Grok: {remaining}% \u2022 {format_reset_left(reset_secs)}"
 
 
 def quota_label(elapsed: float) -> str:
@@ -733,7 +751,7 @@ def fetch_grok_usage(
 def run_codex_provider(
     http_fn: HttpFn = default_http,
     now_fn: NowFn = time.time,
-) -> Tuple[str, int, str]:
+) -> Tuple[str, float, str]:
     store = load_store()
     toks = store.get("providers", {}).get("openai-codex", {}).get("tokens", {})
     access = toks.get("access_token")
@@ -747,36 +765,36 @@ def run_codex_provider(
         raise QuotaChannelsError(
             f"codex usage endpoint returned {status}: {text[:200]}"
         )
-    remaining, days = parse_codex_usage(text)
-    return format_codex_name(remaining, days), days, "Codex"
+    remaining, reset_secs = parse_codex_usage(text)
+    return format_codex_name(remaining, reset_secs), reset_secs, "Codex"
 
 
 def run_kimi_provider(
     http_fn: HttpFn = default_http,
     now_fn: NowFn = time.time,
-) -> Tuple[str, int, str]:
+) -> Tuple[str, float, str]:
     status, text = fetch_kimi_usage(kimi_api_key(), http_fn=http_fn)
     if status != 200:
         raise QuotaChannelsError(f"kimi usage endpoint returned {status}: {text[:200]}")
-    remaining, days = parse_kimi_usage(text, now_fn=now_fn)
-    return format_kimi_name(remaining, days), days, "Kimi"
+    remaining, reset_secs = parse_kimi_usage(text, now_fn=now_fn)
+    return format_kimi_name(remaining, reset_secs), reset_secs, "Kimi"
 
 
 def run_zai_provider(
     http_fn: HttpFn = default_http,
     now_fn: NowFn = time.time,
-) -> Tuple[str, int, str]:
+) -> Tuple[str, float, str]:
     status, text = fetch_zai_usage(zai_api_key(), http_fn=http_fn)
     if status != 200:
         raise QuotaChannelsError(f"z.ai usage endpoint returned {status}: {text[:200]}")
-    remaining, days = parse_zai_usage(text, now_fn=now_fn)
-    return format_zai_name(remaining, days), days, "z.ai"
+    remaining, reset_secs = parse_zai_usage(text, now_fn=now_fn)
+    return format_zai_name(remaining, reset_secs), reset_secs, "z.ai"
 
 
 def run_cursor_provider(
     http_fn: HttpFn = default_http,
     now_fn: NowFn = time.time,
-) -> Tuple[str, int, str]:
+) -> Tuple[str, float, str]:
     status, text = fetch_cursor_usage(cursor_access_token(), http_fn=http_fn)
     if status == 401:
         raise QuotaChannelsError(
@@ -786,10 +804,12 @@ def run_cursor_provider(
         raise QuotaChannelsError(
             f"cursor usage endpoint returned {status}: {text[:200]}"
         )
-    auto_remaining, api_remaining, days = parse_cursor_usage(text, now_fn=now_fn)
+    auto_remaining, api_remaining, reset_secs = parse_cursor_usage(
+        text, now_fn=now_fn
+    )
     return (
-        format_cursor_name(auto_remaining, api_remaining, days),
-        days,
+        format_cursor_name(auto_remaining, api_remaining, reset_secs),
+        reset_secs,
         "Cursor",
     )
 
@@ -797,7 +817,7 @@ def run_cursor_provider(
 def run_grok_provider(
     http_fn: HttpFn = default_http,
     now_fn: NowFn = time.time,
-) -> Tuple[str, int, str]:
+) -> Tuple[str, float, str]:
     store = load_store()
     toks = store.get("providers", {}).get("xai-oauth", {}).get("tokens", {})
     access = toks.get("access_token")
@@ -811,8 +831,8 @@ def run_grok_provider(
         raise QuotaChannelsError(
             f"grok billing endpoint returned {status}: {body[:200]!r}"
         )
-    remaining, days = parse_grok_usage(body, now_fn=now_fn)
-    return format_grok_name(remaining, days), days, "Grok"
+    remaining, reset_secs = parse_grok_usage(body, now_fn=now_fn)
+    return format_grok_name(remaining, reset_secs), reset_secs, "Grok"
 
 
 PROVIDER_RUNNERS = {
@@ -922,11 +942,11 @@ def run_provider_quota(
     headers: dict,
     http_fn: HttpFn = default_http,
     now_fn: NowFn = time.time,
-) -> Tuple[str, int, str, str]:
+) -> Tuple[str, float, str, str]:
     runner = PROVIDER_RUNNERS[key]
-    name, days, label = runner(http_fn=http_fn, now_fn=now_fn)
+    name, reset_secs, label = runner(http_fn=http_fn, now_fn=now_fn)
     rename = rename_channel(channel_id, name, headers, http_fn=http_fn)
-    return label, days, name, rename
+    return label, reset_secs, name, rename
 
 
 def update_category(
@@ -969,17 +989,17 @@ def run_tick(
     headers = discord_headers()
 
     if did_quota:
-        entries: List[Tuple[str, str, int]] = []
+        entries: List[Tuple[str, str, float]] = []
         for key, label, channel_id in config["providers"]:
-            prov_label, days, channel_name, rename = run_provider_quota(
+            prov_label, reset_secs, channel_name, rename = run_provider_quota(
                 key, channel_id, headers, http_fn=http_fn, now_fn=now_fn
             )
             provider_results[prov_label] = {
                 "remaining": _remaining_from_name(channel_name, prov_label),
-                "days": days,
+                "reset_seconds": reset_secs,
                 "rename": rename,
             }
-            entries.append((label, channel_id, days))
+            entries.append((label, channel_id, reset_secs))
         sorted_channels = sort_voice_channels(
             config, entries, headers, http_fn=http_fn
         )

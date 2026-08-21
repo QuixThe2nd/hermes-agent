@@ -20,6 +20,7 @@ from plugins.quota_channels.core import (
     format_cursor_name,
     format_grok_name,
     format_kimi_name,
+    format_reset_left,
     format_zai_name,
     parse_codex_usage,
     parse_cursor_usage,
@@ -72,22 +73,61 @@ def _build_grok_grpc_body(used_pct: float, period_end: int) -> bytes:
     return b"\x00" + len(message).to_bytes(4, "big") + message
 
 
+class TestFormatResetLeft:
+    def test_days_at_two_days_and_beyond(self):
+        assert format_reset_left(172800) == "2d left"
+        assert format_reset_left(3 * 86400) == "3d left"
+
+    def test_hours_between_one_hour_and_two_days(self):
+        assert format_reset_left(3600) == "1h left"
+        assert format_reset_left(25 * 3600) == "25h left"
+        assert format_reset_left(172799) == "48h left"
+
+    def test_minutes_under_one_hour(self):
+        assert format_reset_left(45 * 60) == "45m left"
+        assert format_reset_left(59 * 60) == "59m left"
+
+    def test_rounds_up_to_the_next_unit(self):
+        assert format_reset_left(3 * 86400 + 1) == "4d left"
+        assert format_reset_left(25 * 3600 + 1) == "26h left"
+        assert format_reset_left(45 * 60 + 1) == "46m left"
+
+    def test_negative_clamps_to_zero(self):
+        assert format_reset_left(-3600) == format_reset_left(0)
+
+
 class TestParseCodexUsage:
-    def test_rounds_used_percent_and_days(self):
+    def test_rounds_used_percent_and_keeps_reset_seconds(self):
+        reset_secs = 86400 * 3 + 1
         payload = json.dumps(
             {
                 "rate_limit": {
                     "primary_window": {
                         "used_percent": 12.6,
-                        "reset_after_seconds": 86400 * 3 + 1,
+                        "reset_after_seconds": reset_secs,
                     }
                 }
             }
         )
-        remaining, days = parse_codex_usage(payload)
+        remaining, parsed = parse_codex_usage(payload)
         assert remaining == 87
-        assert days == 4
-        assert format_codex_name(remaining, days) == "Codex: 87% \u2022 4d left"
+        assert parsed == reset_secs
+        assert format_codex_name(remaining, parsed) == "Codex: 87% \u2022 4d left"
+
+    def test_under_two_days_renders_hours(self):
+        payload = json.dumps(
+            {
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 12.6,
+                        "reset_after_seconds": 25 * 3600,
+                    }
+                }
+            }
+        )
+        remaining, parsed = parse_codex_usage(payload)
+        assert parsed == 25 * 3600
+        assert format_codex_name(remaining, parsed) == "Codex: 87% \u2022 25h left"
 
 
 class TestParseKimiUsage:
@@ -101,11 +141,11 @@ class TestParseKimiUsage:
                 }
             }
         )
-        now = reset.timestamp() - 86400
-        remaining, days = parse_kimi_usage(payload, now_fn=lambda: now)
+        now = reset.timestamp() - 25 * 3600
+        remaining, reset_secs = parse_kimi_usage(payload, now_fn=lambda: now)
         assert remaining == 42
-        assert days == 1
-        assert format_kimi_name(remaining, days) == "Kimi: 42% \u2022 1d left"
+        assert reset_secs == 25 * 3600
+        assert format_kimi_name(remaining, reset_secs) == "Kimi: 42% \u2022 25h left"
 
 
 class TestParseZaiUsage:
@@ -121,10 +161,10 @@ class TestParseZaiUsage:
             }
         )
         now = 1_800_000_000_000 / 1000 - 86400 * 2
-        remaining, days = parse_zai_usage(payload, now_fn=lambda: now)
+        remaining, reset_secs = parse_zai_usage(payload, now_fn=lambda: now)
         assert remaining == 45
-        assert days == 2
-        assert format_zai_name(remaining, days) == "z.ai: 45% \u2022 2d left"
+        assert reset_secs == 86400 * 2
+        assert format_zai_name(remaining, reset_secs) == "z.ai: 45% \u2022 2d left"
 
 
 class TestParseCursorUsage:
@@ -137,14 +177,14 @@ class TestParseCursorUsage:
             }
         )
         now = end_ms / 1000 - 86400 * 5
-        auto_remaining, api_remaining, days = parse_cursor_usage(
+        auto_remaining, api_remaining, reset_secs = parse_cursor_usage(
             payload, now_fn=lambda: now
         )
         assert auto_remaining == 88
         assert api_remaining == 67
-        assert days == 5
+        assert reset_secs == 86400 * 5
         assert (
-            format_cursor_name(auto_remaining, api_remaining, days)
+            format_cursor_name(auto_remaining, api_remaining, reset_secs)
             == "Cursor: 88%/67% \u2022 5d left"
         )
 
@@ -154,10 +194,10 @@ class TestParseGrokUsage:
         period_end = int(datetime(2026, 8, 30, tzinfo=timezone.utc).timestamp())
         body = _build_grok_grpc_body(23.6, period_end)
         now = period_end - 86400 * 4
-        remaining, days = parse_grok_usage(body, now_fn=lambda: now)
+        remaining, reset_secs = parse_grok_usage(body, now_fn=lambda: now)
         assert remaining == 76
-        assert days == 4
-        assert format_grok_name(remaining, days) == "Grok: 76% \u2022 4d left"
+        assert reset_secs == 86400 * 4
+        assert format_grok_name(remaining, reset_secs) == "Grok: 76% \u2022 4d left"
 
 
 class TestMockedProviderFetch:
@@ -191,10 +231,10 @@ class TestMockedProviderFetch:
                 return 200, body
             raise AssertionError(req.full_url)
 
-        name, days, label = run_codex_provider(http_fn=fake_http)
+        name, reset_secs, label = run_codex_provider(http_fn=fake_http)
         assert label == "Codex"
-        assert days == 1
-        assert name == "Codex: 95% \u2022 1d left"
+        assert reset_secs == 86400
+        assert name == "Codex: 95% \u2022 24h left"
         status, _ = fetch_codex_usage("tok", http_fn=fake_http)
         assert status == 200
 
@@ -215,11 +255,12 @@ class TestMockedProviderFetch:
             ).encode()
             return 200, body
 
-        name, days, label = run_kimi_provider(
+        name, reset_secs, label = run_kimi_provider(
             http_fn=fake_http, now_fn=lambda: reset.timestamp() - 3600
         )
         assert label == "Kimi"
-        assert name == "Kimi: 80% \u2022 1d left"
+        assert reset_secs == 3600
+        assert name == "Kimi: 80% \u2022 1h left"
         status, _ = fetch_kimi_usage("kimi-key", http_fn=fake_http)
         assert status == 200
 
@@ -240,11 +281,11 @@ class TestMockedProviderFetch:
             ).encode()
             return 200, body
 
-        name, days, label = run_zai_provider(
+        name, reset_secs, label = run_zai_provider(
             http_fn=fake_http, now_fn=lambda: 2_000_000_000_000 / 1000 - 86400
         )
         assert label == "z.ai"
-        assert name == "z.ai: 80% \u2022 1d left"
+        assert name == "z.ai: 80% \u2022 24h left"
         status, _ = fetch_zai_usage("raw-zai-key", http_fn=fake_http)
         assert status == 200
 
@@ -269,7 +310,7 @@ class TestMockedProviderFetch:
             ).encode()
             return 200, body
 
-        name, days, label = run_cursor_provider(
+        name, reset_secs, label = run_cursor_provider(
             http_fn=fake_http, now_fn=lambda: end_ms / 1000 - 86400 * 2
         )
         assert label == "Cursor"
@@ -299,18 +340,18 @@ class TestMockedProviderFetch:
                 return 200, body
             raise AssertionError(req.full_url)
 
-        name, days, label = run_grok_provider(
+        name, reset_secs, label = run_grok_provider(
             http_fn=fake_http, now_fn=lambda: period_end - 86400 * 3
         )
         assert label == "Grok"
         assert name == "Grok: 90% \u2022 3d left"
         status, fetched = fetch_grok_usage("grok-tok", http_fn=fake_http)
         assert status == 200
-        remaining, parsed_days = parse_grok_usage(
+        remaining, parsed_secs = parse_grok_usage(
             fetched, now_fn=lambda: period_end - 86400 * 3
         )
         assert remaining == 90
-        assert parsed_days == 3
+        assert parsed_secs == 86400 * 3
 
     def test_grok_missing_config_raises(self):
         with pytest.raises(QuotaChannelsError, match="no config message"):
@@ -487,10 +528,10 @@ class TestOAuthRefreshRetry:
                 return 200, body
             raise AssertionError(url)
 
-        name, days, label = run_codex_provider(http_fn=fake_http)
+        name, reset_secs, label = run_codex_provider(http_fn=fake_http)
         assert label == "Codex"
-        assert name == "Codex: 90% \u2022 1d left"
-        assert days == 1
+        assert name == "Codex: 90% \u2022 24h left"
+        assert reset_secs == 86400
         assert len(refresh_calls) == 1
         assert len(usage_calls) == 2
         assert usage_calls[0] == "Bearer old-tok"
@@ -536,12 +577,12 @@ class TestOAuthRefreshRetry:
                 return 200, body
             raise AssertionError(url)
 
-        name, days, label = run_grok_provider(
+        name, reset_secs, label = run_grok_provider(
             http_fn=fake_http, now_fn=lambda: period_end - 86400
         )
         assert label == "Grok"
-        assert name == "Grok: 85% \u2022 1d left"
-        assert days == 1
+        assert name == "Grok: 85% \u2022 24h left"
+        assert reset_secs == 86400
         assert len(refresh_calls) == 1
         assert len(billing_calls) == 2
         assert billing_calls[0] == "Bearer old-grok"

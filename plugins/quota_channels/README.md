@@ -1,13 +1,13 @@
 # quota_channels
 
-Discord voice-channel quota display for **Codex**, **Kimi**, **z.ai**, **Cursor**, and **Grok**. Renames configured voice channels with remaining quota percentages and days until reset, sorts channels by days remaining (ascending), and keeps a category channel label fresh between cron ticks.
+Discord voice-channel quota display for **Codex**, **Kimi**, **z.ai**, **Cursor**, and **Grok**. Renames configured voice channels with remaining quota percentages and a granular time-until-reset countdown (days at 2+ days out, then hours, then minutes), sorts channels by time until reset (ascending), and keeps a category channel label fresh between cron ticks.
 
 ## What it does
 
 Each tick (typically every minute via cron):
 
 1. **Quota gate** — provider API fetches run at most every `quota_interval_seconds` (default 30 minutes) unless forced. State lives in `HERMES_HOME/quota_channels_state.json`.
-2. **On a quota run** — fetch all enabled providers, rename voice channels, sort them by days remaining, save state, sleep `post_quota_delay_seconds` (default 31s), then refresh the category label again.
+2. **On a quota run** — fetch all enabled providers, rename voice channels, sort them by time until reset, save state, sleep `post_quota_delay_seconds` (default 31s), then refresh the category label again.
 3. **Every tick** — update the Quotas category name with a bucketed freshness label derived from seconds since the last successful full quota run.
 
 Silent success for the headless CLI; failures print `quota-channels: <message>` and exit 1.
