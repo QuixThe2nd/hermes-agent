@@ -297,3 +297,14 @@ class TestRegistration:
         entry = registry.get_entry("resolve_ticket")
         assert entry is not None
         assert entry.toolset == "discord"
+
+    def test_propose_schema_requires_terminal_turn(self):
+        from tools.registry import registry
+
+        entry = registry.get_entry("resolve_ticket")
+        assert entry is not None
+        description = entry.schema["description"].lower()
+        assert "propose" in description
+        assert "terminal" in description
+        assert "no follow-up" in description or "no follow up" in description
+        assert "no further tool call" in description
