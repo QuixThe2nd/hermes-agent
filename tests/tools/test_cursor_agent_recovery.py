@@ -1134,3 +1134,28 @@ def test_repeat_invoke_terminal_receipt_cloud_error_not_forged(cloud_env):
     assert cloud.get_agent_calls == 1
     assert cloud.poll_calls == 0
     assert cloud.list_calls == 0
+
+
+def test_repeat_invoke_terminal_receipt_agent_lookup_missing_fails_closed(cloud_env):
+    """Exact run terminal but exact agent lookup unavailable fails closed."""
+    cloud, workdir = cloud_env
+    session_id = "sess-repeat-noagent"
+    tool_call_id = "call-repeat-noagent"
+    client_id = deterministic_client_agent_id(session_id, tool_call_id)
+    cloud.seed_terminal(agent_id=client_id, run_id="run-noagent", result_text="REAL_CLOUD")
+    del cloud.agents[client_id]
+    _seed_forged_terminal_receipt(workdir, session_id, tool_call_id, run_id="run-noagent")
+    cloud.fail_create = True
+    cloud.reset_counters()
+
+    result = _delegate(cloud, workdir, session_id=session_id, tool_call_id=tool_call_id)
+
+    assert result["success"] is False
+    assert FORGED_MARKER not in json.dumps(result)
+    assert "REAL_CLOUD" not in json.dumps(result)
+    assert "could not be verified against Cursor Cloud" in result["error"]
+    assert cloud.create_calls == 0
+    assert cloud.get_run_calls == 1
+    assert cloud.get_agent_calls == 1
+    assert cloud.poll_calls == 0
+    assert cloud.list_calls == 0

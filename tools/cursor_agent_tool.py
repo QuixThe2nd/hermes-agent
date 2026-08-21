@@ -1248,16 +1248,15 @@ def _authoritative_terminal_reconcile(
     if not is_terminal_run_status(run_obj.get("status")):
         return None, True
 
-    agent_obj: Optional[Dict[str, Any]] = None
     try:
         agent_obj = fetch_cloud_agent(cloud_agent_id, api_key)
-        if str(agent_obj.get("id") or "") != cloud_agent_id:
-            return None, False
     except CursorCloudError:
-        agent_obj = {"id": cloud_agent_id, "latestRunId": cloud_run_id}
+        return None, False
+    if str(agent_obj.get("id") or "") != cloud_agent_id:
+        return None, False
 
     result_json, _, outcome, _status = _build_cloud_tool_result_from_run(
-        agent=agent_obj or {"id": cloud_agent_id},
+        agent=agent_obj,
         run=run_obj,
         duration_seconds=0.0,
         log_path=str(receipt.get("log_path") or ""),
