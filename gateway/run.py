@@ -5347,12 +5347,86 @@ class TurnRunner:
         except Exception:
             logger.debug("tool stage event enqueue failed", exc_info=True)
 
+    def _collect_final_stage_events(self) -> list:
+        """Drain the stage queue; one event per invocation (terminal preferred)."""
+        ctx = self._ctx
+        by_invocation: Dict[str, list] = {}
+        while not ctx.stage_event_queue.empty():
+            try:
+                event = ctx.stage_event_queue.get_nowait()
+            except Exception:
+                break
+            invocation = str(event.get("invocation_id") or "")
+            if not invocation:
+                continue
+            by_invocation.setdefault(invocation, []).append(event)
+        to_deliver: list = []
+        for events in by_invocation.values():
+            terminal = next((e for e in reversed(events) if e.get("terminal")), None)
+            to_deliver.append(terminal if terminal is not None else events[-1])
+        return to_deliver
+
+    async def _deliver_tool_stage_event(
+        self, event: dict, embed_msg_ids: Dict[str, str]
+    ) -> None:
+        ctx = self._ctx
+        adapter = ctx._stage_embed_adapter
+        if adapter is None:
+            return
+        invocation = str(event.get("invocation_id") or "")
+        if not invocation:
+            return
+        try:
+            message_id = embed_msg_ids.get(invocation)
+            if message_id is None:
+                result = await adapter.send_tool_stage_embed(
+                    ctx.source.chat_id,
+                    event,
+                    metadata=ctx._progress_metadata,
+                    reply_to=ctx._progress_reply_to,
+                )
+            else:
+                result = await adapter.edit_tool_stage_embed(
+                    ctx.source.chat_id,
+                    message_id,
+                    event,
+                    metadata=ctx._progress_metadata,
+                )
+            if result is not None and getattr(result, "success", False):
+                new_id = getattr(result, "message_id", None)
+                if new_id:
+                    embed_msg_ids[invocation] = str(new_id)
+            else:
+                # Fail soft: forget the mapping so the NEXT event
+                # (usually the terminal one) sends a fresh embed
+                # instead of hammering a dead message id. A rendering
+                # failure must never alter the MoA tool's result.
+                embed_msg_ids.pop(invocation, None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(
+                "tool stage embed delivery failed: %s", e, exc_info=True
+            )
+            embed_msg_ids.pop(invocation, None)
+
+    async def _flush_remaining_stage_embeds(
+        self, embed_msg_ids: Dict[str, str]
+    ) -> None:
+        """Deliver terminal (or last) queued event per invocation; fail-soft."""
+        for event in self._collect_final_stage_events():
+            try:
+                await self._deliver_tool_stage_event(event, embed_msg_ids)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
     async def send_tool_stage_embeds(self):
         ctx = self._ctx
         if not ctx.stage_event_queue:
             return
-        adapter = ctx._stage_embed_adapter
-        if adapter is None:
+        if ctx._stage_embed_adapter is None:
             return
 
         # invocation_id -> embed message id. Concurrent invocations of the
@@ -5360,58 +5434,35 @@ class TurnRunner:
         # never cross-edit each other's embed.
         embed_msg_ids: Dict[str, str] = {}
 
-        while True:
-            try:
+        try:
+            while True:
                 if not ctx._run_still_current():
-                    while not ctx.stage_event_queue.empty():
-                        try:
-                            ctx.stage_event_queue.get_nowait()
-                        except Exception:
-                            break
+                    try:
+                        await self._flush_remaining_stage_embeds(embed_msg_ids)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
                     return
 
-                event = ctx.stage_event_queue.get_nowait()
-            except queue.Empty:
-                await asyncio.sleep(0.2)
-                continue
-
-            invocation = ""
-            try:
-                invocation = str(event.get("invocation_id") or "")
-                if not invocation:
+                try:
+                    event = ctx.stage_event_queue.get_nowait()
+                except queue.Empty:
+                    await asyncio.sleep(0.2)
                     continue
-                message_id = embed_msg_ids.get(invocation)
-                if message_id is None:
-                    result = await adapter.send_tool_stage_embed(
-                        ctx.source.chat_id,
-                        event,
-                        metadata=ctx._progress_metadata,
-                        reply_to=ctx._progress_reply_to,
-                    )
-                else:
-                    result = await adapter.edit_tool_stage_embed(
-                        ctx.source.chat_id,
-                        message_id,
-                        event,
-                        metadata=ctx._progress_metadata,
-                    )
-                if result is not None and getattr(result, "success", False):
-                    new_id = getattr(result, "message_id", None)
-                    if new_id:
-                        embed_msg_ids[invocation] = str(new_id)
-                else:
-                    # Fail soft: forget the mapping so the NEXT event
-                    # (usually the terminal one) sends a fresh embed
-                    # instead of hammering a dead message id. A rendering
-                    # failure must never alter the MoA tool's result.
-                    embed_msg_ids.pop(invocation, None)
+
+                await self._deliver_tool_stage_event(event, embed_msg_ids)
+        except asyncio.CancelledError:
+            # Turn teardown cancels this task while a terminal event is still
+            # queued (often during the idle sleep). Mirror send_progress_messages:
+            # drain and deliver final state, then propagate cancellation.
+            try:
+                await self._flush_remaining_stage_embeds(embed_msg_ids)
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
-                logger.debug(
-                    "tool stage embed delivery failed: %s", e, exc_info=True
-                )
-                embed_msg_ids.pop(invocation, None)
+            except Exception:
+                pass
+            raise
 
     def voice_ack_callback(self, call_id, tool_name, args):
         """tool_start_callback: speak a one-time ack in the voice channel."""
