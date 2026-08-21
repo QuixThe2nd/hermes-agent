@@ -195,6 +195,13 @@ const $selectedBot = atom('default')
  *  the socket happened to be homed on. */
 const $focusedBotProfile = host.state.focusedSessionProfile || host.state.profile
 
+/** Profile that owns the chat currently on screen. Bot Mode opens another
+ *  profile's session without moving the gateway socket, so mention filtering
+ *  and sender identity must follow focus rather than host.state.profile. */
+function focusedMentionProfile() {
+  return String($focusedBotProfile.get?.() || '').trim() || 'default'
+}
+
 /** Optional secondary navigation inside the Bots pane (group-chat rooms). */
 
 /** Group-chat rooms: { [group]: { log: [{from:{kind,name},text,at}], watermarks:{[member]:idx}, epoch, running } }.
@@ -2830,6 +2837,52 @@ function useRoster() {
     retry: true,
     retryDelay: attempt => Math.min(15000, 1000 * 2 ** attempt)
   })
+}
+
+/** Synchronous union-roster read for the composer surfaces (autocomplete
+ *  provider + mention middleware). useRoster caches under
+ *  [...ROSTER_KEY, activeConnectionId] — a 3-element key — so a bare
+ *  getQueryData(ROSTER_KEY) exact-match lookup returns undefined forever
+ *  (issue #89303: remote handles absent from @ autocomplete, mentions
+ *  unrouted). Read the live connection's entry first, then fall back to a
+ *  prefix scan keeping the freshest snapshot. Never throws: cold cache or
+ *  legacy queryClient returns null and callers fall back to their own path. */
+function cachedUnionRoster() {
+  if (typeof queryClient === 'undefined' || !queryClient || typeof queryClient.getQueryData !== 'function') {
+    return null
+  }
+
+  try {
+    const connectionId = String(
+      host.state.connectionId?.get?.() || host.activeConnectionId?.() || 'local'
+    )
+    const exact = queryClient.getQueryData([...ROSTER_KEY, connectionId])
+
+    if (Array.isArray(exact?.profiles)) {
+      return exact
+    }
+
+    if (typeof queryClient.getQueriesData === 'function') {
+      let best = null
+
+      // v5 takes a filters object; a legacy v3 queryClient treats the same
+      // object as the key itself and simply matches nothing — harmless.
+      for (const [, data] of queryClient.getQueriesData({ queryKey: ROSTER_KEY })) {
+        if (
+          Array.isArray(data?.profiles) &&
+          (!best || Number(data.fetchedAt || 0) > Number(best.fetchedAt || 0))
+        ) {
+          best = data
+        }
+      }
+
+      return best
+    }
+  } catch {
+    /* cache hiccup — caller falls back (middleware refetches) */
+  }
+
+  return null
 }
 
 /** Merge the union agent roster (host.agents) over the active gateway's
@@ -10733,14 +10786,14 @@ export default {
       area: COMPOSER_AREAS.atCompletions,
       data: {
         provide: query => {
-          const roster = queryClient.getQueryData(ROSTER_KEY)
+          const roster = cachedUnionRoster()
           const profiles = Array.isArray(roster?.profiles) ? roster.profiles : []
 
           if (!profiles.length) {
             return []
           }
 
-          const active = (host.state.profile.get() || 'default').trim() || 'default'
+          const active = focusedMentionProfile()
           const q = (query || '').toLowerCase()
           const items = []
           const live = {
@@ -11041,12 +11094,10 @@ export default {
           }
 
           const live = {
-            name: (host.state.profile.get() || 'default').trim() || 'default',
+            name: focusedMentionProfile(),
             connectionId: String(host.state.connectionId?.get?.() || host.activeConnectionId?.() || 'local')
           }
-          const cached = typeof queryClient !== 'undefined' && queryClient && typeof queryClient.getQueryData === 'function'
-            ? queryClient.getQueryData(ROSTER_KEY)
-            : null
+          const cached = cachedUnionRoster()
           const roster = Array.isArray(cached?.profiles) ? cached.profiles : null
           let mentionedBots = roster ? resolveRosterMentions(text, roster, live) : []
 
