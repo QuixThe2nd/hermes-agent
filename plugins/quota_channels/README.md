@@ -37,7 +37,6 @@ quota_channels:
   # Optional — disabled by default; omit entirely for pre-1.1 behavior
   token_usage:
     enabled: false
-    category_id: "YOUR_TOKEN_CATEGORY_CHANNEL_ID"
     channel_ids:
       codex: "VOICE_CHANNEL_ID"
       zai: "VOICE_CHANNEL_ID"
@@ -47,9 +46,11 @@ quota_channels:
 
 `enabled_providers` may also be a list, e.g. `["codex", "kimi"]`.
 
+**Upgrade note:** No config changes are required when updating from a quota-only install. Existing quota channels keep updating automatically; token usage stays off unless you opt in with `token_usage.enabled: true`.
+
 ## Token usage channels (optional)
 
-When `token_usage.enabled: true`, a separate category and voice channels show **rolling 7-day consumed tokens** (`<Provider>: 226.6M tok/7d`). Token provider fetches are **quota-gated** — they run only on ticks where the quota gate is open (`did_quota`), at most every `quota_interval_seconds`. The token category label (`Token Usage • Updated: …`) refreshes **every tick**, same bucketed freshness as the Quotas category.
+When `token_usage.enabled: true`, additional voice channels in the **same category** as the quota channels show **rolling 7-day consumed tokens** (`<Provider>: 226.6M tok/7d`). Token channels are ordered **after** the quota block in fixed canonical provider order (Codex, Kimi, z.ai, Cursor, Grok), including only providers with a mapped `token_usage.channel_ids` entry. The single Quotas category freshness label (`Quotas • Updated: …`) is unchanged. Token provider fetches are **quota-gated** — they run only on ticks where the quota gate is open (`did_quota`), at most every `quota_interval_seconds`.
 
 | Provider | Source | Notes |
 |----------|--------|-------|

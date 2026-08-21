@@ -54,7 +54,6 @@ CURSOR_AGG_USAGE_URL = (
 # static labels and must never trigger a token-related network request.
 TOKEN_UNSUPPORTED_PROVIDERS = frozenset({"kimi", "grok"})
 
-TOKEN_CATEGORY_PREFIX = "Token Usage"
 TOKEN_WINDOW_DAYS = 7
 
 STATE_FILENAME = "quota_channels_state.json"
@@ -554,12 +553,6 @@ def validate_token_usage_config(
     if not bool(section.get("enabled", False)):
         return None
 
-    category_id = section.get("category_id")
-    if not category_id:
-        raise QuotaChannelsError(
-            "quota_channels.token_usage.category_id required when token_usage is enabled"
-        )
-
     channel_ids = section.get("channel_ids") or {}
     if not isinstance(channel_ids, Mapping):
         raise QuotaChannelsError("quota_channels.token_usage.channel_ids must be a mapping")
@@ -582,7 +575,6 @@ def validate_token_usage_config(
         )
 
     return {
-        "category_id": str(category_id),
         "channel_ids": mapped,
         "providers": providers,
     }
@@ -921,8 +913,10 @@ PROVIDER_RUNNERS = {
     "grok": run_grok_provider,
 }
 
+_PROVIDER_ORDER = {key: idx for idx, (key, _) in enumerate(PROVIDER_SPECS)}
 
-# --- Token usage (rolling 7-day consumed tokens, optional category) ---
+
+# --- Token usage (rolling 7-day consumed tokens, optional channels) ---
 
 
 def _error_text(exc: BaseException) -> str:
@@ -1183,10 +1177,6 @@ TOKEN_RUNNERS = {
 }
 
 
-def token_category_name(last_success: float, now_fn: NowFn = time.time) -> str:
-    return f"{TOKEN_CATEGORY_PREFIX} \u2022 {quota_label(now_fn() - last_success)}"
-
-
 def run_token_provider(
     key: str,
     label: str,
@@ -1225,13 +1215,12 @@ def run_token_provider(
 def run_token_tick(
     token_config: dict,
     *,
-    last_success: float,
     headers: dict,
     http_fn: HttpFn = default_http,
     now_fn: NowFn = time.time,
     did_quota: bool,
 ) -> dict:
-    """Fetch/rename token channels (quota-gated) and refresh the category label.
+    """Fetch/rename token channels when the quota gate is open.
 
     Each provider — fetch, parse, and Discord rename — is isolated; one
     failure never blocks the providers after it.
@@ -1246,19 +1235,7 @@ def run_token_tick(
                 key, label, channel_id, headers, http_fn=http_fn, now_fn=now_fn
             )
 
-    result: Dict[str, Any] = {"did_run": did_quota, "providers": providers}
-    try:
-        result["category"] = rename_channel(
-            token_config["category_id"],
-            token_category_name(last_success, now_fn=now_fn),
-            headers,
-            skip_on_429=True,
-            http_fn=http_fn,
-        )
-    except Exception as exc:
-        result["category"] = "failed"
-        result["category_error"] = _error_text(exc)
-    return result
+    return {"did_run": did_quota, "providers": providers}
 
 
 def plan_position_moves(
@@ -1274,7 +1251,7 @@ def plan_position_moves(
             positions[cid] = channel.get("position")
     if len(positions) != len(entries):
         raise QuotaChannelsError(
-            f"expected {len(entries)} quota voice channels in guild, "
+            f"expected {len(entries)} managed voice channels in guild, "
             f"found {len(positions)}"
         )
     slots = sorted(positions.values())
@@ -1414,7 +1391,7 @@ def run_tick(
 
     try:
         if did_quota:
-            entries: List[Tuple[str, str, float]] = []
+            entries: List[Tuple[str, str, Any]] = []
             for key, label, channel_id in config["providers"]:
                 try:
                     prov_label, reset_secs, channel_name, rename = run_provider_quota(
@@ -1432,8 +1409,15 @@ def run_tick(
                     "reset_seconds": reset_secs,
                     "rename": rename,
                 }
-                entries.append((label, channel_id, reset_secs))
+                entries.append((label, channel_id, (0, reset_secs)))
             if entries:
+                token_config = config.get("token_usage")
+                if token_config:
+                    for key, tok_label, tok_channel_id in token_config["providers"]:
+                        if tok_channel_id:
+                            entries.append(
+                                (tok_label, tok_channel_id, (1, _PROVIDER_ORDER[key]))
+                            )
                 sorted_channels = sort_voice_channels(
                     config, entries, headers, http_fn=http_fn
                 )
@@ -1457,7 +1441,6 @@ def run_tick(
         try:
             token_result = run_token_tick(
                 token_config,
-                last_success=last,
                 headers=headers,
                 http_fn=http_fn,
                 now_fn=now_fn,

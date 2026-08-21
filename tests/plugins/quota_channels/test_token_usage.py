@@ -14,6 +14,8 @@ import yaml
 
 from plugins.quota_channels.core import (
     QuotaChannelsError,
+    PROVIDER_SPECS,
+    category_name,
     cursor_agg_usage_body,
     fetch_codex_profile,
     fetch_cursor_aggregated_usage,
@@ -123,7 +125,6 @@ def _base_section(**overrides):
 def _token_section(**overrides):
     token = {
         "enabled": True,
-        "category_id": "400",
         "channel_ids": {
             "codex": "401",
             "zai": "402",
@@ -136,7 +137,10 @@ def _token_section(**overrides):
     return token
 
 
-def _setup_tick_env(monkeypatch, tmp_path, *, token_usage=None, force_quota=True):
+    return config
+
+
+def _write_tick_credentials(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     secrets = tmp_path / "secrets"
     secrets.mkdir()
@@ -170,6 +174,10 @@ def _setup_tick_env(monkeypatch, tmp_path, *, token_usage=None, force_quota=True
     )
     monkeypatch.setattr("plugins.quota_channels.core.Path.home", lambda: tmp_path)
 
+
+def _setup_tick_env(monkeypatch, tmp_path, *, token_usage=None, force_quota=True):
+    _write_tick_credentials(monkeypatch, tmp_path)
+
     section = _base_section()
     if token_usage is not None:
         section["token_usage"] = token_usage
@@ -197,6 +205,124 @@ def _setup_tick_env(monkeypatch, tmp_path, *, token_usage=None, force_quota=True
     return config
 
 
+class TestV1ConfigMigration:
+    FIXED_NOW = 1_700_000_000.0
+    LAST_SUCCESS = 1_700_000_000
+
+    QUOTA_RESETS = {
+        "codex": ("Codex", 7200, "Codex: 90% \u2022 2h left"),
+        "kimi": ("Kimi", 3600, "Kimi: 80% \u2022 1h left"),
+        "zai": ("z.ai", 1800, "z.ai: 70% \u2022 30m left"),
+        "cursor": ("Cursor", 900, "Cursor: 60%/50% \u2022 15m left"),
+        "grok": ("Grok", 600, "Grok: 50% \u2022 10m left"),
+    }
+
+    def test_v1_config_full_tick_quota_only(self, monkeypatch, tmp_path):
+        _write_tick_credentials(monkeypatch, tmp_path)
+        config = validate_quota_config(_base_section())
+        provider_calls = []
+
+        def fake_run_provider(key, channel_id, headers, http_fn=None, now_fn=None):
+            from plugins.quota_channels.core import rename_channel
+
+            provider_calls.append((key, channel_id))
+            label, reset_secs, name = self.QUOTA_RESETS[key]
+            rename = rename_channel(channel_id, name, headers, http_fn=http_fn)
+            return label, reset_secs, name, rename
+
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.run_provider_quota", fake_run_provider
+        )
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.save_state",
+            lambda now_fn=None: self.LAST_SUCCESS,
+        )
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.load_state",
+            lambda: {"last_quota_success": 0},
+        )
+
+        quota_channel_ids = [config["channel_ids"][key] for key, _ in PROVIDER_SPECS]
+        guild_channels = [
+            {"id": "301", "position": 10},
+            {"id": "302", "position": 11},
+            {"id": "303", "position": 12},
+            {"id": "304", "position": 13},
+            {"id": "305", "position": 14},
+            {"id": "999", "position": 20},
+        ]
+        rename_bodies = []
+        category_bodies = []
+        position_patches = []
+
+        def fake_http(req, timeout=25.0):
+            url = req.full_url
+            method = _request_method(req)
+            if method == "GET" and url.endswith("/guilds/100/channels"):
+                return 200, json.dumps(guild_channels).encode()
+            if "discord.com" in url and method == "GET":
+                return 200, json.dumps({"name": "old-name"}).encode()
+            if method == "PATCH" and url.endswith("/guilds/100/channels"):
+                position_patches.append(json.loads(req.data.decode()))
+                return 204, b""
+            if method == "PATCH" and "/channels/200" in url:
+                category_bodies.append(json.loads(req.data.decode()))
+                return 200, json.dumps({"name": "patched"}).encode()
+            if method == "PATCH":
+                rename_bodies.append((url, json.loads(req.data.decode())))
+                return 200, json.dumps({"name": "patched"}).encode()
+            raise AssertionError((method, url))
+
+        expected_category = category_name(
+            self.LAST_SUCCESS, now_fn=lambda: self.FIXED_NOW
+        )
+
+        result = run_tick(
+            config,
+            force=True,
+            sleep_fn=lambda _: None,
+            http_fn=fake_http,
+            now_fn=lambda: self.FIXED_NOW,
+        )
+
+        assert result["success"] is True
+        assert result["did_quota"] is True
+        assert "token_usage" not in result
+        assert provider_calls == [
+            (key, config["channel_ids"][key]) for key, _ in PROVIDER_SPECS
+        ]
+        assert rename_bodies == [
+            (
+                f"https://discord.com/api/v10/channels/{cid}",
+                {"name": self.QUOTA_RESETS[key][2]},
+            )
+            for key, cid in [
+                ("codex", "301"),
+                ("kimi", "302"),
+                ("zai", "303"),
+                ("cursor", "304"),
+                ("grok", "305"),
+            ]
+        ]
+        assert category_bodies == [
+            {"name": expected_category},
+            {"name": expected_category},
+        ]
+        assert "Token" not in expected_category
+        assert position_patches == [
+            [
+                {"id": "305", "position": 10},
+                {"id": "304", "position": 11},
+                {"id": "302", "position": 13},
+                {"id": "301", "position": 14},
+            ]
+        ]
+        move_ids = {move["id"] for patch in position_patches for move in patch}
+        assert move_ids == {"301", "302", "304", "305"}
+        assert move_ids <= set(quota_channel_ids)
+        assert "999" not in move_ids
+
+
 class TestConfigBackwardCompat:
     def test_old_config_without_token_usage(self):
         config = validate_quota_config(_base_section())
@@ -220,7 +346,7 @@ class TestConfigBackwardCompat:
 class TestTokenUsageDisabled:
     @pytest.mark.parametrize(
         "token_usage",
-        [None, {"enabled": False, "category_id": "400", "channel_ids": {"codex": "401"}}],
+        [None, {"enabled": False, "channel_ids": {"codex": "401"}}],
     )
     def test_disabled_makes_no_token_calls(self, monkeypatch, tmp_path, token_usage):
         config = _setup_tick_env(monkeypatch, tmp_path, token_usage=token_usage)
@@ -243,7 +369,6 @@ class TestTokenUsageDisabled:
                     "403",
                     "404",
                     "405",
-                    "400",
                     "model-usage",
                     "profiles/me",
                     "GetAggregatedUsageEvents",
@@ -298,6 +423,146 @@ class TestPartialChannelMapping:
         assert providers["Grok"]["status"] == "skipped"
         assert providers["Codex"]["status"] in ("updated", "unchanged")
         assert providers["z.ai"]["status"] in ("updated", "unchanged")
+
+
+class TestMergedCategoryOrdering:
+    FIXED_NOW = datetime(2026, 8, 21, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    LAST_SUCCESS = 1_700_000_000
+
+    QUOTA_RESETS = {
+        "codex": ("Codex", 7200, "Codex: 90% \u2022 2h left"),
+        "kimi": ("Kimi", 3600, "Kimi: 80% \u2022 1h left"),
+        "zai": ("z.ai", 1800, "z.ai: 70% \u2022 30m left"),
+        "cursor": ("Cursor", 900, "Cursor: 60%/50% \u2022 15m left"),
+        "grok": ("Grok", 600, "Grok: 50% \u2022 10m left"),
+    }
+
+    def test_quota_block_then_token_block_in_one_category(self, monkeypatch, tmp_path):
+        _write_tick_credentials(monkeypatch, tmp_path)
+        config = validate_quota_config(
+            _base_section(token_usage=_token_section())
+        )
+
+        def fake_run_provider(key, channel_id, headers, http_fn=None, now_fn=None):
+            label, reset_secs, name = self.QUOTA_RESETS[key]
+            return label, reset_secs, name, "renamed"
+
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.run_provider_quota", fake_run_provider
+        )
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.save_state",
+            lambda now_fn=None: self.LAST_SUCCESS,
+        )
+        monkeypatch.setattr(
+            "plugins.quota_channels.core.load_state",
+            lambda: {"last_quota_success": 0},
+        )
+
+        guild_channels = [
+            {"id": "301", "position": 10},
+            {"id": "302", "position": 11},
+            {"id": "303", "position": 12},
+            {"id": "304", "position": 13},
+            {"id": "305", "position": 14},
+            {"id": "401", "position": 15},
+            {"id": "404", "position": 16},
+            {"id": "402", "position": 17},
+            {"id": "403", "position": 18},
+            {"id": "405", "position": 19},
+            {"id": "999", "position": 25},
+        ]
+        position_patches = []
+        sort_orders = []
+        import plugins.quota_channels.core as core
+
+        original_plan = core.plan_position_moves
+
+        def capture_plan(entries, channels):
+            ordered = sorted(entries, key=lambda item: item[2])
+            sort_orders.append([cid for _, cid, _ in ordered])
+            return original_plan(entries, channels)
+
+        monkeypatch.setattr(core, "plan_position_moves", capture_plan)
+
+        def fake_http(req, timeout=25.0):
+            url = req.full_url
+            method = _request_method(req)
+            if "profiles/me" in url:
+                body = json.dumps(
+                    {
+                        "stats": {
+                            "daily_usage_buckets": [
+                                {"start_date": "2026-08-21", "tokens": 1000}
+                            ]
+                        }
+                    }
+                ).encode()
+                return 200, body
+            if "model-usage" in url:
+                body = json.dumps(
+                    {
+                        "code": 200,
+                        "data": {"totalUsage": {"totalTokensUsage": 5000}},
+                    }
+                ).encode()
+                return 200, body
+            if "GetAggregatedUsageEvents" in url:
+                body = json.dumps(
+                    {"totalInputTokens": 100, "totalOutputTokens": 50}
+                ).encode()
+                return 200, body
+            if method == "GET" and url.endswith("/guilds/100/channels"):
+                return 200, json.dumps(guild_channels).encode()
+            if "discord.com" in url and method == "GET":
+                return 200, json.dumps({"name": "old-name"}).encode()
+            if method == "PATCH" and url.endswith("/guilds/100/channels"):
+                position_patches.append(json.loads(req.data.decode()))
+                return 204, b""
+            if method == "PATCH":
+                return 200, json.dumps({"name": "patched"}).encode()
+            raise AssertionError((method, url))
+
+        result = run_tick(
+            config,
+            force=True,
+            sleep_fn=lambda _: None,
+            http_fn=fake_http,
+            now_fn=lambda: self.FIXED_NOW,
+        )
+
+        assert result["token_usage"]["did_run"] is True
+        assert sort_orders == [
+            [
+                "305",
+                "304",
+                "303",
+                "302",
+                "301",
+                "401",
+                "404",
+                "402",
+                "403",
+                "405",
+            ]
+        ]
+        assert len(position_patches) == 1
+        move_ids = {move["id"] for move in position_patches[0]}
+        managed_ids = {
+            "301",
+            "302",
+            "303",
+            "304",
+            "305",
+            "401",
+            "402",
+            "403",
+            "404",
+            "405",
+        }
+        assert move_ids <= managed_ids
+        assert move_ids == {"301", "302", "304", "305"}
+        assert "999" not in move_ids
 
 
 class TestFormatting:
@@ -684,7 +949,6 @@ class TestIsolation:
         )["token_usage"]
         result = run_token_tick(
             token_config,
-            last_success=1_700_000_000,
             headers=headers,
             http_fn=fake_http,
             now_fn=lambda: fixed_now,

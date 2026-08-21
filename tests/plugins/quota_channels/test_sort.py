@@ -52,5 +52,31 @@ class TestPlanPositionMoves:
 
     def test_missing_channel_is_error(self):
         entries = [("Codex", "c1", 1)]
-        with pytest.raises(QuotaChannelsError, match="expected 1 quota voice channels"):
+        with pytest.raises(QuotaChannelsError, match="expected 1 managed voice channels"):
             plan_position_moves(entries, [])
+
+    def test_quota_block_then_token_block(self):
+        entries = [
+            ("Codex", "q1", (0, 7200)),
+            ("Kimi", "q2", (0, 3600)),
+            ("Codex", "t1", (1, 0)),
+            ("Kimi", "t2", (1, 1)),
+            ("z.ai", "t3", (1, 2)),
+        ]
+        guild_channels = [
+            {"id": "q1", "position": 12},
+            {"id": "q2", "position": 10},
+            {"id": "t1", "position": 14},
+            {"id": "t2", "position": 11},
+            {"id": "t3", "position": 13},
+            {"id": "unmanaged", "position": 15},
+        ]
+        moves = plan_position_moves(entries, guild_channels)
+        assert moves == [
+            {"id": "q1", "position": 11},
+            {"id": "t1", "position": 12},
+            {"id": "t2", "position": 13},
+            {"id": "t3", "position": 14},
+        ]
+        managed_ids = {move["id"] for move in moves}
+        assert "unmanaged" not in managed_ids
