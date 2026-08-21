@@ -32,6 +32,7 @@ class FakeCursorCloud:
         self.fail_create = False
         self.fail_receipt_write = False
         self.block_after_create = False
+        self.mismatch_create_agent_id = False
         self.terminal_status = "FINISHED"
         self.result_text = "cloud done"
         self.on_create: Optional[Callable[[Dict[str, Any]], None]] = None
@@ -86,6 +87,8 @@ class FakeCursorCloud:
         if self.on_create:
             self.on_create(payload)
         agent_id = str(payload.get("agentId") or "")
+        if self.mismatch_create_agent_id and agent_id:
+            agent_id = f"{agent_id}-mismatch"
         run_id = f"run-{len(self.runs) + 1}"
         agent = {
             "id": agent_id,

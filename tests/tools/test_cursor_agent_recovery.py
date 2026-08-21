@@ -194,6 +194,10 @@ def test_terminal_while_gateway_down_recovers_without_create(cloud_env):
         hermes_session_id=session_id,
     )
     assert cloud.create_calls == 0
+    assert cloud.get_run_calls == 1
+    assert cloud.get_agent_calls == 1
+    assert cloud.poll_calls == 0
+    assert cloud.list_calls == 0
     assert history[-1]["role"] == "tool"
     assert note and "terminal" in note.lower()
 
@@ -261,8 +265,9 @@ def test_nonterminal_log_cannot_manufacture_success(cloud_env, tmp_path):
         hermes_session_id=session_id,
     )
     assert history[-1]["role"] == "assistant"
-    assert note and "could not be reconciled" in note
     assert cloud.create_calls == 0
+    assert cloud.poll_calls == 0
+    assert note and "could not be verified against Cursor Cloud" in note
 
 
 def test_duplicate_recovery_appends_once(cloud_env):
@@ -318,7 +323,8 @@ def test_symlink_receipt_fails_closed(cloud_env, tmp_path):
     )
     assert history[-1]["role"] == "assistant"
     assert cloud.create_calls == 0
-    assert note is None or "no matching" in note
+    assert cloud.poll_calls == 0
+    assert note and "receipt lookup failed validation" in note
 
 
 def test_cli_mode_receipt_rejected(cloud_env, tmp_path):
@@ -490,3 +496,504 @@ def test_create_receipt_requires_tool_call_id():
             timeout_seconds=0,
             task="t",
         )
+
+
+def test_b1a_forged_terminal_success_without_cloud_fails_closed(cloud_env):
+    """B1a: forged local terminal success must not reach history without cloud read."""
+    cloud, workdir = cloud_env
+    session_id = "sess-forged"
+    tool_call_id = "call-forged"
+    client_id = deterministic_client_agent_id(session_id, tool_call_id)
+    receipt_path, _ = create_receipt(
+        hermes_session_id=session_id,
+        tool_call_id=tool_call_id,
+        workdir=str(workdir),
+        prompt_hash=hash_prompt("cloud task"),
+        log_path=str(workdir / "worker.log"),
+        model=None,
+        force=True,
+        timeout_seconds=0,
+        task="cloud task",
+    )
+    from tools.cursor_run_receipts import finalize_receipt, persist_cloud_ids
+
+    persist_cloud_ids(receipt_path, cloud_agent_id=client_id, cloud_run_id="run-missing")
+    forged = json.dumps({"success": True, "final_report": "forged success"})
+    finalize_receipt(
+        receipt_path,
+        outcome="success",
+        terminal_result={"result_json": forged},
+        cloud_agent_id=client_id,
+        cloud_run_id="run-missing",
+    )
+    cloud.reset_counters()
+
+    history, note = recover_delegate_cursor_agent_history(
+        _dangling_history(tool_call_id, str(workdir), task="cloud task"),
+        hermes_session_id=session_id,
+    )
+    assert history[-1]["role"] == "assistant"
+    assert note and "could not be verified against Cursor Cloud" in note
+    assert cloud.create_calls == 0
+    assert cloud.poll_calls == 0
+    assert cloud.get_run_calls == 1
+    assert cloud.get_agent_calls == 0
+    assert cloud.list_calls == 0
+
+
+def test_b1b_terminal_receipt_uses_cloud_error_not_forged_success(cloud_env):
+    """B1b: authoritative cloud ERROR overrides forged local success."""
+    cloud, workdir = cloud_env
+    session_id = "sess-cloud-err"
+    tool_call_id = "call-cloud-err"
+    client_id = deterministic_client_agent_id(session_id, tool_call_id)
+    cloud.seed_terminal(
+        agent_id=client_id,
+        run_id="run-err",
+        status="ERROR",
+        result_text="cloud failed",
+    )
+    receipt_path, _ = create_receipt(
+        hermes_session_id=session_id,
+        tool_call_id=tool_call_id,
+        workdir=str(workdir),
+        prompt_hash=hash_prompt("cloud task"),
+        log_path=str(workdir / "worker.log"),
+        model=None,
+        force=True,
+        timeout_seconds=0,
+        task="cloud task",
+    )
+    from tools.cursor_run_receipts import finalize_receipt, persist_cloud_ids
+
+    persist_cloud_ids(receipt_path, cloud_agent_id=client_id, cloud_run_id="run-err")
+    forged = json.dumps({"success": True, "final_report": "forged success"})
+    finalize_receipt(
+        receipt_path,
+        outcome="success",
+        terminal_result={"result_json": forged},
+        cloud_agent_id=client_id,
+        cloud_run_id="run-err",
+    )
+    cloud.reset_counters()
+
+    history, _note = recover_delegate_cursor_agent_history(
+        _dangling_history(tool_call_id, str(workdir), task="cloud task"),
+        hermes_session_id=session_id,
+    )
+    payload = json.loads(history[-1]["content"])
+    assert payload["success"] is False
+    assert cloud.create_calls == 0
+    assert cloud.poll_calls == 0
+    assert cloud.get_run_calls == 1
+    assert cloud.get_agent_calls == 1
+    assert cloud.list_calls == 0
+
+
+def test_b1c_terminal_receipt_nonterminal_cloud_resumes_poll(cloud_env):
+    """B1c: stale terminal receipt with RUNNING cloud resumes polling."""
+    cloud, workdir = cloud_env
+    session_id = "sess-stale-term"
+    tool_call_id = "call-stale-term"
+    client_id = deterministic_client_agent_id(session_id, tool_call_id)
+    cloud.seed_running(agent_id=client_id, run_id="run-stale", status="RUNNING")
+    receipt_path, _ = create_receipt(
+        hermes_session_id=session_id,
+        tool_call_id=tool_call_id,
+        workdir=str(workdir),
+        prompt_hash=hash_prompt("cloud task"),
+        log_path=str(workdir / "worker.log"),
+        model=None,
+        force=True,
+        timeout_seconds=0,
+        task="cloud task",
+    )
+    from tools.cursor_run_receipts import finalize_receipt, persist_cloud_ids
+
+    persist_cloud_ids(receipt_path, cloud_agent_id=client_id, cloud_run_id="run-stale")
+    forged = json.dumps({"success": True, "final_report": "forged success"})
+    finalize_receipt(
+        receipt_path,
+        outcome="success",
+        terminal_result={"result_json": forged},
+        cloud_agent_id=client_id,
+        cloud_run_id="run-stale",
+    )
+    cloud.reset_counters()
+
+    history, note = recover_delegate_cursor_agent_history(
+        _dangling_history(tool_call_id, str(workdir), task="cloud task"),
+        hermes_session_id=session_id,
+    )
+    assert history[-1]["role"] == "tool"
+    assert cloud.create_calls == 0
+    assert cloud.poll_calls >= 1
+    assert note and "cloud run" in note
+
+
+def test_b1d_duplicate_tool_result_zero_cloud_calls(cloud_env):
+    """B1d: existing tool result prevents duplicate append and cloud calls."""
+    cloud, workdir = cloud_env
+    session_id = "sess-dup-guard"
+    tool_call_id = "call-dup-guard"
+    client_id = deterministic_client_agent_id(session_id, tool_call_id)
+    cloud.seed_terminal(agent_id=client_id, run_id="run-dup-guard")
+    receipt_path, _ = create_receipt(
+        hermes_session_id=session_id,
+        tool_call_id=tool_call_id,
+        workdir=str(workdir),
+        prompt_hash=hash_prompt("cloud task"),
+        log_path=str(workdir / "worker.log"),
+        model=None,
+        force=True,
+        timeout_seconds=0,
+        task="cloud task",
+    )
+    from tools.cursor_run_receipts import finalize_receipt, persist_cloud_ids
+
+    persist_cloud_ids(receipt_path, cloud_agent_id=client_id, cloud_run_id="run-dup-guard")
+    result_json = json.dumps({"success": True, "final_report": "already present"})
+    finalize_receipt(
+        receipt_path,
+        outcome="success",
+        terminal_result={"result_json": result_json},
+        cloud_agent_id=client_id,
+        cloud_run_id="run-dup-guard",
+    )
+    history = _dangling_history(tool_call_id, str(workdir), task="cloud task")
+    history.insert(
+        0,
+        {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": result_json,
+        },
+    )
+    cloud.reset_counters()
+
+    _history, note = recover_delegate_cursor_agent_history(
+        history,
+        hermes_session_id=session_id,
+    )
+    assert note and "duplicate recovery append skipped" in note
+    assert cloud.create_calls == 0
+    assert cloud.poll_calls == 0
+    assert cloud.get_run_calls == 0
+    assert cloud.get_agent_calls == 0
+    assert cloud.list_calls == 0
+
+
+def test_b2_lock_symlink_raises_receipt_validation_error(cloud_env):
+    """B2: LOCK_SYMLINK_ACQUIRED True must not happen — symlink lock fails closed."""
+    cloud, workdir = cloud_env
+    session_id = "sess-lock-symlink"
+    tool_call_id = "call-lock-symlink"
+    client_id = deterministic_client_agent_id(session_id, tool_call_id)
+    receipt_path, _ = create_receipt(
+        hermes_session_id=session_id,
+        tool_call_id=tool_call_id,
+        workdir=str(workdir),
+        prompt_hash=hash_prompt("cloud task"),
+        log_path=str(workdir / "worker.log"),
+        model=None,
+        force=True,
+        timeout_seconds=0,
+        task="cloud task",
+    )
+    from tools.cursor_run_receipts import lock_path_for_binding, persist_cloud_ids
+
+    persist_cloud_ids(receipt_path, cloud_agent_id=client_id, cloud_run_id="run-lock")
+    lock_path = lock_path_for_binding(session_id, tool_call_id)
+    target = workdir / "lock-target"
+    target.write_text("x", encoding="utf-8")
+    if lock_path.exists():
+        lock_path.unlink()
+    os.symlink(target, lock_path)
+
+    with pytest.raises(ReceiptValidationError):
+        with binding_run_lock(session_id, tool_call_id):
+            pytest.fail("symlink lock path must not be acquired")
+
+    cloud.reset_counters()
+    history, note = recover_delegate_cursor_agent_history(
+        _dangling_history(tool_call_id, str(workdir), task="cloud task"),
+        hermes_session_id=session_id,
+    )
+    assert history[-1]["role"] == "assistant"
+    assert note and "receipt lookup failed validation" in note
+    assert cloud.create_calls == 0
+    assert cloud.poll_calls == 0
+
+
+def test_b2_lock_directory_raises_receipt_validation_error(cloud_env):
+    cloud, workdir = cloud_env
+    session_id = "sess-lock-dir"
+    tool_call_id = "call-lock-dir"
+    from tools.cursor_run_receipts import lock_path_for_binding
+
+    lock_path = lock_path_for_binding(session_id, tool_call_id)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if lock_path.exists():
+        lock_path.unlink()
+    lock_path.mkdir()
+
+    with pytest.raises(ReceiptValidationError):
+        with binding_run_lock(session_id, tool_call_id):
+            pytest.fail("lock should not be acquired on directory path")
+
+
+def test_b3_world_readable_receipt_fails_closed_zero_cloud(cloud_env):
+    """B3: chmod 0644 receipt must fail closed with zero cloud calls."""
+    cloud, workdir = cloud_env
+    session_id = "sess-perms"
+    tool_call_id = "call-perms"
+    client_id = deterministic_client_agent_id(session_id, tool_call_id)
+    cloud.seed_terminal(agent_id=client_id, run_id="run-perms")
+    receipt_path, _ = create_receipt(
+        hermes_session_id=session_id,
+        tool_call_id=tool_call_id,
+        workdir=str(workdir),
+        prompt_hash=hash_prompt("cloud task"),
+        log_path=str(workdir / "worker.log"),
+        model=None,
+        force=True,
+        timeout_seconds=0,
+        task="cloud task",
+    )
+    from tools.cursor_run_receipts import finalize_receipt, persist_cloud_ids
+
+    persist_cloud_ids(receipt_path, cloud_agent_id=client_id, cloud_run_id="run-perms")
+    finalize_receipt(
+        receipt_path,
+        outcome="success",
+        terminal_result={"result_json": json.dumps({"success": True})},
+        cloud_agent_id=client_id,
+        cloud_run_id="run-perms",
+    )
+    os.chmod(receipt_path, 0o644)
+    cloud.reset_counters()
+
+    history, note = recover_delegate_cursor_agent_history(
+        _dangling_history(tool_call_id, str(workdir), task="cloud task"),
+        hermes_session_id=session_id,
+    )
+    assert history[-1]["role"] == "assistant"
+    assert note and "receipt lookup failed validation" in note
+    assert cloud.create_calls == 0
+    assert cloud.poll_calls == 0
+    assert cloud.get_run_calls == 0
+    assert cloud.get_agent_calls == 0
+    assert cloud.list_calls == 0
+
+
+def test_b3_foreign_owner_receipt_fails_closed(cloud_env, monkeypatch):
+    cloud, workdir = cloud_env
+    session_id = "sess-owner"
+    tool_call_id = "call-owner"
+    receipt_path, _ = create_receipt(
+        hermes_session_id=session_id,
+        tool_call_id=tool_call_id,
+        workdir=str(workdir),
+        prompt_hash=hash_prompt("cloud task"),
+        log_path=str(workdir / "worker.log"),
+        model=None,
+        force=True,
+        timeout_seconds=0,
+        task="cloud task",
+    )
+    import tools.cursor_run_receipts as receipts_mod
+
+    real_getuid = os.getuid
+    monkeypatch.setattr(receipts_mod.os, "getuid", lambda: real_getuid() + 99999)
+    cloud.reset_counters()
+
+    history, note = recover_delegate_cursor_agent_history(
+        _dangling_history(tool_call_id, str(workdir), task="cloud task"),
+        hermes_session_id=session_id,
+    )
+    assert history[-1]["role"] == "assistant"
+    assert note and "receipt lookup failed validation" in note
+    assert cloud.create_calls == 0
+    assert cloud.get_run_calls == 0
+
+
+def test_b4_symlink_extra_candidate_fails_closed(cloud_env, tmp_path):
+    cloud, workdir = cloud_env
+    session_id = "sess-b4-symlink"
+    tool_call_id = "call-b4-symlink"
+    client_id = deterministic_client_agent_id(session_id, tool_call_id)
+    receipt_path, _ = create_receipt(
+        hermes_session_id=session_id,
+        tool_call_id=tool_call_id,
+        workdir=str(workdir),
+        prompt_hash=hash_prompt("cloud task"),
+        log_path=str(workdir / "worker.log"),
+        model=None,
+        force=True,
+        timeout_seconds=0,
+        task="cloud task",
+    )
+    from tools.cursor_run_receipts import persist_cloud_ids
+
+    persist_cloud_ids(receipt_path, cloud_agent_id=client_id, cloud_run_id="run-b4")
+    extra = cursor_runs_dir() / "extra.receipt.json"
+    target = tmp_path / "extra-target.json"
+    target.write_text("{}", encoding="utf-8")
+    os.symlink(target, extra)
+    cloud.reset_counters()
+
+    history, note = recover_delegate_cursor_agent_history(
+        _dangling_history(tool_call_id, str(workdir), task="cloud task"),
+        hermes_session_id=session_id,
+    )
+    assert history[-1]["role"] == "assistant"
+    assert note and "receipt lookup failed validation" in note
+    assert cloud.create_calls == 0
+    assert cloud.get_run_calls == 0
+
+
+def test_b4_malformed_extra_candidate_fails_closed(cloud_env):
+    cloud, workdir = cloud_env
+    session_id = "sess-b4-bad"
+    tool_call_id = "call-b4-bad"
+    client_id = deterministic_client_agent_id(session_id, tool_call_id)
+    receipt_path, _ = create_receipt(
+        hermes_session_id=session_id,
+        tool_call_id=tool_call_id,
+        workdir=str(workdir),
+        prompt_hash=hash_prompt("cloud task"),
+        log_path=str(workdir / "worker.log"),
+        model=None,
+        force=True,
+        timeout_seconds=0,
+        task="cloud task",
+    )
+    from tools.cursor_run_receipts import persist_cloud_ids
+
+    persist_cloud_ids(receipt_path, cloud_agent_id=client_id, cloud_run_id="run-b4-bad")
+    bad = cursor_runs_dir() / "bad-extra.receipt.json"
+    bad.write_text("{not-json", encoding="utf-8")
+    os.chmod(bad, 0o600)
+    cloud.reset_counters()
+
+    history, note = recover_delegate_cursor_agent_history(
+        _dangling_history(tool_call_id, str(workdir), task="cloud task"),
+        hermes_session_id=session_id,
+    )
+    assert history[-1]["role"] == "assistant"
+    assert note and "receipt lookup failed validation" in note
+    assert cloud.create_calls == 0
+
+
+def test_b5a_in_lock_receipt_tamper_fails_closed(cloud_env, monkeypatch):
+    cloud, workdir = cloud_env
+    session_id = "sess-b5a"
+    tool_call_id = "call-b5a"
+    client_id = deterministic_client_agent_id(session_id, tool_call_id)
+    cloud.seed_terminal(agent_id=client_id, run_id="run-b5a")
+    receipt_path, receipt = create_receipt(
+        hermes_session_id=session_id,
+        tool_call_id=tool_call_id,
+        workdir=str(workdir),
+        prompt_hash=hash_prompt("cloud task"),
+        log_path=str(workdir / "worker.log"),
+        model=None,
+        force=True,
+        timeout_seconds=0,
+        task="cloud task",
+    )
+    from tools.cursor_run_receipts import finalize_receipt, persist_cloud_ids
+
+    persist_cloud_ids(receipt_path, cloud_agent_id=client_id, cloud_run_id="run-b5a")
+    finalize_receipt(
+        receipt_path,
+        outcome="success",
+        terminal_result={"result_json": json.dumps({"success": True})},
+        cloud_agent_id=client_id,
+        cloud_run_id="run-b5a",
+    )
+    real_read = read_receipt
+    calls = {"n": 0}
+
+    def _tampered_read(path):
+        data = real_read(path)
+        if data is None:
+            return None
+        calls["n"] += 1
+        if calls["n"] >= 1:
+            tampered = dict(data)
+            tampered["request_fingerprint"] = "sha256:deadbeef"
+            return tampered
+        return data
+
+    monkeypatch.setattr(cursor_agent_tool, "read_receipt", _tampered_read)
+    cloud.reset_counters()
+
+    history, note = recover_delegate_cursor_agent_history(
+        _dangling_history(tool_call_id, str(workdir), task="cloud task"),
+        hermes_session_id=session_id,
+    )
+    assert history[-1]["role"] == "assistant"
+    assert note and "binding mismatch" in note
+    assert cloud.create_calls == 0
+    assert cloud.get_run_calls == 0
+
+
+def test_b5b_create_agent_id_mismatch_fails_closed(cloud_env):
+    cloud, workdir = cloud_env
+    cloud.mismatch_create_agent_id = True
+    result = _delegate(
+        cloud,
+        workdir,
+        session_id="sess-mismatch",
+        tool_call_id="call-mismatch",
+    )
+    assert result["success"] is False
+    assert cloud.poll_calls == 0
+    receipt = read_receipt(receipt_path_for_binding("sess-mismatch", "call-mismatch"))
+    assert receipt is not None
+    assert receipt.get("cloud_agent_id") is None
+    assert receipt.get("state") == "terminal"
+    assert receipt.get("outcome") == "failed"
+
+
+def test_authoritative_terminal_recovery_exact_cloud_call_counts(cloud_env):
+    """Happy terminal recovery performs exactly one get_run and one get_agent."""
+    cloud, workdir = cloud_env
+    session_id = "sess-counts"
+    tool_call_id = "call-counts"
+    client_id = deterministic_client_agent_id(session_id, tool_call_id)
+    cloud.seed_terminal(agent_id=client_id, run_id="run-counts", result_text="counts ok")
+    receipt_path, _ = create_receipt(
+        hermes_session_id=session_id,
+        tool_call_id=tool_call_id,
+        workdir=str(workdir),
+        prompt_hash=hash_prompt("cloud task"),
+        log_path=str(workdir / "worker.log"),
+        model=None,
+        force=True,
+        timeout_seconds=0,
+        task="cloud task",
+    )
+    from tools.cursor_run_receipts import finalize_receipt, persist_cloud_ids
+
+    persist_cloud_ids(receipt_path, cloud_agent_id=client_id, cloud_run_id="run-counts")
+    finalize_receipt(
+        receipt_path,
+        outcome="success",
+        terminal_result={"result_json": json.dumps({"success": True, "final_report": "counts ok"})},
+        cloud_agent_id=client_id,
+        cloud_run_id="run-counts",
+    )
+    cloud.reset_counters()
+
+    history, _note = recover_delegate_cursor_agent_history(
+        _dangling_history(tool_call_id, str(workdir), task="cloud task"),
+        hermes_session_id=session_id,
+    )
+    assert history[-1]["role"] == "tool"
+    assert cloud.create_calls == 0
+    assert cloud.list_calls == 0
+    assert cloud.poll_calls == 0
+    assert cloud.get_run_calls == 1
+    assert cloud.get_agent_calls == 1

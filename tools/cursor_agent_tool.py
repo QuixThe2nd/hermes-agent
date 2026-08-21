@@ -58,13 +58,15 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from tools.agent_cli_runner import _terminate_process
 from tools.cursor_run_receipts import (
     ReceiptValidationError,
     MAX_RECOVERY_ATTEMPTS,
+    _assert_receipt_permissions,
+    _assert_regular_receipt_file,
     binding_run_lock,
     create_receipt,
     cursor_runs_dir,
@@ -78,6 +80,7 @@ from tools.cursor_run_receipts import (
     receipt_matches_binding,
     request_fingerprint,
     update_receipt,
+    validate_receipt_binding,
 )
 from tools.environments.local import build_subprocess_env
 from tools.registry import registry
@@ -1203,6 +1206,81 @@ def _reconcile_result_from_receipt(receipt: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _revalidate_receipt_for_recovery(
+    receipt_path: Path,
+    receipt: Dict[str, Any],
+    *,
+    hermes_session_id: str,
+    tool_call_id: str,
+    request_fingerprint_value: str,
+) -> None:
+    """Fail-closed TOCTOU revalidation under the binding lock."""
+    _assert_regular_receipt_file(receipt_path, must_exist=True)
+    _assert_receipt_permissions(receipt_path)
+    validate_receipt_binding(
+        receipt,
+        hermes_session_id=hermes_session_id,
+        tool_call_id=tool_call_id,
+        request_fingerprint_value=request_fingerprint_value,
+    )
+
+
+def _authoritative_terminal_reconcile(
+    receipt: Dict[str, Any],
+    receipt_path: Path,
+    *,
+    api_key: str,
+) -> Tuple[Optional[str], bool]:
+    """Reconcile a terminal receipt from Cursor Cloud under the binding lock.
+
+    Returns ``(result_json, cloud_still_running)``. When ``result_json`` is set,
+    append it as the authoritative tool result. When ``cloud_still_running`` is
+    True, the local terminal claim was stale and polling should resume. When
+    both indicate failure, fail closed without appending.
+    """
+    cloud_agent_id = str(receipt.get("cloud_agent_id") or "")
+    cloud_run_id = str(receipt.get("cloud_run_id") or "")
+    if not cloud_agent_id or not cloud_run_id:
+        return None, False
+
+    client_id = str(receipt.get("client_agent_id") or "")
+    if client_id and cloud_agent_id != client_id:
+        return None, False
+
+    try:
+        run_obj = fetch_cloud_run(cloud_agent_id, cloud_run_id, api_key)
+    except CursorCloudError:
+        return None, False
+
+    if not is_terminal_run_status(run_obj.get("status")):
+        return None, True
+
+    agent_obj: Optional[Dict[str, Any]] = None
+    try:
+        agent_obj = fetch_cloud_agent(cloud_agent_id, api_key)
+        if str(agent_obj.get("id") or "") != cloud_agent_id:
+            return None, False
+    except CursorCloudError:
+        agent_obj = {"id": cloud_agent_id, "latestRunId": cloud_run_id}
+
+    result_json, _, outcome, _status = _build_cloud_tool_result_from_run(
+        agent=agent_obj or {"id": cloud_agent_id},
+        run=run_obj,
+        duration_seconds=0.0,
+        log_path=str(receipt.get("log_path") or ""),
+        attempt_id=str(receipt.get("attempt_id") or ""),
+    )
+    finalize_receipt(
+        receipt_path,
+        outcome=outcome,
+        terminal_result={"result_json": result_json},
+        log_path=str(receipt.get("log_path") or ""),
+        cloud_agent_id=cloud_agent_id,
+        cloud_run_id=cloud_run_id,
+    )
+    return result_json, False
+
+
 def fetch_cloud_run(agent_id: str, run_id: str, api_key: str) -> Dict[str, Any]:
     body = _http_request(
         "GET",
@@ -1523,6 +1601,23 @@ def _execute_cloud_delegation(
         finally:
             worker.cleanup()
 
+        returned_agent_id = str(agent_obj.get("id") or "")
+        if returned_agent_id != client_agent_id:
+            result_json = _make_result(
+                success=False,
+                error=(
+                    "Cursor Cloud Agent create returned an agent id that does not "
+                    "match the deterministic binding id"
+                ),
+            )
+            finalize_receipt(
+                receipt_path,
+                outcome="failed",
+                terminal_result={"result_json": result_json},
+                log_path=str(log_path),
+            )
+            return result_json
+
         progress_url = extract_progress_url(agent_obj)
         if progress_url:
             _emit_progress_notice(f"Cursor Cloud Agent: {progress_url}")
@@ -1632,6 +1727,21 @@ def recover_delegate_cursor_agent_history(
     """Reconcile or resume an interrupted ``delegate_cursor_agent`` cloud run."""
     found = _find_dangling_delegate_cursor_call(agent_history)
     if not found:
+        last_call = None
+        last = agent_history[-1] if agent_history else None
+        if isinstance(last, dict) and last.get("role") == "assistant":
+            for call in last.get("tool_calls") or []:
+                function = call.get("function") or {}
+                if str(function.get("name") or "") == "delegate_cursor_agent":
+                    last_call = call
+                    break
+        if last_call is not None:
+            existing_id = str(last_call.get("id") or last_call.get("call_id") or "")
+            if existing_id and _tool_result_already_present(agent_history, existing_id):
+                return agent_history, (
+                    "[System note: delegate_cursor_agent tool result already present; "
+                    "duplicate recovery append skipped.]"
+                )
         return agent_history, None
     _assistant_msg, call = found
     tool_call_id = str(call.get("id") or call.get("call_id") or "")
@@ -1678,27 +1788,6 @@ def recover_delegate_cursor_agent_history(
             "automatic recovery refused.]"
         )
 
-    if is_terminal_receipt(receipt):
-        result_json = _reconcile_result_from_receipt(receipt)
-        if not result_json:
-            return agent_history, (
-                "[System note: delegate_cursor_agent receipt is terminal but "
-                "could not be reconciled from persisted evidence.]"
-            )
-        history = list(agent_history)
-        history.append(
-            make_tool_result_message(
-                "delegate_cursor_agent",
-                result_json,
-                tool_call_id,
-                effect_disposition="unknown",
-            )
-        )
-        return history, (
-            "[System note: Recovered a terminal delegate_cursor_agent result "
-            "from persisted cloud evidence without re-invoking Cursor.]"
-        )
-
     recovery_attempts = int(receipt.get("recovery_attempts") or 0)
     if recovery_attempts >= MAX_RECOVERY_ATTEMPTS:
         return agent_history, (
@@ -1720,56 +1809,82 @@ def recover_delegate_cursor_agent_history(
             f"[System note: delegate_cursor_agent recovery refused: {exc}]"
         )
 
-    with binding_run_lock(hermes_session_id, tool_call_id) as acquired:
-        if not acquired:
-            return agent_history, (
-                "[System note: Another Hermes process is recovering the "
-                "same delegate_cursor_agent run; this session skipped recovery.]"
-            )
-        fresh = read_receipt(receipt_path)
-        if fresh is None:
-            return agent_history, (
-                "[System note: delegate_cursor_agent receipt disappeared during recovery.]"
-            )
-        if is_terminal_receipt(fresh):
-            result_json = _reconcile_result_from_receipt(fresh)
-            if result_json:
-                history = list(agent_history)
-                history.append(
-                    make_tool_result_message(
-                        "delegate_cursor_agent",
-                        result_json,
-                        tool_call_id,
-                        effect_disposition="unknown",
-                    )
+    try:
+        with binding_run_lock(hermes_session_id, tool_call_id) as acquired:
+            if not acquired:
+                return agent_history, (
+                    "[System note: Another Hermes process is recovering the "
+                    "same delegate_cursor_agent run; this session skipped recovery.]"
                 )
-                return history, (
-                    "[System note: Recovered delegate_cursor_agent from "
-                    "terminal cloud evidence while waiting for recovery lock.]"
+            fresh = read_receipt(receipt_path)
+            if fresh is None:
+                return agent_history, (
+                    "[System note: delegate_cursor_agent receipt disappeared during recovery.]"
                 )
-            return agent_history, (
-                "[System note: delegate_cursor_agent receipt became terminal "
-                "without reconcilable evidence.]"
-            )
+            try:
+                _revalidate_receipt_for_recovery(
+                    receipt_path,
+                    fresh,
+                    hermes_session_id=hermes_session_id,
+                    tool_call_id=tool_call_id,
+                    request_fingerprint_value=fingerprint,
+                )
+            except ReceiptValidationError:
+                return agent_history, (
+                    "[System note: delegate_cursor_agent receipt binding mismatch; "
+                    "automatic recovery refused.]"
+                )
 
-        update_receipt(
-            receipt_path,
-            recovery_attempts=recovery_attempts + 1,
-        )
-        result_json = _execute_cloud_delegation(
-            task=str(args.get("task") or ""),
-            workdir=workdir,
-            model=args.get("model"),
-            timeout_seconds=int(
-                args.get("timeout_seconds", fresh.get("timeout_seconds") or 0)
-            ),
-            force=is_truthy_value(args.get("force", fresh.get("force", True)), default=True),
-            hermes_session_id=hermes_session_id,
-            tool_call_id=tool_call_id or None,
-            receipt_path=receipt_path,
-            receipt=fresh,
-            api_key=api_key,
-            recovery_mode=True,
+            cloud_still_running = False
+            if is_terminal_receipt(fresh):
+                result_json, cloud_still_running = _authoritative_terminal_reconcile(
+                    fresh,
+                    receipt_path,
+                    api_key=api_key,
+                )
+                if result_json:
+                    history = list(agent_history)
+                    history.append(
+                        make_tool_result_message(
+                            "delegate_cursor_agent",
+                            result_json,
+                            tool_call_id,
+                            effect_disposition="unknown",
+                        )
+                    )
+                    return history, (
+                        "[System note: Recovered a terminal delegate_cursor_agent result "
+                        "from authoritative Cursor Cloud evidence without re-invoking create.]"
+                    )
+                if not cloud_still_running:
+                    return agent_history, (
+                        "[System note: delegate_cursor_agent terminal receipt could not "
+                        "be verified against Cursor Cloud; automatic recovery refused.]"
+                    )
+
+            update_receipt(
+                receipt_path,
+                recovery_attempts=recovery_attempts + 1,
+            )
+            result_json = _execute_cloud_delegation(
+                task=str(args.get("task") or ""),
+                workdir=workdir,
+                model=args.get("model"),
+                timeout_seconds=int(
+                    args.get("timeout_seconds", fresh.get("timeout_seconds") or 0)
+                ),
+                force=is_truthy_value(args.get("force", fresh.get("force", True)), default=True),
+                hermes_session_id=hermes_session_id,
+                tool_call_id=tool_call_id or None,
+                receipt_path=receipt_path,
+                receipt=fresh,
+                api_key=api_key,
+                recovery_mode=True,
+            )
+    except ReceiptValidationError:
+        return agent_history, (
+            "[System note: delegate_cursor_agent receipt lookup failed validation; "
+            "automatic recovery refused.]"
         )
 
     history = list(agent_history)
@@ -1932,50 +2047,56 @@ def delegate_cursor_agent(
     machine_name = new_machine_name()
     log_path = log_dir / f"{run_timestamp}-{os.getpid()}-{machine_name}.log"
 
-    with binding_run_lock(hermes_session_id, tool_call_id) as acquired:
-        if not acquired:
-            return _make_result(
-                success=False,
-                error=(
-                    "Another Hermes process is already creating or recovering "
-                    "this delegate_cursor_agent binding."
-                ),
-            )
-        try:
-            receipt_path, receipt = create_receipt(
+    try:
+        with binding_run_lock(hermes_session_id, tool_call_id) as acquired:
+            if not acquired:
+                return _make_result(
+                    success=False,
+                    error=(
+                        "Another Hermes process is already creating or recovering "
+                        "this delegate_cursor_agent binding."
+                    ),
+                )
+            try:
+                receipt_path, receipt = create_receipt(
+                    hermes_session_id=hermes_session_id,
+                    tool_call_id=tool_call_id,
+                    workdir=str(workdir_path),
+                    prompt_hash=prompt_hash,
+                    log_path=str(log_path),
+                    model=model_name,
+                    force=force_enabled,
+                    timeout_seconds=clamped_timeout,
+                    task=task_text,
+                )
+            except ReceiptValidationError as exc:
+                return _make_result(
+                    success=False,
+                    error=f"delegate_cursor_agent receipt creation refused: {exc}",
+                )
+
+            if is_terminal_receipt(receipt):
+                existing = _reconcile_result_from_receipt(receipt)
+                if existing:
+                    return existing
+
+            return _execute_cloud_delegation(
+                task=task_text,
+                workdir=str(workdir_path),
+                model=model_name,
+                timeout_seconds=clamped_timeout,
+                force=force_enabled,
                 hermes_session_id=hermes_session_id,
                 tool_call_id=tool_call_id,
-                workdir=str(workdir_path),
-                prompt_hash=prompt_hash,
-                log_path=str(log_path),
-                model=model_name,
-                force=force_enabled,
-                timeout_seconds=clamped_timeout,
-                task=task_text,
+                receipt_path=receipt_path,
+                receipt=receipt,
+                api_key=api_key,
+                recovery_mode=False,
             )
-        except ReceiptValidationError as exc:
-            return _make_result(
-                success=False,
-                error=f"delegate_cursor_agent receipt creation refused: {exc}",
-            )
-
-        if is_terminal_receipt(receipt):
-            existing = _reconcile_result_from_receipt(receipt)
-            if existing:
-                return existing
-
-        return _execute_cloud_delegation(
-            task=task_text,
-            workdir=str(workdir_path),
-            model=model_name,
-            timeout_seconds=clamped_timeout,
-            force=force_enabled,
-            hermes_session_id=hermes_session_id,
-            tool_call_id=tool_call_id,
-            receipt_path=receipt_path,
-            receipt=receipt,
-            api_key=api_key,
-            recovery_mode=False,
+    except ReceiptValidationError as exc:
+        return _make_result(
+            success=False,
+            error=f"delegate_cursor_agent receipt lock refused: {exc}",
         )
 
 

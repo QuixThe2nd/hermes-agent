@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import stat
 import tempfile
 import uuid
 from contextlib import contextmanager
@@ -146,6 +147,42 @@ def _assert_regular_receipt_file(path: Path, *, must_exist: bool) -> None:
         raise ReceiptValidationError("missing receipt")
 
 
+def _assert_receipt_permissions(path: Path) -> None:
+    """Require restrictive 0600 semantics and current-user ownership."""
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        raise ReceiptValidationError("receipt stat failed") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise ReceiptValidationError("non-regular receipt file")
+    if st.st_mode & 0o077 != 0:
+        raise ReceiptValidationError("receipt permissions too permissive")
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():  # windows-footgun: ok — hasattr-gated POSIX uid check
+        raise ReceiptValidationError("receipt not owned by current user")
+
+
+def _load_receipt_candidate(path: Path) -> Dict[str, Any]:
+    """Load one receipt file with fail-closed validation for discovery."""
+    _assert_path_within_runs_dir(path)
+    if path.is_symlink():
+        raise ReceiptValidationError("symlink receipt")
+    if not path.is_file():
+        raise ReceiptValidationError("non-regular receipt file")
+    _assert_receipt_permissions(path)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ReceiptValidationError("unreadable receipt") from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ReceiptValidationError("unparseable receipt") from exc
+    if not isinstance(data, dict):
+        raise ReceiptValidationError("malformed receipt schema")
+    _validate_receipt_schema(data)
+    return data
+
+
 def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     _assert_path_within_runs_dir(path)
@@ -175,7 +212,12 @@ def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
 
 def read_receipt(path: Path | str) -> Optional[Dict[str, Any]]:
     receipt_path = Path(path)
-    if not receipt_path.is_file() or receipt_path.is_symlink():
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        return None
+    try:
+        _assert_receipt_permissions(receipt_path)
+    except ReceiptValidationError:
+        logger.debug("receipt permission/ownership rejected: %s", receipt_path)
         return None
     try:
         data = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -255,9 +297,7 @@ def create_receipt(
     path = receipt_path_for_binding(hermes_session_id, tool_call_id)
     _assert_regular_receipt_file(path, must_exist=False)
     if path.exists():
-        existing = read_receipt(path)
-        if existing is None:
-            raise ReceiptValidationError("corrupt existing receipt")
+        existing = _load_receipt_candidate(path)
         validate_receipt_binding(
             existing,
             hermes_session_id=hermes_session_id,
@@ -308,9 +348,10 @@ def create_receipt(
 def update_receipt(path: Path | str, **fields: Any) -> Optional[Dict[str, Any]]:
     receipt_path = Path(path)
     _assert_regular_receipt_file(receipt_path, must_exist=True)
-    current = read_receipt(receipt_path)
-    if current is None:
-        return None
+    try:
+        current = _load_receipt_candidate(receipt_path)
+    except ReceiptValidationError:
+        raise
     client_id = current.get("client_agent_id")
     new_cloud_id = fields.get("cloud_agent_id")
     if (
@@ -386,21 +427,9 @@ def find_receipt_for_binding(
     if not root.is_dir():
         return None
 
-    primary = receipt_path_for_binding(hermes_session_id, tool_call_id)
     matches: list[Tuple[Path, Dict[str, Any]]] = []
-    if primary.is_file() and not primary.is_symlink():
-        data = read_receipt(primary)
-        if data:
-            matches.append((primary, data))
-
     for path in root.glob(f"*{RECEIPT_SUFFIX}"):
-        if path == primary:
-            continue
-        if path.is_symlink() or not path.is_file():
-            continue
-        data = read_receipt(path)
-        if not data:
-            continue
+        data = _load_receipt_candidate(path)
         if data.get("hermes_session_id") != hermes_session_id:
             continue
         bound = data.get("tool_call_id")
@@ -448,9 +477,33 @@ def binding_run_lock(hermes_session_id: str, tool_call_id: Optional[str]) -> Ite
     lock_path = lock_path_for_binding(hermes_session_id, tool_call_id or "")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     _assert_path_within_runs_dir(lock_path)
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    if lock_path.exists():
+        try:
+            st = os.lstat(lock_path)
+        except OSError as exc:
+            raise ReceiptValidationError("invalid lock path") from exc
+        if not stat.S_ISREG(st.st_mode):
+            raise ReceiptValidationError("non-regular lock file")
+
+    open_flags = os.O_CREAT | os.O_RDWR
+    nofollow = getattr(os, "O_NOFOLLOW", 0)  # windows-footgun: ok — getattr-gated O_NOFOLLOW
+    if nofollow:
+        open_flags |= nofollow
+    fd = os.open(str(lock_path), open_flags, 0o600)
     acquired = False
+    fd_closed = False
     try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ReceiptValidationError("non-regular lock file")
+        if st.st_mode & 0o077 != 0:
+            raise ReceiptValidationError("lock permissions too permissive")
+        if hasattr(os, "getuid") and st.st_uid != os.getuid():  # windows-footgun: ok — hasattr-gated POSIX uid check
+            raise ReceiptValidationError("lock not owned by current user")
+        try:
+            os.chmod(lock_path, 0o600)
+        except OSError:
+            pass
         if hasattr(fcntl, "flock"):  # windows-footgun: ok — hasattr-gated POSIX flock
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -460,7 +513,13 @@ def binding_run_lock(hermes_session_id: str, tool_call_id: Optional[str]) -> Ite
         else:
             acquired = True
         yield acquired
+    except ReceiptValidationError:
+        os.close(fd)
+        fd_closed = True
+        raise
     finally:
+        if fd_closed:
+            return
         if acquired and hasattr(fcntl, "flock"):  # windows-footgun: ok — hasattr-gated POSIX flock
             try:
                 fcntl.flock(fd, fcntl.LOCK_UN)
