@@ -244,6 +244,10 @@ class GatewayStreamConsumer:
         # when overflow splits seal head chunks.  Used to record a reconciliable
         # turn-final payload for multi-message deliveries (#78541).
         self._stream_ledger = ""
+        # Authoritative ``final_response`` from ``finish(final_text)``, if any.
+        # Used on split turns to detect non-prefix rewrites that must keep the
+        # legacy edit path so the gateway can resend with a reply reference.
+        self._authoritative_final_text: Optional[str] = None
         self._message_id: Optional[str] = None
         # Wall-clock timestamp (time.monotonic) when ``_message_id`` was
         # first assigned from a successful first-send.  Used by the
@@ -623,6 +627,7 @@ class GatewayStreamConsumer:
         self._message_created_ts = None
         self._accumulated = ""
         self._stream_ledger = ""
+        self._authoritative_final_text = None
         self._last_sent_text = ""
         self._fallback_final_send = False
         self._fallback_prefix = ""
@@ -899,6 +904,7 @@ class GatewayStreamConsumer:
                             got_segment_break = True
                             break
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _FINAL_TEXT:
+                            self._authoritative_final_text = item[1]
                             # Authoritative turn-final payload (see finish()).
                             # Adopt it as the finalize content so the seal /
                             # final edit carries the TRUE final — including
@@ -1094,11 +1100,11 @@ class GatewayStreamConsumer:
                         if chunks_delivered:
                             # A sealed head is on screen, so this turn is now a
                             # multi-message delivery.  Flag it BEFORE the tail
-                            # send below: the fresh-final route replaces every
-                            # tracked preview with one message, which is only
-                            # valid while the active message holds the whole
-                            # answer.  Once heads are sealed it does not, and
-                            # deleting them would drop delivered text (#78541).
+                            # send below.  Discord (and adapters that prefer
+                            # fresh final) replace every tracked preview with
+                            # one notify send carrying the full ledger once
+                            # the turn finalizes; other adapters keep editing
+                            # the tail in place (#78541).
                             self._turn_split_delivery = True
 
                         self._last_edit_time = time.monotonic()
@@ -2220,22 +2226,33 @@ class GatewayStreamConsumer:
         # (an oversized reply split across the platform's edit limit).  All of
         # them are replaced by the single fresh message below.
         #
-        # That replacement is only sound while ``text`` holds the whole answer.
-        # On a multi-message split the head chunks were sealed and dropped out
-        # of ``_accumulated``, so ``text`` is just the tail — deleting the
-        # sealed heads would erase text the user already received and leave the
-        # complete reply nowhere on screen (#78541).  Keep the sealed messages
-        # and take the normal edit path instead.
-        if self._turn_split_delivery:
-            return False
+        # On a multi-message split the caller's ``text`` is only the tail —
+        # the sealed heads carry the rest.  Fresh-final is only sound when
+        # ``_stream_ledger`` holds the full answer (normalized the same way as
+        # ``_record_turn_final_payload``).  Non-prefix rewrites keep the legacy
+        # edit path so ``delivered_final_matches`` reports a mismatch and the
+        # gateway resends with the reply reference (#78541 / Discord contract).
+        send_text = text
+        if self._turn_split_delivery is True:
+            if not self._stream_ledger:
+                return False
+            auth = self._authoritative_final_text
+            if auth is not None and not auth.startswith(self._stream_ledger):
+                return False
+            send_text = ensure_closed_code_fences(
+                self._clean_for_display(self._stream_ledger)
+            ).strip()
+            if not send_text:
+                return False
         stale_ids = set(self._preview_message_ids)
         if self._message_id and self._message_id != "__no_edit__":
             stale_ids.add(self._message_id)
         try:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
-                content=text,
-                metadata=self._metadata_for_send(final=True),
+                content=send_text,
+                reply_to=self._initial_reply_to_id if is_turn_final else None,
+                metadata=self._metadata_for_send(final=is_turn_final),
             )
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
@@ -2275,7 +2292,7 @@ class GatewayStreamConsumer:
             self._message_id = "__no_edit__"
             self._message_created_ts = None
         self._already_sent = True
-        self._last_sent_text = text
+        self._last_sent_text = send_text
         if is_turn_final:
             self._final_response_sent = True
         return True
@@ -2315,6 +2332,7 @@ class GatewayStreamConsumer:
         self._message_id = None
         self._accumulated = ""
         self._stream_ledger = ""
+        self._authoritative_final_text = None
         self._last_sent_text = ""
         self._already_sent = False
         self._final_response_sent = False
@@ -2443,7 +2461,10 @@ class GatewayStreamConsumer:
                     # their streaming UI can transition out of the in-
                     # progress state.  Everyone else short-circuits.
                     if text == self._last_sent_text and not (
-                        finalize and self._adapter_requires_finalize
+                        finalize and (
+                            self._adapter_requires_finalize
+                            or self._adapter_prefers_fresh_final(text)
+                        )
                     ):
                         return True
                     # Fresh-final for long-lived previews: when finalizing
@@ -2489,17 +2510,25 @@ class GatewayStreamConsumer:
                     if (
                         finalize
                         and (
-                            _prefers_fresh
+                            (_prefers_fresh and is_turn_final)
                             or (
                                 not _has_prefers_hook
                                 and self._should_send_fresh_final()
                             )
                         )
-                        and await self._try_fresh_final(
-                            text, is_turn_final=is_turn_final,
-                        )
                     ):
-                        return True
+                        if await self._try_fresh_final(
+                            text, is_turn_final=is_turn_final,
+                        ):
+                            return True
+                        # Discord (and any adapter that prefers fresh final)
+                        # cannot attach a reply reference via edit.  A failed
+                        # fresh-final must not fall back to edit-in-place and
+                        # mark the turn delivered — leave final delivery to
+                        # the gateway's notify send so the user still gets one
+                        # reply ping.
+                        if is_turn_final and _prefers_fresh:
+                            return False
                     # Edit existing message
                     result = await self._edit_message(
                         message_id=self._message_id,
@@ -2668,7 +2697,7 @@ class GatewayStreamConsumer:
                     content=text,
                     reply_to=self._initial_reply_to_id,
                     metadata=self._metadata_for_send(
-                        final=finalize,
+                        final=finalize and is_turn_final,
                         expect_edits=not finalize,
                     ),
                 )

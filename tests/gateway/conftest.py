@@ -201,6 +201,23 @@ def _ensure_discord_mock() -> None:
     discord_mod.Interaction = object
     discord_mod.Message = type("Message", (), {})
 
+    class _FakeMessageReference:
+        def __init__(
+            self,
+            *,
+            message_id=None,
+            channel_id=None,
+            guild_id=None,
+            fail_if_not_exists=False,
+            **_kwargs,
+        ):
+            self.message_id = message_id
+            self.channel_id = channel_id
+            self.guild_id = guild_id
+            self.fail_if_not_exists = fail_if_not_exists
+
+    discord_mod.MessageReference = _FakeMessageReference
+
     # Embed: accept the kwargs production code / tests use
     # (title, description, color). MagicMock auto-attributes work too,
     # but some tests construct and inspect .title/.description directly.
