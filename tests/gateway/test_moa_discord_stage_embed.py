@@ -709,6 +709,85 @@ async def test_full_path_real_tool_events_render_through_drain(
     assert delivered_stages == ["starting", "advisors", "aggregating", "complete"]
 
 
+class _BlockingTerminalStageAdapter(_RecordingStageAdapter):
+    """Blocks terminal send/edit until ``release`` is set; no ok record before block."""
+
+    def __init__(self):
+        super().__init__()
+        self.blocked = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def _maybe_block(self, stage):
+        if stage.get("terminal"):
+            self.blocked.set()
+            await self.release.wait()
+
+    async def send_tool_stage_embed(self, chat_id, stage, metadata=None, reply_to=None):
+        await self._maybe_block(stage)
+        return await super().send_tool_stage_embed(
+            chat_id, stage, metadata=metadata, reply_to=reply_to
+        )
+
+    async def edit_tool_stage_embed(self, chat_id, message_id, stage, metadata=None):
+        await self._maybe_block(stage)
+        return await super().edit_tool_stage_embed(
+            chat_id, message_id, stage, metadata=metadata
+        )
+
+
+def _successful_terminal_deliveries(adapter):
+    return [
+        record
+        for record in adapter.ok_sends + adapter.ok_edits
+        if record.get("ok")
+        and record["stage"].get("terminal")
+        and record["stage"].get("invocation_id") == "inv-cancel-inflight"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_drain_cancel_delivers_inflight_terminal():
+    """Cancel during a blocked terminal send/edit must not drop the dequeued event."""
+    from gateway.run import TurnRunner
+
+    adapter = _BlockingTerminalStageAdapter()
+    ctx = _stage_ctx(adapter)
+    runner = TurnRunner(_StubGatewayRunner(), ctx)
+    ctx.stage_event_queue.put_nowait(
+        _stage_event("consult_moa", "inv-cancel-inflight", "starting")
+    )
+    ctx.stage_event_queue.put_nowait(
+        _stage_event(
+            "consult_moa",
+            "inv-cancel-inflight",
+            "complete",
+            "success",
+            advisors=2,
+        )
+    )
+
+    task = asyncio.create_task(runner.send_tool_stage_embeds())
+    await asyncio.wait_for(adapter.blocked.wait(), timeout=2.0)
+
+    task.cancel()
+    adapter.release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    terminal_deliveries = _successful_terminal_deliveries(adapter)
+    assert len(terminal_deliveries) == 1
+    assert terminal_deliveries[0]["stage"]["status"] == "success"
+    other_terminal = [
+        record
+        for record in adapter.ok_sends + adapter.ok_edits
+        if record.get("ok")
+        and record["stage"].get("terminal")
+        and record["stage"].get("invocation_id") != "inv-cancel-inflight"
+    ]
+    assert other_terminal == []
+
+
 @pytest.mark.asyncio
 async def test_drain_cancel_delivers_queued_terminal(monkeypatch):
     """Teardown cancel must not drop a terminal event queued during idle sleep."""

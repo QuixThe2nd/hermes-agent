@@ -5433,6 +5433,7 @@ class TurnRunner:
         # same tool each own exactly one message, so their updates can
         # never cross-edit each other's embed.
         embed_msg_ids: Dict[str, str] = {}
+        in_flight_event = None
 
         try:
             while True:
@@ -5451,11 +5452,16 @@ class TurnRunner:
                     await asyncio.sleep(0.2)
                     continue
 
+                in_flight_event = event
                 await self._deliver_tool_stage_event(event, embed_msg_ids)
+                in_flight_event = None
         except asyncio.CancelledError:
             # Turn teardown cancels this task while a terminal event is still
-            # queued (often during the idle sleep). Mirror send_progress_messages:
-            # drain and deliver final state, then propagate cancellation.
+            # queued (often during the idle sleep) or while its send/edit await
+            # is in flight. Re-queue the dequeued in-flight event so the flush
+            # path can deliver it exactly once, then propagate cancellation.
+            if in_flight_event is not None:
+                ctx.stage_event_queue.put_nowait(in_flight_event)
             try:
                 await self._flush_remaining_stage_embeds(embed_msg_ids)
             except asyncio.CancelledError:
