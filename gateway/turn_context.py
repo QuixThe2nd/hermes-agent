@@ -46,7 +46,7 @@ class TurnContext:
     # --- queues ----------------------------------------------------------
     progress_queue: Any = None
     log_queue: Any = None
-    # Structured tool-stage events (consult_moa / moa_debate round
+    # Structured tool-stage events (moa_ask / moa_debate round
     # transitions) for surfaces that render one self-editing card per tool
     # invocation. None on every platform except Discord-with-embeds, so the
     # agent.moa_loop stage bus simply has no subscriber elsewhere.

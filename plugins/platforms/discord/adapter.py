@@ -1039,9 +1039,9 @@ _TOOL_STAGE_TITLE_CAP = 100  # Discord embed title limit
 _TOOL_STAGE_DESC_CAP = 480  # conservative well under the 4096 description cap
 
 _TOOL_STAGE_LABELS: Dict[tuple[str, str], str] = {
-    ("consult_moa", "starting"): "starting",
-    ("consult_moa", "advisors"): "advisors running",
-    ("consult_moa", "aggregating"): "aggregating",
+    ("moa_ask", "starting"): "starting",
+    ("moa_ask", "advisors"): "advisors running",
+    ("moa_ask", "aggregating"): "aggregating",
     ("moa_debate", "starting"): "starting",
     ("moa_debate", "proposal"): "proposal round",
     ("moa_debate", "critique"): "critique round",

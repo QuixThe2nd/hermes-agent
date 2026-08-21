@@ -2,7 +2,7 @@
 
 Covers the full seam end to end:
 
-1. ``consult_moa`` / ``moa_debate`` publish ordered, allowlisted stage
+1. ``moa_ask`` / ``moa_debate`` publish ordered, allowlisted stage
    events onto the ``agent.moa_loop`` bus (stage ordering, terminal
    success/partial/degraded/failure classification, optional-revision run
    vs skip, sensitive-payload exclusion).
@@ -250,7 +250,7 @@ def _stage_ctx(adapter):
 # ---------------------------------------------------------------------------
 
 
-def test_consult_moa_stage_order_and_terminal_success(monkeypatch, configured_moa):
+def test_moa_ask_stage_order_and_terminal_success(monkeypatch, configured_moa):
     from tools import moa_tool
 
     _install_consult_fakes(
@@ -259,7 +259,7 @@ def test_consult_moa_stage_order_and_terminal_success(monkeypatch, configured_mo
 
     with _StageCollector("sess-consult-ok") as collector:
         result = json.loads(
-            moa_tool.consult_moa(
+            moa_tool.moa_ask(
                 question="Which architecture?",
                 session_id="sess-consult-ok",
                 task_id="task-9",
@@ -282,7 +282,7 @@ def test_consult_moa_stage_order_and_terminal_success(monkeypatch, configured_mo
     assert all(e["status"] is None for e in collector.events[:-1])
 
 
-def test_consult_moa_terminal_partial_when_one_advisor_fails(
+def test_moa_ask_terminal_partial_when_one_advisor_fails(
     monkeypatch, configured_moa
 ):
     from tools import moa_tool
@@ -293,7 +293,7 @@ def test_consult_moa_terminal_partial_when_one_advisor_fails(
     )
 
     with _StageCollector("sess-consult-partial") as collector:
-        result = json.loads(moa_tool.consult_moa(question="q", session_id="sess-consult-partial"))
+        result = json.loads(moa_tool.moa_ask(question="q", session_id="sess-consult-partial"))
 
     assert result["partial"] is True
     assert collector.stages() == ["starting", "advisors", "aggregating", "complete"]
@@ -301,13 +301,13 @@ def test_consult_moa_terminal_partial_when_one_advisor_fails(
     assert collector.events[-1]["counts"]["failed"] == 1
 
 
-def test_consult_moa_terminal_failure_when_config_unusable(monkeypatch, configured_moa):
+def test_moa_ask_terminal_failure_when_config_unusable(monkeypatch, configured_moa):
     from tools import moa_tool
 
     configured_moa["moa"]["presets"]["homelab"]["enabled"] = False
 
     with _StageCollector("sess-consult-fail") as collector:
-        result = json.loads(moa_tool.consult_moa(question="q", session_id="sess-consult-fail"))
+        result = json.loads(moa_tool.moa_ask(question="q", session_id="sess-consult-fail"))
 
     assert result["success"] is False
     assert collector.stages() == ["starting", "complete"]
@@ -439,7 +439,7 @@ def test_stage_events_never_carry_prompts_evidence_or_answers(
 
     with _StageCollector("sess-canary") as collector:
         json.loads(
-            moa_tool.consult_moa(
+            moa_tool.moa_ask(
                 question=canary_prompt,
                 evidence=canary_evidence,
                 session_id="sess-canary",
@@ -476,12 +476,12 @@ def test_tools_run_unchanged_without_any_subscriber(monkeypatch, configured_moa)
 
     # No subscription for this session id — publish must be a silent no-op.
     result = json.loads(
-        moa_tool.consult_moa(question="q", session_id="sess-unheard", task_id="t")
+        moa_tool.moa_ask(question="q", session_id="sess-unheard", task_id="t")
     )
     assert result["success"] is True
 
     # And with no session at all (direct/test invocation shape).
-    result = json.loads(moa_tool.consult_moa(question="q"))
+    result = json.loads(moa_tool.moa_ask(question="q"))
     assert result["success"] is True
 
 
@@ -496,7 +496,7 @@ def test_registry_dispatch_delivers_session_id_to_stage_reporter(
 
     with _StageCollector("sess-registry") as collector:
         raw = registry.dispatch(
-            "consult_moa",
+            "moa_ask",
             {"question": "Which architecture?"},
             task_id="task-reg",
             session_id="sess-registry",
@@ -518,10 +518,10 @@ async def test_drain_creates_one_embed_and_edits_same_message():
     adapter = _RecordingStageAdapter()
     ctx = _stage_ctx(adapter)
     events = [
-        _stage_event("consult_moa", "inv-1", "starting"),
-        _stage_event("consult_moa", "inv-1", "advisors", advisors=2, models=2),
-        _stage_event("consult_moa", "inv-1", "aggregating", advisors=2, usable=2),
-        _stage_event("consult_moa", "inv-1", "complete", "success", advisors=2),
+        _stage_event("moa_ask", "inv-1", "starting"),
+        _stage_event("moa_ask", "inv-1", "advisors", advisors=2, models=2),
+        _stage_event("moa_ask", "inv-1", "aggregating", advisors=2, usable=2),
+        _stage_event("moa_ask", "inv-1", "complete", "success", advisors=2),
     ]
     for event in events:
         ctx.stage_event_queue.put_nowait(event)
@@ -549,9 +549,9 @@ async def test_drain_correlates_concurrent_invocations():
     adapter = _RecordingStageAdapter()
     ctx = _stage_ctx(adapter)
     stream_a = [
-        _stage_event("consult_moa", "inv-a", "starting"),
-        _stage_event("consult_moa", "inv-a", "advisors", advisors=2),
-        _stage_event("consult_moa", "inv-a", "complete", "success", advisors=2),
+        _stage_event("moa_ask", "inv-a", "starting"),
+        _stage_event("moa_ask", "inv-a", "advisors", advisors=2),
+        _stage_event("moa_ask", "inv-a", "complete", "success", advisors=2),
     ]
     stream_b = [
         _stage_event("moa_debate", "inv-b", "starting"),
@@ -609,9 +609,9 @@ async def test_drain_send_failure_fails_soft_and_later_events_retry():
     adapter = _RecordingStageAdapter(fail_sends=1)
     ctx = _stage_ctx(adapter)
     events = [
-        _stage_event("consult_moa", "inv-y", "starting"),
-        _stage_event("consult_moa", "inv-y", "advisors", advisors=2),
-        _stage_event("consult_moa", "inv-y", "complete", "success", advisors=2),
+        _stage_event("moa_ask", "inv-y", "starting"),
+        _stage_event("moa_ask", "inv-y", "advisors", advisors=2),
+        _stage_event("moa_ask", "inv-y", "complete", "success", advisors=2),
     ]
     for event in events:
         ctx.stage_event_queue.put_nowait(event)
@@ -656,7 +656,7 @@ def test_stage_event_callback_enqueues_only_while_run_is_current():
         _run_still_current=lambda: False,
     )
     TurnRunner(_StubGatewayRunner(), ctx).tool_stage_event_callback(
-        _stage_event("consult_moa", "inv", "starting")
+        _stage_event("moa_ask", "inv", "starting")
     )
     assert ctx.stage_event_queue.empty()
 
@@ -665,7 +665,7 @@ def test_stage_event_callback_enqueues_only_while_run_is_current():
 async def test_full_path_real_tool_events_render_through_drain(
     monkeypatch, configured_moa
 ):
-    """consult_moa -> bus -> queue -> drain -> adapter, one embed."""
+    """moa_ask -> bus -> queue -> drain -> adapter, one embed."""
     from gateway.run import TurnRunner
     from tools import moa_tool
 
@@ -683,7 +683,7 @@ async def test_full_path_real_tool_events_render_through_drain(
         try:
             task = asyncio.create_task(runner.send_tool_stage_embeds())
             result = json.loads(
-                moa_tool.consult_moa(
+                moa_tool.moa_ask(
                     question="Which architecture?",
                     session_id="sess-full",
                     task_id="task-full",
@@ -904,11 +904,11 @@ async def test_drain_cancel_delivers_inflight_terminal():
     ctx = _stage_ctx(adapter)
     runner = TurnRunner(_StubGatewayRunner(), ctx)
     ctx.stage_event_queue.put_nowait(
-        _stage_event("consult_moa", "inv-cancel-inflight", "starting")
+        _stage_event("moa_ask", "inv-cancel-inflight", "starting")
     )
     ctx.stage_event_queue.put_nowait(
         _stage_event(
-            "consult_moa",
+            "moa_ask",
             "inv-cancel-inflight",
             "complete",
             "success",
@@ -947,11 +947,11 @@ async def test_drain_cancel_after_terminal_side_effect_is_exactly_once():
     ctx = _stage_ctx(adapter)
     runner = TurnRunner(_StubGatewayRunner(), ctx)
     ctx.stage_event_queue.put_nowait(
-        _stage_event("consult_moa", "inv-post-side-effect", "starting")
+        _stage_event("moa_ask", "inv-post-side-effect", "starting")
     )
     ctx.stage_event_queue.put_nowait(
         _stage_event(
-            "consult_moa",
+            "moa_ask",
             "inv-post-side-effect",
             "complete",
             "success",
@@ -996,11 +996,11 @@ async def test_drain_double_cancel_is_exactly_once():
     ctx = _stage_ctx(adapter)
     runner = TurnRunner(_StubGatewayRunner(), ctx)
     ctx.stage_event_queue.put_nowait(
-        _stage_event("consult_moa", "inv-double-cancel", "starting")
+        _stage_event("moa_ask", "inv-double-cancel", "starting")
     )
     ctx.stage_event_queue.put_nowait(
         _stage_event(
-            "consult_moa",
+            "moa_ask",
             "inv-double-cancel",
             "complete",
             "success",
@@ -1134,14 +1134,14 @@ async def test_drain_unknown_pin_parks_then_delivers_terminal_once(monkeypatch):
     runner = TurnRunner(_StubGatewayRunner(), ctx)
     invocation = "inv-parked-terminal"
     ctx.stage_event_queue.put_nowait(
-        _stage_event("consult_moa", invocation, "starting")
+        _stage_event("moa_ask", invocation, "starting")
     )
     ctx.stage_event_queue.put_nowait(
-        _stage_event("consult_moa", invocation, "advisors", advisors=2)
+        _stage_event("moa_ask", invocation, "advisors", advisors=2)
     )
     ctx.stage_event_queue.put_nowait(
         _stage_event(
-            "consult_moa",
+            "moa_ask",
             invocation,
             "complete",
             "success",
@@ -1208,11 +1208,11 @@ async def test_drain_harvest_timeout_pins_delivery_no_retry(monkeypatch):
     ctx = _stage_ctx(adapter)
     runner = TurnRunner(_StubGatewayRunner(), ctx)
     ctx.stage_event_queue.put_nowait(
-        _stage_event("consult_moa", "inv-harvest-timeout", "starting")
+        _stage_event("moa_ask", "inv-harvest-timeout", "starting")
     )
     ctx.stage_event_queue.put_nowait(
         _stage_event(
-            "consult_moa",
+            "moa_ask",
             "inv-harvest-timeout",
             "complete",
             "success",
@@ -1268,14 +1268,14 @@ async def test_stop_drain_unknown_pin_bounded_returns_without_teardown_block(
     runner = TurnRunner(_StubGatewayRunner(), ctx)
     invocation = "inv-stop-drain-timeout"
     ctx.stage_event_queue.put_nowait(
-        _stage_event("consult_moa", invocation, "starting")
+        _stage_event("moa_ask", invocation, "starting")
     )
     ctx.stage_event_queue.put_nowait(
-        _stage_event("consult_moa", invocation, "advisors", advisors=2)
+        _stage_event("moa_ask", invocation, "advisors", advisors=2)
     )
     ctx.stage_event_queue.put_nowait(
         _stage_event(
-            "consult_moa",
+            "moa_ask",
             invocation,
             "complete",
             "success",
@@ -1362,11 +1362,11 @@ async def test_drain_unknown_timeout_pins_delivery_no_retry(monkeypatch):
     ctx = _stage_ctx(adapter)
     runner = TurnRunner(_StubGatewayRunner(), ctx)
     ctx.stage_event_queue.put_nowait(
-        _stage_event("consult_moa", "inv-unknown", "starting")
+        _stage_event("moa_ask", "inv-unknown", "starting")
     )
     ctx.stage_event_queue.put_nowait(
         _stage_event(
-            "consult_moa",
+            "moa_ask",
             "inv-unknown",
             "complete",
             "success",
@@ -1413,11 +1413,11 @@ async def test_drain_terminal_failure_retries_exactly_once_in_normal_path():
     adapter = _FastFailTerminalAdapter()
     ctx = _stage_ctx(adapter)
     ctx.stage_event_queue.put_nowait(
-        _stage_event("consult_moa", "inv-normal-retry", "starting")
+        _stage_event("moa_ask", "inv-normal-retry", "starting")
     )
     ctx.stage_event_queue.put_nowait(
         _stage_event(
-            "consult_moa",
+            "moa_ask",
             "inv-normal-retry",
             "complete",
             "success",
@@ -1443,11 +1443,11 @@ async def test_drain_terminal_second_failure_has_no_third_attempt():
     adapter = _FastFailTerminalAdapter()
     ctx = _stage_ctx(adapter)
     ctx.stage_event_queue.put_nowait(
-        _stage_event("consult_moa", "inv-no-third", "starting")
+        _stage_event("moa_ask", "inv-no-third", "starting")
     )
     ctx.stage_event_queue.put_nowait(
         _stage_event(
-            "consult_moa",
+            "moa_ask",
             "inv-no-third",
             "complete",
             "success",
@@ -1484,11 +1484,11 @@ async def test_drain_cancel_while_blocked_creates_no_new_deliveries():
     runner._claim_tool_stage_delivery = counting_claim
 
     ctx.stage_event_queue.put_nowait(
-        _stage_event("consult_moa", "inv-cancel-no-flush", "starting")
+        _stage_event("moa_ask", "inv-cancel-no-flush", "starting")
     )
     ctx.stage_event_queue.put_nowait(
         _stage_event(
-            "consult_moa",
+            "moa_ask",
             "inv-cancel-no-flush",
             "complete",
             "success",
@@ -1549,10 +1549,10 @@ async def test_drain_cancel_during_idle_sleep_creates_no_deliveries(monkeypatch)
     await asyncio.wait_for(sleep_entered.wait(), timeout=2.0)
 
     ctx.stage_event_queue.put_nowait(
-        _stage_event("consult_moa", "inv-cancel", "starting")
+        _stage_event("moa_ask", "inv-cancel", "starting")
     )
     ctx.stage_event_queue.put_nowait(
-        _stage_event("consult_moa", "inv-cancel", "complete", "success", advisors=2)
+        _stage_event("moa_ask", "inv-cancel", "complete", "success", advisors=2)
     )
 
     task.cancel()
@@ -1570,13 +1570,13 @@ async def test_drain_stop_path_delivers_terminal_not_discarding():
 
     adapter = _RecordingStageAdapter()
     ctx = _stage_ctx(adapter)
-    ctx.stage_event_queue.put_nowait(_stage_event("consult_moa", "inv-stop", "starting"))
+    ctx.stage_event_queue.put_nowait(_stage_event("moa_ask", "inv-stop", "starting"))
     ctx.stage_event_queue.put_nowait(
-        _stage_event("consult_moa", "inv-stop", "advisors", advisors=2)
+        _stage_event("moa_ask", "inv-stop", "advisors", advisors=2)
     )
     ctx.stage_event_queue.put_nowait(
         _stage_event(
-            "consult_moa", "inv-stop", "complete", "partial", advisors=2, failed=1
+            "moa_ask", "inv-stop", "complete", "partial", advisors=2, failed=1
         )
     )
     ctx._current_flag["value"] = False
@@ -1589,7 +1589,7 @@ async def test_drain_stop_path_delivers_terminal_not_discarding():
     assert len(adapter.ok_edits) == 0
 
 
-def test_consult_moa_unexpected_exception_still_reports_terminal_failure(
+def test_moa_ask_unexpected_exception_still_reports_terminal_failure(
     monkeypatch, configured_moa
 ):
     from tools import moa_tool
@@ -1603,7 +1603,7 @@ def test_consult_moa_unexpected_exception_still_reports_terminal_failure(
 
     with _StageCollector("sess-boom") as collector:
         with pytest.raises(RuntimeError, match="unexpected"):
-            moa_tool.consult_moa(question="q", session_id="sess-boom")
+            moa_tool.moa_ask(question="q", session_id="sess-boom")
 
     terminals = [e for e in collector.events if e.get("terminal")]
     assert len(terminals) == 1
@@ -1690,20 +1690,20 @@ def _make_discord_stage_adapter():
 async def test_discord_send_and_edit_stage_embed_same_message():
     adapter, sent, edited = _make_discord_stage_adapter()
 
-    running = _stage_event("consult_moa", "inv-abc", "advisors", advisors=2, models=2)
+    running = _stage_event("moa_ask", "inv-abc", "advisors", advisors=2, models=2)
     result = await adapter.send_tool_stage_embed("555", running, reply_to=None)
     assert result.success is True
     assert result.message_id == "4242"
     embed = sent["embed"]
-    assert "consult_moa" in embed.title
+    assert "moa_ask" in embed.title
     assert "advisors running" in embed.title
     assert "2 advisors" in embed.description
     assert "inv-abc"[:8] in embed.footer["text"]
 
-    terminal = _stage_event("consult_moa", "inv-abc", "complete", "success", advisors=2)
+    terminal = _stage_event("moa_ask", "inv-abc", "complete", "success", advisors=2)
     edit_result = await adapter.edit_tool_stage_embed("555", "4242", terminal)
     assert edit_result.success is True
-    assert edited["embed"].title.startswith("consult_moa — ✅ complete")
+    assert edited["embed"].title.startswith("moa_ask — ✅ complete")
 
 
 @pytest.mark.asyncio
@@ -1730,7 +1730,7 @@ async def test_discord_stage_embed_terminal_marks_and_colors():
 async def test_discord_stage_embed_renders_only_allowlisted_fields():
     adapter, sent, _ = _make_discord_stage_adapter()
 
-    event = _stage_event("consult_moa", "inv-2", "advisors", advisors=2)
+    event = _stage_event("moa_ask", "inv-2", "advisors", advisors=2)
     # A hostile/buggy extra key must never reach the rendered embed.
     event["prompt"] = "SECRET-PROMPT-never-render"
     event["raw_args"] = {"evidence": "SECRET-EVIDENCE-never-render"}
@@ -1751,7 +1751,7 @@ async def test_discord_stage_embeds_fail_soft_when_disconnected():
 
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     adapter._client = None
-    event = _stage_event("consult_moa", "inv-3", "starting")
+    event = _stage_event("moa_ask", "inv-3", "starting")
 
     result = await adapter.send_tool_stage_embed("555", event)
     assert result.success is False
@@ -1765,12 +1765,12 @@ def test_tool_stage_appearance_maps_all_documented_stages():
 
     # Consult stages render a human label; terminal statuses a marked title.
     title, desc, color = _tool_stage_appearance(
-        "consult_moa", "starting", None, {}
+        "moa_ask", "starting", None, {}
     )
-    assert title == "consult_moa — starting"
+    assert title == "moa_ask — starting"
     assert color == "running"
 
-    title, _, color = _tool_stage_appearance("consult_moa", "complete", "partial", {"failed": 1})
+    title, _, color = _tool_stage_appearance("moa_ask", "complete", "partial", {"failed": 1})
     assert "⚠️ partial" in title
     assert color == "warn"
 
@@ -1785,7 +1785,7 @@ def test_tool_stage_appearance_maps_all_documented_stages():
     assert len(title) <= 100
 
     # Counts render only when safely present — strings and bools are dropped.
-    _, desc, _ = _tool_stage_appearance("consult_moa", "advisors", None, {"advisors": 2, "junk": "text"})
+    _, desc, _ = _tool_stage_appearance("moa_ask", "advisors", None, {"advisors": 2, "junk": "text"})
     assert "2 advisors" in desc
     assert "junk" not in desc
 

@@ -5323,7 +5323,7 @@ class TurnRunner:
                 logger.error("Progress message error: %s", e)
                 await asyncio.sleep(1)
 
-    # ── Structured tool-stage embeds (consult_moa / moa_debate) ─────────
+    # ── Structured tool-stage embeds (moa_ask / moa_debate) ─────────
     #
     # ``agent.moa_loop``'s stage-event bus delivers allowlisted,
     # per-invocation stage events (tool, stage, terminal status, integer
@@ -28881,7 +28881,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Queue for progress messages (thread-safe)
         progress_queue = queue.Queue() if needs_progress_queue else None
-        # Structured tool-stage embeds (consult_moa / moa_debate): subscribe
+        # Structured tool-stage embeds (moa_ask / moa_debate): subscribe
         # to agent.moa_loop's stage-event bus only when this turn's adapter
         # can render stage embeds (Discord today) AND the user hasn't turned
         # tool progress off. On every other platform no subscriber exists,
