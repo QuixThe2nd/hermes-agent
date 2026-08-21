@@ -39,6 +39,21 @@ from unittest.mock import MagicMock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _suppress_on_gateway_start_hook(monkeypatch):
+    """Keep gateway startup tests hermetic — bundled auto_update reconciles via hook."""
+    import hermes_cli.lifecycle as lifecycle
+
+    real_invoke_hook = lifecycle.invoke_hook
+
+    def invoke_hook(hook_name, **kwargs):
+        if hook_name == "on_gateway_start":
+            return []
+        return real_invoke_hook(hook_name, **kwargs)
+
+    monkeypatch.setattr(lifecycle, "invoke_hook", invoke_hook)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _bind_lark_sdk_globals_when_installed():
     """Bind the feishu adapter's lark SDK globals once per test session.

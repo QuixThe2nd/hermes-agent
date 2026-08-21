@@ -2197,3 +2197,215 @@ class TestDefaultEnabledForkPlugins:
 
         assert mgr._plugins["fork_custom"].enabled is False
         assert mgr._plugins["fork_custom"].error == "disabled via config"
+
+    def test_bundled_disabled_management_registers_without_main_register(
+        self, tmp_path, monkeypatch
+    ):
+        self._home(
+            tmp_path,
+            monkeypatch,
+            config={"plugins": {"enabled": [], "disabled": ["mgmt_only"]}},
+        )
+        bundled = self._bundled(tmp_path, monkeypatch)
+        plugin_dir = _make_plugin_dir(
+            bundled,
+            "mgmt_only",
+            register_body="raise RuntimeError('main register must not run')",
+            manifest_extra={
+                "default_enabled": True,
+                "disabled_management": "disabled_management",
+            },
+            auto_enable=False,
+            home=tmp_path / "home",
+        )
+        (plugin_dir / "disabled_management.py").write_text(
+            "def register_disabled(ctx):\n"
+            "    ctx.register_cli_command(\n"
+            "        name='mgmt_only',\n"
+            "        help='mgmt',\n"
+            "        setup_fn=lambda p: None,\n"
+            "        handler_fn=lambda args: 0,\n"
+            "    )\n"
+            "    ctx.register_hook('on_gateway_start', lambda **k: None)\n"
+        )
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        loaded = mgr._plugins["mgmt_only"]
+        assert loaded.enabled is False
+        assert loaded.error == "disabled via config"
+        assert "mgmt_only" in mgr._cli_commands
+        assert "on_gateway_start" in loaded.hooks_registered
+        assert loaded.module.__name__.startswith("hermes_disabled_mgmt.")
+
+    def test_disabled_management_forbidden_surface_fails_without_partial_regs(
+        self, tmp_path, monkeypatch
+    ):
+        self._home(
+            tmp_path,
+            monkeypatch,
+            config={"plugins": {"enabled": [], "disabled": ["forbidden_tool"]}},
+        )
+        bundled = self._bundled(tmp_path, monkeypatch)
+        plugin_dir = _make_plugin_dir(
+            bundled,
+            "forbidden_tool",
+            register_body="ctx.register_tool('evil', {}, lambda *a, **k: '{}')",
+            manifest_extra={
+                "default_enabled": True,
+                "disabled_management": "disabled_management",
+            },
+            auto_enable=False,
+            home=tmp_path / "home",
+        )
+        (plugin_dir / "disabled_management.py").write_text(
+            "def register_disabled(ctx):\n"
+            "    ctx.register_cli_command(\n"
+            "        name='forbidden_tool',\n"
+            "        help='mgmt',\n"
+            "        setup_fn=lambda p: None,\n"
+            "    )\n"
+            "    ctx.register_tool('evil', {}, lambda *a, **k: '{}')\n"
+        )
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        loaded = mgr._plugins["forbidden_tool"]
+        assert loaded.enabled is False
+        assert loaded.error == "disabled via config"
+        assert "forbidden_tool" not in mgr._cli_commands
+        assert loaded.hooks_registered == []
+        assert not any(
+            registration.plugin_key == "forbidden_tool" and registration.active
+            for registration in mgr._registration_order
+        )
+
+    def test_disabled_management_rejects_non_gateway_start_hook(
+        self, tmp_path, monkeypatch
+    ):
+        self._home(
+            tmp_path,
+            monkeypatch,
+            config={"plugins": {"enabled": [], "disabled": ["bad_hook"]}},
+        )
+        bundled = self._bundled(tmp_path, monkeypatch)
+        plugin_dir = _make_plugin_dir(
+            bundled,
+            "bad_hook",
+            manifest_extra={
+                "default_enabled": True,
+                "disabled_management": "disabled_management",
+            },
+            auto_enable=False,
+            home=tmp_path / "home",
+        )
+        (plugin_dir / "disabled_management.py").write_text(
+            "def register_disabled(ctx):\n"
+            "    ctx.register_cli_command(\n"
+            "        name='bad_hook',\n"
+            "        help='mgmt',\n"
+            "        setup_fn=lambda p: None,\n"
+            "    )\n"
+            "    ctx.register_hook('on_session_start', lambda **k: None)\n"
+        )
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        loaded = mgr._plugins["bad_hook"]
+        assert loaded.enabled is False
+        assert loaded.error == "disabled via config"
+        assert "bad_hook" not in mgr._cli_commands
+        assert loaded.hooks_registered == []
+        assert "on_session_start" not in mgr._hooks
+        assert not any(
+            registration.plugin_key == "bad_hook" and registration.active
+            for registration in mgr._registration_order
+        )
+
+    def test_disabled_management_context_exposes_only_allowed_surface(
+        self, tmp_path, monkeypatch
+    ):
+        self._home(
+            tmp_path,
+            monkeypatch,
+            config={"plugins": {"enabled": [], "disabled": ["narrow_ctx"]}},
+        )
+        bundled = self._bundled(tmp_path, monkeypatch)
+        plugin_dir = _make_plugin_dir(
+            bundled,
+            "narrow_ctx",
+            manifest_extra={
+                "default_enabled": True,
+                "disabled_management": "disabled_management",
+            },
+            auto_enable=False,
+            home=tmp_path / "home",
+        )
+        (plugin_dir / "disabled_management.py").write_text(
+            "_captured = []\n"
+            "def register_disabled(ctx):\n"
+            "    _captured.append(ctx)\n"
+        )
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        import sys
+
+        module_name = mgr._plugins["narrow_ctx"].module.__name__
+        ctx = sys.modules[module_name]._captured[0]
+        forbidden = (
+            "register_tool",
+            "register_command",
+            "register_platform",
+            "register_memory_provider",
+            "register_context_engine",
+            "get_config",
+            "set_config",
+            "state",
+            "llm",
+        )
+        for name in forbidden:
+            assert not hasattr(ctx, name), name
+
+    def test_user_plugin_disabled_management_stays_unimported(
+        self, tmp_path, monkeypatch
+    ):
+        home = self._home(
+            tmp_path,
+            monkeypatch,
+            config={"plugins": {"enabled": ["user_mgmt"], "disabled": ["user_mgmt"]}},
+        )
+        self._bundled(tmp_path, monkeypatch)
+        plugin_dir = home / "plugins" / "user_mgmt"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "plugin.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "name": "user_mgmt",
+                    "version": "0.1.0",
+                    "disabled_management": "disabled_management",
+                }
+            )
+        )
+        (plugin_dir / "__init__.py").write_text(
+            "def register(ctx):\n"
+            "    ctx.register_hook('on_session_start', lambda **k: None)\n"
+        )
+        (plugin_dir / "disabled_management.py").write_text(
+            "def register_disabled(ctx):\n"
+            "    raise AssertionError('user disabled_management must not run')\n"
+        )
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        loaded = mgr._plugins["user_mgmt"]
+        assert loaded.enabled is False
+        assert loaded.error == "disabled via config"
+        assert "user_mgmt" not in mgr._cli_commands
+        assert loaded.hooks_registered == []
+        assert loaded.module is None

@@ -3214,6 +3214,19 @@ DEFAULT_CONFIG = {
     },
 
     # ``hermes update`` behaviour.
+    # Unattended update scheduler (plugins/auto_update). Explicit
+    # ``auto_update.enabled: false`` or ``plugins.disabled: [auto_update]``
+    # always wins and survives reconcile/upgrade.
+    "auto_update": {
+        "enabled": True,
+        "idle_minutes": 8,
+        "schedule": "*-*-* *:00,30:00",
+        "randomized_delay_sec": 0,
+        "accuracy_sec": "1s",
+        "notify_on_success": "",
+        "notify_on_failure": "",
+    },
+
     "updates": {
         # Pre-update safety backup — ONE consolidated mechanism, three modes:
         #

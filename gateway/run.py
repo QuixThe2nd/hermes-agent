@@ -12848,6 +12848,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning(
                 "plugin discovery failed at gateway startup", exc_info=True,
             )
+        else:
+            try:
+                from hermes_cli.lifecycle import invoke_hook
+
+                invoke_hook("on_gateway_start")
+            except Exception:
+                logger.warning(
+                    "on_gateway_start hook failed at gateway startup",
+                    exc_info=True,
+                )
 
         # Register the generic relay adapter when a connector relay URL is
         # configured (GATEWAY_RELAY_URL / gateway.relay_url). No URL -> no-op, so
