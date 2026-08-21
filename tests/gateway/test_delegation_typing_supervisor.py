@@ -4,18 +4,12 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 
 import tools.async_delegation as ad
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource, build_session_key
-
-
-@pytest.fixture(autouse=True)
-def _reset_async_delegation():
-    ad._reset_for_tests()
-    yield
-    ad._reset_for_tests()
 
 
 class _StubAdapter(BasePlatformAdapter):
@@ -38,17 +32,44 @@ class _BaseOffAdapter(_StubAdapter):
     _delegation_typing_enabled = False
 
 
-def _make_adapter(*, typing_indicator: bool = True, enabled: bool = True) -> _StubAdapter:
-    cls = _StubAdapter if enabled else _BaseOffAdapter
-    adapter = cls(
-        PlatformConfig(enabled=True, token="t", typing_indicator=typing_indicator),
-        Platform.DISCORD,
-    )
-    adapter._delegation_typing_poll_interval = 0.05
-    adapter.send_typing = AsyncMock(return_value=None)
-    adapter.stop_typing = AsyncMock(return_value=None)
-    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="m1"))
-    return adapter
+_tracked_adapters: list[_StubAdapter] = []
+
+
+@pytest.fixture
+def make_adapter():
+    def _factory(*, typing_indicator: bool = True, enabled: bool = True) -> _StubAdapter:
+        cls = _StubAdapter if enabled else _BaseOffAdapter
+        adapter = cls(
+            PlatformConfig(enabled=True, token="t", typing_indicator=typing_indicator),
+            Platform.DISCORD,
+        )
+        adapter._delegation_typing_poll_interval = 0.05
+        adapter.send_typing = AsyncMock(return_value=None)
+        adapter.stop_typing = AsyncMock(return_value=None)
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="m1"))
+        _tracked_adapters.append(adapter)
+        return adapter
+
+    return _factory
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _adapter_teardown():
+    ad._reset_for_tests()
+    _tracked_adapters.clear()
+    yield
+    for adapter in list(_tracked_adapters):
+        await adapter.cancel_background_tasks()
+        await asyncio.sleep(0)
+        assert not adapter._delegation_typing_tasks, (
+            "delegation typing supervisor leaked after test teardown"
+        )
+        pending = [t for t in adapter._background_tasks if not t.done()]
+        assert not pending, (
+            f"background tasks still pending after test teardown: {pending!r}"
+        )
+    ad._reset_for_tests()
+    _tracked_adapters.clear()
 
 
 def _sk(chat_id="C123"):
@@ -74,8 +95,8 @@ def _mark_complete(delegation_id: str = "d1") -> None:
 
 
 @pytest.mark.asyncio
-async def test_live_delegation_after_turn_end_keeps_typing_without_session_lock():
-    adapter = _make_adapter()
+async def test_live_delegation_after_turn_end_keeps_typing_without_session_lock(make_adapter):
+    adapter = make_adapter()
     session_key = _sk()
     _seed_live(session_key)
 
@@ -88,8 +109,8 @@ async def test_live_delegation_after_turn_end_keeps_typing_without_session_lock(
 
 
 @pytest.mark.asyncio
-async def test_no_live_delegation_does_not_create_supervisor():
-    adapter = _make_adapter()
+async def test_no_live_delegation_does_not_create_supervisor(make_adapter):
+    adapter = make_adapter()
     session_key = _sk()
 
     await adapter._ensure_delegation_typing(session_key, "C123")
@@ -100,8 +121,8 @@ async def test_no_live_delegation_does_not_create_supervisor():
 
 
 @pytest.mark.asyncio
-async def test_last_completion_stops_supervisor_and_platform_typing():
-    adapter = _make_adapter()
+async def test_last_completion_stops_supervisor_and_platform_typing(make_adapter):
+    adapter = make_adapter()
     session_key = _sk()
     _seed_live(session_key)
 
@@ -116,8 +137,8 @@ async def test_last_completion_stops_supervisor_and_platform_typing():
 
 
 @pytest.mark.asyncio
-async def test_session_isolation():
-    adapter = _make_adapter()
+async def test_session_isolation(make_adapter):
+    adapter = make_adapter()
     sk_a = _sk("A")
     sk_b = _sk("B")
     _seed_live(sk_a, "d-a")
@@ -132,8 +153,8 @@ async def test_session_isolation():
 
 
 @pytest.mark.asyncio
-async def test_ensure_is_idempotent():
-    adapter = _make_adapter()
+async def test_ensure_is_idempotent(make_adapter):
+    adapter = make_adapter()
     session_key = _sk()
     _seed_live(session_key)
 
@@ -145,8 +166,8 @@ async def test_ensure_is_idempotent():
 
 
 @pytest.mark.asyncio
-async def test_follow_up_turn_handoff_restarts_single_supervisor():
-    adapter = _make_adapter()
+async def test_follow_up_turn_handoff_restarts_single_supervisor(make_adapter):
+    adapter = make_adapter()
     session_key = _sk()
     _seed_live(session_key)
     adapter._message_handler = AsyncMock(return_value="ok")
@@ -171,8 +192,8 @@ async def test_follow_up_turn_handoff_restarts_single_supervisor():
 
 
 @pytest.mark.asyncio
-async def test_in_band_drain_parent_does_not_start_supervisor_during_follow_up():
-    adapter = _make_adapter()
+async def test_in_band_drain_parent_does_not_start_supervisor_during_follow_up(make_adapter):
+    adapter = make_adapter()
     session_key = _sk()
     _seed_live(session_key)
 
@@ -218,8 +239,8 @@ async def test_in_band_drain_parent_does_not_start_supervisor_during_follow_up()
 
 
 @pytest.mark.asyncio
-async def test_stop_delegation_typing_propagates_caller_cancelled():
-    adapter = _make_adapter()
+async def test_stop_delegation_typing_propagates_caller_cancelled(make_adapter):
+    adapter = make_adapter()
     session_key = _sk()
     _seed_live(session_key)
 
@@ -235,8 +256,8 @@ async def test_stop_delegation_typing_propagates_caller_cancelled():
 
 
 @pytest.mark.asyncio
-async def test_expected_cancelled_task_does_not_ensure_supervisor():
-    adapter = _make_adapter()
+async def test_expected_cancelled_task_does_not_ensure_supervisor(make_adapter):
+    adapter = make_adapter()
     session_key = _sk()
     _seed_live(session_key)
     adapter._session_tasks[session_key] = asyncio.current_task()
@@ -249,8 +270,8 @@ async def test_expected_cancelled_task_does_not_ensure_supervisor():
 
 
 @pytest.mark.asyncio
-async def test_cancel_background_tasks_cleans_supervisor():
-    adapter = _make_adapter()
+async def test_cancel_background_tasks_cleans_supervisor(make_adapter):
+    adapter = make_adapter()
     session_key = _sk()
     _seed_live(session_key)
 
@@ -258,7 +279,7 @@ async def test_cancel_background_tasks_cleans_supervisor():
     supervisor = adapter._delegation_typing_tasks[session_key]
     assert supervisor in adapter._background_tasks
 
-    await adapter.cancel_background_tasks()
+    await asyncio.wait_for(adapter.cancel_background_tasks(), timeout=5.0)
 
     assert supervisor.done()
     assert session_key not in adapter._delegation_typing_tasks
@@ -266,8 +287,8 @@ async def test_cancel_background_tasks_cleans_supervisor():
 
 
 @pytest.mark.asyncio
-async def test_default_off_base_adapter_never_starts_supervisor():
-    adapter = _make_adapter(enabled=False)
+async def test_default_off_base_adapter_never_starts_supervisor(make_adapter):
+    adapter = make_adapter(enabled=False)
     session_key = _sk()
     _seed_live(session_key)
 
@@ -279,8 +300,8 @@ async def test_default_off_base_adapter_never_starts_supervisor():
 
 
 @pytest.mark.asyncio
-async def test_typing_indicator_disabled_suppresses_supervisor():
-    adapter = _make_adapter(typing_indicator=False)
+async def test_typing_indicator_disabled_suppresses_supervisor(make_adapter):
+    adapter = make_adapter(typing_indicator=False)
     session_key = _sk()
     _seed_live(session_key)
 
@@ -292,8 +313,8 @@ async def test_typing_indicator_disabled_suppresses_supervisor():
 
 
 @pytest.mark.asyncio
-async def test_stop_delegation_typing_cleans_platform_typing():
-    adapter = _make_adapter()
+async def test_stop_delegation_typing_cleans_platform_typing(make_adapter):
+    adapter = make_adapter()
     session_key = _sk()
     _seed_live(session_key)
 

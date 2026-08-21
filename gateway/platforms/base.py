@@ -5424,6 +5424,12 @@ class BasePlatformAdapter(ABC):
                             self.name,
                             typing_err,
                         )
+                # Python 3.11: task.cancel() can race with wait_for's inner send
+                # completing in the same pass — cancellation is consumed (no
+                # CancelledError) while cancelling() stays > 0; check before sleep.
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling() > 0:
+                    return
                 await asyncio.sleep(poll_interval)
         except asyncio.CancelledError:
             pass
@@ -7236,19 +7242,18 @@ class BasePlatformAdapter(ABC):
             for task in tasks:
                 self._expected_cancelled_tasks.add(task)
                 task.cancel()
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(
-                        *(asyncio.shield(t) for t in tasks),
-                        return_exceptions=True,
-                    ),
-                    timeout=5.0,
-                )
-            except asyncio.TimeoutError:
+            # asyncio.wait instead of wait_for(gather(shield(...))): on
+            # Python 3.11 the shielded-gather pattern can hang forever when
+            # the children were cancelled before the gather future started
+            # resolving.  asyncio.wait bounds the wait and reports
+            # already-cancelled tasks in `done` immediately; caller
+            # cancellation still propagates (CancelledError is not caught).
+            done, pending = await asyncio.wait(tasks, timeout=5.0)
+            if pending:
                 logger.warning(
                     "[%s] %d background task(s) did not exit within 5s; "
                     "releasing tracking and letting them unwind in the background",
-                    self.name, len([t for t in tasks if not t.done()]),
+                    self.name, len(pending),
                 )
                 break
             # Loop: late-arrival tasks spawned during the gather above
