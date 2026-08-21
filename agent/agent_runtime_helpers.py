@@ -3343,22 +3343,26 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 **dispatch_kwargs,
             )
 
-    if skip_tool_execution_middleware:
-        return _execute(function_args)
+    from tools.tool_status import tool_status_scope
 
-    from hermes_cli.middleware import run_tool_execution_middleware
+    emit = getattr(agent, "_emit_status", None)
+    with tool_status_scope(emit if callable(emit) else None):
+        if skip_tool_execution_middleware:
+            return _execute(function_args)
 
-    return run_tool_execution_middleware(
-        function_name,
-        function_args,
-        lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
-        original_args=function_args,
-        task_id=effective_task_id or "",
-        session_id=getattr(agent, "session_id", "") or "",
-        tool_call_id=tool_call_id or "",
-        turn_id=getattr(agent, "_current_turn_id", "") or "",
-        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-    )
+        from hermes_cli.middleware import run_tool_execution_middleware
+
+        return run_tool_execution_middleware(
+            function_name,
+            function_args,
+            lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
+            original_args=function_args,
+            task_id=effective_task_id or "",
+            session_id=getattr(agent, "session_id", "") or "",
+            tool_call_id=tool_call_id or "",
+            turn_id=getattr(agent, "_current_turn_id", "") or "",
+            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+        )
 
 
 

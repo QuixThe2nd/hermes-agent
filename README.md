@@ -4,7 +4,7 @@ A developer edition of [Hermes Agent](https://github.com/NousResearch/hermes-age
 
 **What's different here:**
 - **Tools**
-  - Delegation — send coding tasks to the Cursor Agent CLI, straight from chat
+  - Delegation — send coding tasks to a Cursor My Machines Cloud Agent in the target checkout, straight from chat
   - Delegation — send coding tasks to the Claude Code CLI, straight from chat
   - Delegation — delegate coding tools run unbounded by default; stall watchdog is the only kill switch
   - Delegation — `delegate_task action='list'` surfaces per-child liveness (current tool, iteration, seconds since activity, stalled flag) so a wedged subagent is distinguishable from a slow one
