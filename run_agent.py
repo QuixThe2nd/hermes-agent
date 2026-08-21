@@ -8855,7 +8855,7 @@ class AIAgent:
             # which may be observed from another thread.
             from tools.tool_status import tool_status_scope
 
-            with bind_subagent_parent(self), tool_status_scope(self._emit_status), scoped_runtime_main({}):
+            with bind_subagent_parent(self), tool_status_scope(getattr(self, "_emit_status", None)), scoped_runtime_main({}):
                 try:
                     if durable_turn_lease_thread is not None:
                         with durable_turn_lease_activity_lock:
