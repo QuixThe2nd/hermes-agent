@@ -131,6 +131,27 @@ def _has_active_compression_lock(conn: sqlite3.Connection, now: float | None = N
     return row is not None
 
 
+def _has_live_turn_lease(conn: sqlite3.Connection, now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    row = conn.execute(
+        "SELECT 1 FROM session_turn_leases WHERE expires_at > ? LIMIT 1",
+        (now,),
+    ).fetchone()
+    return row is not None
+
+
+def _has_live_delegation(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM async_delegations
+        WHERE state IN ('running', 'finalizing')
+        LIMIT 1
+        """
+    ).fetchone()
+    return row is not None
+
+
 def evaluate_idle(
     *,
     idle_minutes: int,
@@ -141,6 +162,7 @@ def evaluate_idle(
     """Return whether Hermes looks idle enough for an unattended update."""
     path = db_path or state_db_path()
     blockers: list[IdleBlocker] = []
+    now = time.time() if now is None else now
     try:
         if not path.is_file():
             return IdleSnapshot(
@@ -166,6 +188,14 @@ def evaluate_idle(
             if _has_active_compression_lock(conn, now=now):
                 blockers.append(
                     IdleBlocker("compression", "active compression lock")
+                )
+            if _has_live_turn_lease(conn, now=now):
+                blockers.append(
+                    IdleBlocker("live_turn", "active session turn lease")
+                )
+            if _has_live_delegation(conn):
+                blockers.append(
+                    IdleBlocker("live_delegation", "delegated agent running")
                 )
     except (OSError, sqlite3.Error):
         return IdleSnapshot(

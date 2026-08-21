@@ -9,12 +9,15 @@ from hermes_constants import display_hermes_home
 
 from plugins.auto_update.config import load_auto_update_config, plugin_explicitly_disabled
 from plugins.auto_update.platform import detect_install_scope, platform_supported
+from plugins.auto_update.lifecycle import reconcile_scheduler_on_load
 from plugins.auto_update.runner import run_scheduled_update
 from plugins.auto_update.systemd import (
     ReconcileResult,
     disable_timer,
     format_status,
+    linger_warning,
     reconcile_units,
+    timer_is_active,
 )
 
 
@@ -25,6 +28,10 @@ def _effective_enabled() -> bool:
 def cmd_status() -> int:
     cfg = load_auto_update_config()
     scope = detect_install_scope()
+    warnings: list[str] = []
+    linger = linger_warning(scope)
+    if linger:
+        warnings.append(linger)
     result = ReconcileResult(
         supported=platform_supported() and scope is not None,
         scope=scope,
@@ -32,11 +39,9 @@ def cmd_status() -> int:
         enabled=_effective_enabled(),
         timer_active=False,
         legacy=(),
-        warnings=(),
+        warnings=tuple(warnings),
     )
     if result.supported and scope is not None:
-        from plugins.auto_update.systemd import timer_is_active
-
         result = ReconcileResult(
             supported=True,
             scope=scope,
@@ -44,12 +49,13 @@ def cmd_status() -> int:
             enabled=_effective_enabled(),
             timer_active=timer_is_active(scope),
             legacy=(),
-            warnings=(),
+            warnings=tuple(warnings),
         )
     print(format_status(result))
     print(f"  Config enabled: {'yes' if cfg['enabled'] else 'no'}")
     print(f"  Idle minutes: {cfg['idle_minutes']}")
-    print(f"  Window: {cfg['schedule_start_hour']:02d}:00–{cfg['schedule_end_hour']:02d}:00 local")
+    print(f"  Schedule: {cfg['schedule']}")
+    print(f"  Randomized delay: {cfg['randomized_delay_sec']}s")
     if plugin_explicitly_disabled():
         print("  Explicit disable: yes (config/plugins.disabled)")
     return 0
@@ -72,7 +78,9 @@ def cmd_enable() -> int:
         )
         return 1
     _save_enabled_flag(True)
-    result = reconcile_units(load_auto_update_config(), enabled=True)
+    result = reconcile_scheduler_on_load()
+    if result is None:
+        result = reconcile_units(load_auto_update_config(), enabled=True)
     print(format_status(result))
     print(f"Scheduler installed under {display_hermes_home()}.")
     return 0 if result.supported else 1
@@ -80,16 +88,20 @@ def cmd_enable() -> int:
 
 def cmd_disable() -> int:
     _save_enabled_flag(False)
-    scope = detect_install_scope()
-    if scope is not None:
-        disable_timer(scope)
+    result = reconcile_scheduler_on_load()
+    if result is None and platform_supported():
+        scope = detect_install_scope()
+        if scope is not None:
+            disable_timer(scope)
     print("Hermes auto-update disabled; timer stopped.")
     return 0
 
 
 def cmd_reconcile() -> int:
-    enabled = _effective_enabled()
-    result = reconcile_units(load_auto_update_config(), enabled=enabled)
+    result = reconcile_scheduler_on_load()
+    if result is None:
+        enabled = _effective_enabled()
+        result = reconcile_units(load_auto_update_config(), enabled=enabled)
     print(format_status(result))
     return 0 if result.supported or not platform_supported() else 1
 

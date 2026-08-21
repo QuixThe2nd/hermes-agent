@@ -384,6 +384,10 @@ VALID_HOOKS: Set[str] = {
     #   alias_used: the exact token the user typed (str), args_raw: str,
     #   session_key: str | None (gateway), platform: str | None (gateway).
     "pre_command",
+    # Gateway startup observer. Fired once after plugin discovery completes
+    # during GatewayRunner.start(). Observer-only; return values ignored.
+    # No meaningful payload fields beyond the standard additive envelope.
+    "on_gateway_start",
 }
 
 # Hooks whose return value carries a directive that the shell-hook response

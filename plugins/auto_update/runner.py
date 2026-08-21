@@ -10,7 +10,11 @@ from typing import Callable, Sequence
 from hermes_cli.relaunch import resolve_hermes_bin
 from hermes_cli.update_lock import read_live_update
 
-from plugins.auto_update.config import load_auto_update_config, plugin_explicitly_disabled
+from plugins.auto_update.config import (
+    _coerce_bool,
+    load_auto_update_config,
+    plugin_explicitly_disabled,
+)
 from plugins.auto_update.idle import IdleSnapshot, evaluate_idle
 from plugins.auto_update.lock import nonblocking_run_lock
 from plugins.auto_update.notify import emit_notification
@@ -20,6 +24,7 @@ logger = logging.getLogger(__name__)
 UPDATE_CHECK_ARGV = ("update", "--check")
 UPDATE_APPLY_ARGV = ("update", "--yes")
 UP_TO_DATE_MARKERS = ("already up to date", "✓ already up to date")
+UPDATE_AVAILABLE_MARKER = "⚕ update available"
 
 
 @dataclass(frozen=True)
@@ -46,7 +51,7 @@ def _check_output_indicates_update_available(text: str) -> bool:
     lowered = (text or "").lower()
     if any(marker in lowered for marker in UP_TO_DATE_MARKERS):
         return False
-    return "update available" in lowered or "behind" in lowered
+    return UPDATE_AVAILABLE_MARKER in lowered
 
 
 def run_subprocess(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -70,7 +75,7 @@ def run_scheduled_update(
         return RunOutcome(0, "disabled")
 
     settings = cfg or load_auto_update_config()
-    if not settings.get("enabled", True):
+    if not _coerce_bool(settings.get("enabled"), True):
         return RunOutcome(0, "disabled")
 
     if read_live_update_fn() is not None:
@@ -84,12 +89,14 @@ def run_scheduled_update(
         if not idle.idle:
             return RunOutcome(0, f"not_idle:{idle.blockers[0].code}")
 
-        idle_recheck = evaluate_idle_fn(idle_minutes=int(settings["idle_minutes"]))
-        if not idle_recheck.idle:
-            return RunOutcome(0, f"not_idle_recheck:{idle_recheck.blockers[0].code}")
-
         check_argv = build_stock_updater_argv("check")
-        check = run_cmd(check_argv)
+        try:
+            check = run_cmd(check_argv)
+        except subprocess.TimeoutExpired:
+            emit_notification(settings.get("notify_on_failure", ""))
+            logger.warning("auto-update check timed out")
+            return RunOutcome(0, "check_timeout")
+
         combined = "\n".join(filter(None, (check.stdout, check.stderr)))
         if check.returncode != 0 and not _check_output_indicates_update_available(combined):
             logger.info("auto-update check failed quietly: rc=%s", check.returncode)
@@ -98,8 +105,21 @@ def run_scheduled_update(
         if not _check_output_indicates_update_available(combined):
             return RunOutcome(0, "no_update")
 
+        idle_before_apply = evaluate_idle_fn(idle_minutes=int(settings["idle_minutes"]))
+        if not idle_before_apply.idle:
+            return RunOutcome(
+                0,
+                f"not_idle_before_apply:{idle_before_apply.blockers[0].code}",
+            )
+
         apply_argv = build_stock_updater_argv("apply")
-        apply = run_cmd(apply_argv)
+        try:
+            apply = run_cmd(apply_argv)
+        except subprocess.TimeoutExpired:
+            emit_notification(settings.get("notify_on_failure", ""))
+            logger.warning("auto-update apply timed out")
+            return RunOutcome(0, "apply_timeout")
+
         if apply.returncode == 0:
             emit_notification(settings.get("notify_on_success", ""))
             return RunOutcome(0, "updated")

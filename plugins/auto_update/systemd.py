@@ -5,12 +5,14 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from hermes_constants import display_hermes_home, get_hermes_home
 
+from plugins.auto_update.config import default_schedule_calendar
 from plugins.auto_update.legacy import duplicate_scheduler_present, migrate_legacy_units
 from plugins.auto_update.platform import (
     InstallScope,
@@ -46,11 +48,27 @@ def timer_unit_path(scope: InstallScope) -> Path:
     return scope.unit_dir / TIMER_NAME
 
 
-def _calendar_hours(start_hour: int, end_hour: int) -> str:
-    hours = list(range(start_hour, end_hour))
-    if not hours:
-        hours = [4, 5, 6, 7]
-    return ",".join(f"{hour:02d}" for hour in hours)
+def _systemd_quote(value: str) -> str:
+    if not value:
+        return '""'
+    special = set(' \t\n"\\$%')
+    if not any(ch in special for ch in value):
+        return value
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("$", "\\$")
+        .replace("%", "%%")
+    )
+    return f'"{escaped}"'
+
+
+def format_exec_start(argv: Sequence[str]) -> str:
+    return " ".join(_systemd_quote(part) for part in argv)
+
+
+def format_environment(key: str, value: str) -> str:
+    return f"Environment={_systemd_quote(f'{key}={value}')}"
 
 
 def render_service_unit(
@@ -59,22 +77,26 @@ def render_service_unit(
     exec_start: Sequence[str],
     scope: InstallScope | None = None,
 ) -> str:
-    exec_line = " ".join(exec_start)
+    exec_line = format_exec_start(exec_start)
     profile = profile_cli_args()
     profile_env = ""
     if profile:
-        profile_env = f'Environment="HERMES_PROFILE={profile[-1]}"\n'
+        profile_env = format_environment("HERMES_PROFILE", profile[-1]) + "\n"
+    working_dir = hermes_home.replace("%", "%%")
+    if any(ch in working_dir for ch in ' \t\n"\\$'):
+        working_dir = _systemd_quote(working_dir)
     identity = ""
     wanted_by = "WantedBy=multi-user.target"
     if scope and not scope.system:
         wanted_by = "WantedBy=default.target"
     elif scope and scope.system:
         try:
+            import grp
             import pwd
 
             st = Path(hermes_home).stat()
             user = pwd.getpwuid(st.st_uid).pw_name
-            group = pwd.getpwuid(st.st_uid).pw_name
+            group = grp.getgrgid(st.st_gid).gr_name
             identity = f"User={user}\nGroup={group}\n"
         except (ImportError, KeyError, OSError):
             pass
@@ -86,8 +108,8 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 {identity}ExecStart={exec_line}
-WorkingDirectory={hermes_home}
-Environment="HERMES_HOME={hermes_home}"
+WorkingDirectory={working_dir}
+{format_environment("HERMES_HOME", hermes_home)}
 {profile_env}StandardOutput=journal
 StandardError=journal
 
@@ -98,17 +120,17 @@ StandardError=journal
 
 def render_timer_unit(
     *,
-    start_hour: int,
-    end_hour: int,
+    schedule: str,
     randomized_delay_sec: int,
+    accuracy_sec: str,
 ) -> str:
-    hours = _calendar_hours(start_hour, end_hour)
     return f"""[Unit]
 Description=Hermes unattended update schedule
 
 [Timer]
-OnCalendar=*-*-* {hours}:00:00
+OnCalendar={schedule}
 RandomizedDelaySec={randomized_delay_sec}
+AccuracySec={accuracy_sec}
 Persistent=true
 Unit={SERVICE_NAME}
 
@@ -158,6 +180,33 @@ def default_systemctl_runner(args: Sequence[str]) -> tuple[int, str, str]:
         return 1, "", str(exc)
 
 
+def timer_stamp_path(scope: InstallScope, timer_name: str = TIMER_NAME) -> Path:
+    if scope.system:
+        base = Path("/var/lib/systemd/timers")
+    else:
+        base = Path.home() / ".local/share/systemd/timers"
+    return base / f"stamp-{timer_name}"
+
+
+def prestamp_timer(
+    scope: InstallScope,
+    *,
+    timer_name: str = TIMER_NAME,
+    now_usec: int | None = None,
+    write_stamp: Callable[[Path, str], None] | None = None,
+) -> None:
+    """Pre-stamp a timer so ``Persistent=true`` does not catch up on first enable."""
+    stamp = timer_stamp_path(scope, timer_name)
+    usec = now_usec if now_usec is not None else int(time.time() * 1_000_000)
+    writer = write_stamp or _write_timer_stamp
+    writer(stamp, str(usec))
+
+
+def _write_timer_stamp(path: Path, payload: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(payload, encoding="utf-8")
+
+
 def timer_is_active(
     scope: InstallScope,
     *,
@@ -185,8 +234,31 @@ def disable_timer(
     *,
     run_systemctl: Callable[[Sequence[str]], tuple[int, str, str]] = default_systemctl_runner,
 ) -> None:
+    """Stop/disable the timer only — never stop the oneshot service."""
     run_systemctl(build_systemctl_cmd(scope, "disable", "--now", TIMER_NAME))
-    run_systemctl(build_systemctl_cmd(scope, "stop", SERVICE_NAME))
+
+
+def user_linger_enabled(*, username: str | None = None) -> bool:
+    """Read-only linger probe via /var/lib/systemd/linger/<user> presence."""
+    if username is None:
+        try:
+            import pwd
+
+            username = pwd.getpwuid(os.getuid()).pw_name  # windows-footgun: ok — Linux-only linger probe
+        except (ImportError, KeyError, OSError):
+            return False
+    return (Path("/var/lib/systemd/linger") / username).is_file()
+
+
+def linger_warning(scope: InstallScope | None) -> str | None:
+    if scope is None or scope.system:
+        return None
+    if user_linger_enabled():
+        return None
+    return (
+        "User-scoped timer selected but loginctl linger is off; the timer may not "
+        "run after logout. Enable with: loginctl enable-linger $USER"
+    )
 
 
 def reconcile_units(
@@ -195,6 +267,7 @@ def reconcile_units(
     enabled: bool,
     run_systemctl: Callable[[Sequence[str]], tuple[int, str, str]] = default_systemctl_runner,
     scope: InstallScope | None = None,
+    write_stamp: Callable[[Path, str], None] | None = None,
 ) -> ReconcileResult:
     if not platform_supported():
         return ReconcileResult(
@@ -238,9 +311,9 @@ def reconcile_units(
         scope=selected,
     )
     timer_body = render_timer_unit(
-        start_hour=int(cfg.get("schedule_start_hour", 4)),
-        end_hour=int(cfg.get("schedule_end_hour", 8)),
-        randomized_delay_sec=int(cfg.get("randomized_delay_sec", 3600)),
+        schedule=str(cfg.get("schedule") or default_schedule_calendar()),
+        randomized_delay_sec=int(cfg.get("randomized_delay_sec", 1800)),
+        accuracy_sec=str(cfg.get("accuracy_sec", "1s")),
     )
 
     changed = write_units_if_changed(
@@ -253,7 +326,7 @@ def reconcile_units(
 
     legacy = migrate_legacy_units(selected, run_systemctl=run_systemctl)
     warnings = list(legacy.warnings)
-    if duplicate_scheduler_present(selected):
+    if duplicate_scheduler_present(selected, run_systemctl=run_systemctl):
         warnings.append(
             "legacy hermes-auto-update.timer still present; refusing duplicate schedulers"
         )
@@ -268,11 +341,18 @@ def reconcile_units(
         )
 
     # Enable/start TIMER ONLY — never start the oneshot service immediately.
+    if not timer_is_enabled(selected, run_systemctl=run_systemctl):
+        prestamp_timer(selected, write_stamp=write_stamp)
+
     code, _, err = run_systemctl(
         build_systemctl_cmd(selected, "enable", "--now", TIMER_NAME)
     )
     if code != 0:
         warnings.append(f"failed to enable timer: {err.strip() or code}")
+
+    linger = linger_warning(selected)
+    if linger:
+        warnings.append(linger)
 
     return ReconcileResult(
         supported=True,

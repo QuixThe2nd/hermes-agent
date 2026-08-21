@@ -6,17 +6,19 @@ from pathlib import Path
 
 import pytest
 
+from plugins.auto_update.config import default_schedule_calendar
 from plugins.auto_update.platform import InstallScope
 from plugins.auto_update.systemd import (
     SERVICE_NAME,
     TIMER_NAME,
     disable_timer,
+    format_exec_start,
+    prestamp_timer,
     reconcile_units,
     render_service_unit,
     render_timer_unit,
     service_unit_path,
     timer_unit_path,
-    write_units_if_changed,
 )
 
 
@@ -30,9 +32,9 @@ def user_scope(tmp_path) -> InstallScope:
 @pytest.fixture
 def cfg():
     return {
-        "schedule_start_hour": 4,
-        "schedule_end_hour": 8,
+        "schedule": default_schedule_calendar(),
         "randomized_delay_sec": 1800,
+        "accuracy_sec": "1s",
     }
 
 
@@ -47,15 +49,21 @@ def test_service_unit_has_no_gateway_coupling(user_scope):
     assert "BindsTo=" not in body
 
 
-def test_timer_has_persistent_and_randomized_delay(cfg, user_scope):
+def test_exec_start_quotes_paths_with_spaces():
+    line = format_exec_start(["/opt/my hermes/bin/python", "auto_update", "run"])
+    assert '"/opt/my hermes/bin/python"' in line
+
+
+def test_timer_renders_off_hours_schedule_with_delay(cfg):
     body = render_timer_unit(
-        start_hour=cfg["schedule_start_hour"],
-        end_hour=cfg["schedule_end_hour"],
+        schedule=cfg["schedule"],
         randomized_delay_sec=cfg["randomized_delay_sec"],
+        accuracy_sec=cfg["accuracy_sec"],
     )
+    assert "OnCalendar=*-*-* 04,05,06,07:00:00" in body
     assert "Persistent=true" in body
     assert "RandomizedDelaySec=1800" in body
-    assert "04,05,06,07:00:00" in body
+    assert "AccuracySec=1s" in body
     assert f"Unit={SERVICE_NAME}" in body
 
 
@@ -68,6 +76,8 @@ def test_reconcile_idempotent_and_atomic(user_scope, cfg, monkeypatch, tmp_path)
             return 0, "active\n", ""
         if args[-2:] == ["is-enabled", TIMER_NAME]:
             return 0, "enabled\n", ""
+        if args[-2:] == ["is-enabled", "hermes-auto-update.timer"]:
+            return 1, "disabled\n", ""
         return 0, "", ""
 
     monkeypatch.setattr(
@@ -84,7 +94,13 @@ def test_reconcile_idempotent_and_atomic(user_scope, cfg, monkeypatch, tmp_path)
         lambda: ["/usr/bin/python3", "-m", "hermes_cli.main", "auto_update", "run"],
     )
     monkeypatch.setattr(
-        "plugins.auto_update.legacy.duplicate_scheduler_present", lambda _scope: False
+        "plugins.auto_update.legacy.duplicate_scheduler_present",
+        lambda *_args, **_kwargs: False,
+    )
+    stamp_dir = tmp_path / "stamps"
+    monkeypatch.setattr(
+        "plugins.auto_update.systemd.timer_stamp_path",
+        lambda scope, timer_name=TIMER_NAME: stamp_dir / f"stamp-{timer_name}",
     )
 
     first = reconcile_units(cfg, enabled=True, run_systemctl=fake_systemctl)
@@ -101,9 +117,63 @@ def test_reconcile_idempotent_and_atomic(user_scope, cfg, monkeypatch, tmp_path)
     enable_calls = [c for c in calls if "enable" in c and TIMER_NAME in c]
     assert enable_calls
     assert not any("start" in c and SERVICE_NAME in c for c in calls)
+    assert not any("stop" in c and SERVICE_NAME in c for c in calls)
 
 
-def test_disabled_reconcile_preserves_explicit_disable(user_scope, cfg, monkeypatch):
+def test_first_enable_prestamps_and_does_not_start_service(
+    user_scope, cfg, monkeypatch, tmp_path
+):
+    calls: list[list[str]] = []
+    stamp_writes: list[tuple[Path, str]] = []
+
+    def fake_systemctl(args):
+        calls.append(list(args))
+        if args[-2:] == ["is-enabled", TIMER_NAME]:
+            return 1, "disabled\n", ""
+        if args[-2:] == ["is-active", TIMER_NAME]:
+            return 0, "active\n", ""
+        if args[-2:] == ["is-enabled", "hermes-auto-update.timer"]:
+            return 1, "disabled\n", ""
+        return 0, "", ""
+
+    def fake_write(path: Path, payload: str) -> None:
+        stamp_writes.append((path, payload))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(payload, encoding="utf-8")
+
+    monkeypatch.setattr("plugins.auto_update.systemd.platform_supported", lambda: True)
+    monkeypatch.setattr(
+        "plugins.auto_update.systemd.detect_install_scope", lambda: user_scope
+    )
+    monkeypatch.setattr(
+        "plugins.auto_update.systemd.get_hermes_home", lambda: tmp_path / ".hermes"
+    )
+    monkeypatch.setattr(
+        "plugins.auto_update.systemd.unit_exec_start_argv",
+        lambda: ["/usr/bin/python3", "-m", "hermes_cli.main", "auto_update", "run"],
+    )
+    monkeypatch.setattr(
+        "plugins.auto_update.legacy.duplicate_scheduler_present",
+        lambda *_args, **_kwargs: False,
+    )
+    stamp_dir = tmp_path / "stamps"
+    monkeypatch.setattr(
+        "plugins.auto_update.systemd.timer_stamp_path",
+        lambda scope, timer_name=TIMER_NAME: stamp_dir / f"stamp-{timer_name}",
+    )
+
+    reconcile_units(
+        cfg,
+        enabled=True,
+        run_systemctl=fake_systemctl,
+        write_stamp=fake_write,
+    )
+    assert stamp_writes
+    assert stamp_writes[0][0].name == f"stamp-{TIMER_NAME}"
+    assert not any("start" in c and SERVICE_NAME in c for c in calls)
+
+
+def test_disabled_reconcile_stops_timer_only(user_scope, cfg, monkeypatch):
     calls: list[list[str]] = []
 
     def fake_systemctl(args):
@@ -119,3 +189,67 @@ def test_disabled_reconcile_preserves_explicit_disable(user_scope, cfg, monkeypa
     result = reconcile_units(cfg, enabled=False, run_systemctl=fake_systemctl)
     assert result.enabled is False
     assert any("disable" in c and TIMER_NAME in c for c in calls)
+    assert not any("enable" in c for c in calls)
+    assert not any("stop" in c and SERVICE_NAME in c for c in calls)
+
+
+def test_disable_timer_never_stops_service(user_scope):
+    calls: list[list[str]] = []
+
+    def fake_systemctl(args):
+        calls.append(list(args))
+        return 0, "", ""
+
+    disable_timer(user_scope, run_systemctl=fake_systemctl)
+    assert any("disable" in c and TIMER_NAME in c for c in calls)
+    assert not any(SERVICE_NAME in c and "stop" in c for c in calls)
+
+
+def test_prestamp_timer_writes_usec_stamp(user_scope, tmp_path, monkeypatch):
+    stamp_dir = tmp_path / "stamps"
+    monkeypatch.setattr(
+        "plugins.auto_update.systemd.timer_stamp_path",
+        lambda scope, timer_name=TIMER_NAME: stamp_dir / f"stamp-{timer_name}",
+    )
+    prestamp_timer(user_scope, now_usec=1234567890000000)
+    stamp = stamp_dir / f"stamp-{TIMER_NAME}"
+    assert stamp.read_text(encoding="utf-8") == "1234567890000000"
+
+
+def test_environment_values_escape_percent_sign():
+    from plugins.auto_update.systemd import format_environment, render_service_unit
+
+    env_line = format_environment("HERMES_HOME", "/tmp/weird%home")
+    assert env_line == 'Environment="HERMES_HOME=/tmp/weird%%home"'
+    body = render_service_unit(
+        hermes_home="/tmp/weird%home",
+        exec_start=["/usr/bin/python3", "auto_update", "run"],
+        scope=None,
+    )
+    assert env_line in body
+
+
+def test_system_scope_group_from_st_gid(tmp_path, monkeypatch):
+    import grp
+    import os
+    import pwd
+
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    uid = os.getuid()
+    gid = os.getgid()
+    os.chown(home, uid, gid)
+    user = pwd.getpwuid(uid).pw_name
+    group = grp.getgrgid(gid).gr_name
+    scope = InstallScope(
+        system=True,
+        unit_dir=tmp_path / "systemd",
+        systemctl_prefix=("systemctl",),
+    )
+    body = render_service_unit(
+        hermes_home=str(home),
+        exec_start=["/usr/bin/python3", "auto_update", "run"],
+        scope=scope,
+    )
+    assert f"User={user}" in body
+    assert f"Group={group}" in body

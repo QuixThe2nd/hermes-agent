@@ -3220,9 +3220,9 @@ DEFAULT_CONFIG = {
     "auto_update": {
         "enabled": True,
         "idle_minutes": 8,
-        "schedule_start_hour": 4,
-        "schedule_end_hour": 8,
-        "randomized_delay_sec": 3600,
+        "schedule": "*-*-* 04,05,06,07:00:00",
+        "randomized_delay_sec": 1800,
+        "accuracy_sec": "1s",
         "notify_on_success": "",
         "notify_on_failure": "",
     },

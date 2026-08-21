@@ -7,7 +7,8 @@ from typing import Any, Mapping
 DEFAULT_IDLE_MINUTES = 8
 DEFAULT_SCHEDULE_START_HOUR = 4
 DEFAULT_SCHEDULE_END_HOUR = 8
-DEFAULT_RANDOMIZED_DELAY_SEC = 3600
+DEFAULT_RANDOMIZED_DELAY_SEC = 1800
+DEFAULT_ACCURACY_SEC = "1s"
 
 
 def _coerce_bool(value: Any, default: bool) -> bool:
@@ -28,6 +29,38 @@ def _coerce_int(value: Any, default: int, *, minimum: int = 0) -> int:
     return max(minimum, parsed)
 
 
+def _calendar_from_hour_window(start_hour: int, end_hour: int) -> str:
+    hours = list(range(start_hour, end_hour))
+    if not hours:
+        hours = list(range(DEFAULT_SCHEDULE_START_HOUR, DEFAULT_SCHEDULE_END_HOUR))
+    return f"*-*-* {','.join(f'{hour:02d}' for hour in hours)}:00:00"
+
+
+def default_schedule_calendar() -> str:
+    return _calendar_from_hour_window(
+        DEFAULT_SCHEDULE_START_HOUR, DEFAULT_SCHEDULE_END_HOUR
+    )
+
+
+def resolve_schedule(raw: Mapping[str, Any]) -> str:
+    """Return the systemd OnCalendar expression for auto-update."""
+    explicit = raw.get("schedule") or raw.get("schedule_calendar")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+
+    if "schedule_start_hour" in raw or "schedule_end_hour" in raw:
+        start_hour = _coerce_int(
+            raw.get("schedule_start_hour"), DEFAULT_SCHEDULE_START_HOUR, minimum=0
+        )
+        end_hour = _coerce_int(
+            raw.get("schedule_end_hour"), DEFAULT_SCHEDULE_END_HOUR, minimum=0
+        )
+        if end_hour > start_hour:
+            return _calendar_from_hour_window(start_hour, end_hour)
+
+    return default_schedule_calendar()
+
+
 def load_auto_update_config(raw: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Return normalized auto-update settings.
 
@@ -46,26 +79,19 @@ def load_auto_update_config(raw: Mapping[str, Any] | None = None) -> dict[str, A
     if not isinstance(raw, Mapping):
         raw = {}
 
-    start_hour = _coerce_int(
-        raw.get("schedule_start_hour"), DEFAULT_SCHEDULE_START_HOUR, minimum=0
-    )
-    end_hour = _coerce_int(
-        raw.get("schedule_end_hour"), DEFAULT_SCHEDULE_END_HOUR, minimum=0
-    )
-    if end_hour <= start_hour:
-        end_hour = DEFAULT_SCHEDULE_END_HOUR
-        start_hour = DEFAULT_SCHEDULE_START_HOUR
-
     return {
         "enabled": _coerce_bool(raw.get("enabled"), True),
         "idle_minutes": _coerce_int(
             raw.get("idle_minutes"), DEFAULT_IDLE_MINUTES, minimum=1
         ),
-        "schedule_start_hour": start_hour,
-        "schedule_end_hour": end_hour,
+        "schedule": resolve_schedule(raw),
         "randomized_delay_sec": _coerce_int(
-            raw.get("randomized_delay_sec"), DEFAULT_RANDOMIZED_DELAY_SEC, minimum=0
+            raw.get("randomized_delay_sec"),
+            DEFAULT_RANDOMIZED_DELAY_SEC,
+            minimum=0,
         ),
+        "accuracy_sec": str(raw.get("accuracy_sec") or DEFAULT_ACCURACY_SEC).strip()
+        or DEFAULT_ACCURACY_SEC,
         "notify_on_success": str(raw.get("notify_on_success") or "").strip(),
         "notify_on_failure": str(raw.get("notify_on_failure") or "").strip(),
     }
@@ -87,6 +113,8 @@ def plugin_explicitly_disabled(cfg: Mapping[str, Any] | None = None) -> bool:
         return True
 
     section = cfg.get("auto_update") or {}
-    if isinstance(section, Mapping) and section.get("enabled") is False:
-        return True
+    if isinstance(section, Mapping):
+        enabled = section.get("enabled")
+        if enabled is not None and not _coerce_bool(enabled, True):
+            return True
     return False

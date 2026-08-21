@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import subprocess
-from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +11,7 @@ from plugins.auto_update.idle import IdleBlocker, IdleSnapshot
 from plugins.auto_update.runner import (
     UPDATE_APPLY_ARGV,
     UPDATE_CHECK_ARGV,
+    _check_output_indicates_update_available,
     build_stock_updater_argv,
     run_scheduled_update,
 )
@@ -39,6 +39,28 @@ def test_build_stock_updater_argv_uses_public_subcommand(monkeypatch):
     ]
 
 
+def test_behind_substring_without_marker_is_not_available():
+    text = "  This checkout is 5 commit(s) BEHIND origin/main"
+    assert _check_output_indicates_update_available(text) is False
+
+
+def test_update_available_marker_is_detected():
+    text = "⚕ Update available: 2 commits behind origin/main."
+    assert _check_output_indicates_update_available(text) is True
+
+
+def test_runner_enabled_string_false_is_quiet_noop(home, monkeypatch):
+    monkeypatch.setattr(
+        "plugins.auto_update.runner.plugin_explicitly_disabled", lambda: False
+    )
+    outcome = run_scheduled_update(
+        cfg={"enabled": "false", "idle_minutes": 8, "notify_on_success": "", "notify_on_failure": ""},
+        evaluate_idle_fn=lambda *a, **k: pytest.fail("must not evaluate idle"),
+        run_cmd=lambda argv: pytest.fail("must not invoke updater"),
+    )
+    assert outcome.reason == "disabled"
+
+
 def test_runner_defers_when_not_idle(home, monkeypatch):
     monkeypatch.setattr(
         "plugins.auto_update.runner.plugin_explicitly_disabled", lambda: False
@@ -59,7 +81,7 @@ def test_runner_defers_when_not_idle(home, monkeypatch):
     assert calls["check"] == 1
 
 
-def test_runner_rechecks_idle_before_updater(home, monkeypatch):
+def test_runner_rechecks_idle_before_apply_not_before_check(home, monkeypatch):
     monkeypatch.setattr(
         "plugins.auto_update.runner.plugin_explicitly_disabled", lambda: False
     )
@@ -67,17 +89,32 @@ def test_runner_rechecks_idle_before_updater(home, monkeypatch):
         "plugins.auto_update.runner.load_auto_update_config",
         lambda: {"enabled": True, "idle_minutes": 8, "notify_on_success": "", "notify_on_failure": ""},
     )
+    monkeypatch.setattr("plugins.auto_update.runner.read_live_update", lambda: None)
     calls = {"n": 0}
+    updater_calls: list[str] = []
 
     def idle(*args, **kwargs):
         calls["n"] += 1
-        if calls["n"] == 1:
+        if calls["n"] <= 1:
             return IdleSnapshot(idle=True, blockers=())
         return IdleSnapshot(idle=False, blockers=(IdleBlocker("recent_activity", "x"),))
 
-    outcome = run_scheduled_update(evaluate_idle_fn=idle, run_cmd=lambda argv: pytest.fail("should not run"))
-    assert outcome.reason.startswith("not_idle_recheck")
+    def run_cmd(argv):
+        updater_calls.append(argv[-1])
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout="⚕ Update available: 1 commit behind origin/main.\n",
+            stderr="",
+        )
+
+    outcome = run_scheduled_update(
+        evaluate_idle_fn=idle,
+        run_cmd=run_cmd,
+    )
+    assert outcome.reason.startswith("not_idle_before_apply")
     assert calls["n"] == 2
+    assert updater_calls == ["--check"]
 
 
 def test_runner_no_update_path(home, monkeypatch):
@@ -189,18 +226,137 @@ def test_runner_lock_contention_defers(home, monkeypatch):
     assert outcome.reason == "lock_contention"
 
 
-def test_runner_does_not_import_update_internals():
+def test_runner_check_timeout_is_non_fatal(home, monkeypatch):
+    monkeypatch.setattr(
+        "plugins.auto_update.runner.plugin_explicitly_disabled", lambda: False
+    )
+    monkeypatch.setattr(
+        "plugins.auto_update.runner.load_auto_update_config",
+        lambda: {
+            "enabled": True,
+            "idle_minutes": 8,
+            "notify_on_success": "",
+            "notify_on_failure": "timeout",
+        },
+    )
+    monkeypatch.setattr("plugins.auto_update.runner.read_live_update", lambda: None)
+    emitted: list[str] = []
+    monkeypatch.setattr(
+        "plugins.auto_update.runner.emit_notification",
+        lambda msg, **kw: emitted.append(msg),
+    )
+
+    def run_cmd(argv):
+        raise subprocess.TimeoutExpired(argv, 3600)
+
+    outcome = run_scheduled_update(
+        evaluate_idle_fn=lambda *a, **k: IdleSnapshot(idle=True, blockers=()),
+        run_cmd=run_cmd,
+    )
+    assert outcome.code == 0
+    assert outcome.reason == "check_timeout"
+    assert emitted == ["timeout"]
+
+
+def test_runner_apply_timeout_is_non_fatal(home, monkeypatch):
+    monkeypatch.setattr(
+        "plugins.auto_update.runner.plugin_explicitly_disabled", lambda: False
+    )
+    monkeypatch.setattr(
+        "plugins.auto_update.runner.load_auto_update_config",
+        lambda: {
+            "enabled": True,
+            "idle_minutes": 8,
+            "notify_on_success": "",
+            "notify_on_failure": "timeout",
+        },
+    )
+    monkeypatch.setattr("plugins.auto_update.runner.read_live_update", lambda: None)
+    emitted: list[str] = []
+    monkeypatch.setattr(
+        "plugins.auto_update.runner.emit_notification",
+        lambda msg, **kw: emitted.append(msg),
+    )
+    calls = {"n": 0}
+
+    def run_cmd(argv):
+        if argv[-1] == "--check":
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout="⚕ Update available: 1 commit behind origin/main.\n",
+                stderr="",
+            )
+        raise subprocess.TimeoutExpired(argv, 3600)
+
+    outcome = run_scheduled_update(
+        evaluate_idle_fn=lambda *a, **k: IdleSnapshot(idle=True, blockers=()),
+        run_cmd=run_cmd,
+    )
+    assert outcome.code == 0
+    assert outcome.reason == "apply_timeout"
+    assert emitted == ["timeout"]
+
+
+def test_runner_live_turn_lease_defers_without_updater(home, monkeypatch):
+    monkeypatch.setattr(
+        "plugins.auto_update.runner.plugin_explicitly_disabled", lambda: False
+    )
+    monkeypatch.setattr(
+        "plugins.auto_update.runner.load_auto_update_config",
+        lambda: {"enabled": True, "idle_minutes": 8, "notify_on_success": "", "notify_on_failure": ""},
+    )
+    monkeypatch.setattr("plugins.auto_update.runner.read_live_update", lambda: None)
+    sentinel = home / "auto-update" / "sentinel.bin"
+    sentinel.parent.mkdir(parents=True, exist_ok=True)
+    sentinel.write_bytes(b"UNCHANGED")
+
+    def idle(*args, **kwargs):
+        return IdleSnapshot(
+            idle=False,
+            blockers=(IdleBlocker("live_turn", "active session turn lease"),),
+        )
+
+    outcome = run_scheduled_update(
+        evaluate_idle_fn=idle,
+        run_cmd=lambda argv: pytest.fail("must not invoke updater"),
+    )
+    assert outcome.code == 0
+    assert outcome.reason.startswith("not_idle")
+    assert sentinel.read_bytes() == b"UNCHANGED"
+
+
+def test_runner_live_delegation_defers_without_updater(home, monkeypatch):
+    monkeypatch.setattr(
+        "plugins.auto_update.runner.plugin_explicitly_disabled", lambda: False
+    )
+    monkeypatch.setattr(
+        "plugins.auto_update.runner.load_auto_update_config",
+        lambda: {"enabled": True, "idle_minutes": 8, "notify_on_success": "", "notify_on_failure": ""},
+    )
+    monkeypatch.setattr("plugins.auto_update.runner.read_live_update", lambda: None)
+    sentinel = home / "auto-update" / "sentinel.bin"
+    sentinel.parent.mkdir(parents=True, exist_ok=True)
+    sentinel.write_bytes(b"UNCHANGED")
+
+    def idle(*args, **kwargs):
+        return IdleSnapshot(
+            idle=False,
+            blockers=(IdleBlocker("live_delegation", "delegated agent running"),),
+        )
+
+    outcome = run_scheduled_update(
+        evaluate_idle_fn=idle,
+        run_cmd=lambda argv: pytest.fail("must not invoke updater"),
+    )
+    assert outcome.code == 0
+    assert outcome.reason.startswith("not_idle")
+    assert sentinel.read_bytes() == b"UNCHANGED"
+
+
+def test_runner_stock_updater_boundary():
     import plugins.auto_update.runner as runner
 
-    forbidden = (
-        "update_cmd",
-        "git pull",
-        "pre_update_backup",
-        "rollback",
-        "dashboard_procs",
-    )
-    source = runner.__doc__ or ""
-    # Behavioral boundary: runner only exposes subprocess argv builders.
     assert UPDATE_CHECK_ARGV == ("update", "--check")
     assert UPDATE_APPLY_ARGV == ("update", "--yes")
     assert callable(runner.build_stock_updater_argv)

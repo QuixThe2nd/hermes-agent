@@ -183,6 +183,83 @@ async def test_startup_one_failing_platform_does_not_block_others(monkeypatch, t
     assert Platform.TELEGRAM in runner._failed_platforms
 
 
+@pytest.mark.asyncio
+async def test_gateway_startup_invokes_on_gateway_start_hook(monkeypatch, tmp_path):
+    """Gateway startup fires on_gateway_start once after plugin discovery."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _OrderRecorder.reset()
+
+    config = GatewayConfig(
+        platforms={
+            Platform.DISCORD: PlatformConfig(enabled=True, token="***"),
+        },
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+
+    monkeypatch.setattr(
+        runner,
+        "_create_adapter",
+        lambda platform, platform_config: _TimingAdapter(platform, 0.0),
+    )
+    monkeypatch.setattr(runner, "_start_secondary_profile_adapters", lambda: 0)
+
+    call_order: list[str] = []
+
+    def track_discover():
+        call_order.append("discover")
+
+    def track_invoke(hook_name, **kwargs):
+        call_order.append(f"invoke:{hook_name}")
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", track_discover)
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", track_invoke)
+
+    await runner.start()
+
+    assert "discover" in call_order
+    assert "invoke:on_gateway_start" in call_order
+    assert call_order.index("invoke:on_gateway_start") > call_order.index("discover")
+
+
+@pytest.mark.asyncio
+async def test_gateway_startup_survives_on_gateway_start_hook_failure(
+    monkeypatch, tmp_path
+):
+    """on_gateway_start hook errors must not block gateway startup."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _OrderRecorder.reset()
+
+    config = GatewayConfig(
+        platforms={
+            Platform.DISCORD: PlatformConfig(enabled=True, token="***"),
+        },
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+
+    monkeypatch.setattr(
+        runner,
+        "_create_adapter",
+        lambda platform, platform_config: _TimingAdapter(platform, 0.0),
+    )
+    monkeypatch.setattr(runner, "_start_secondary_profile_adapters", lambda: 0)
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+
+    def exploding_invoke(hook_name, **kwargs):
+        if hook_name == "on_gateway_start":
+            raise RuntimeError("hook boom")
+        return []
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", exploding_invoke)
+
+    result = await runner.start()
+
+    assert result is True
+    assert Platform.DISCORD in runner.adapters
+
+
 class TestTelegramColdStartCap:
     """The initial (pre-`running`) Telegram connect uses a capped budget (#85993).
 

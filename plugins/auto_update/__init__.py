@@ -8,10 +8,10 @@ logger = logging.getLogger(__name__)
 
 
 def register(ctx) -> None:
+    # DEBT: ``plugins.disabled: [auto_update]`` skips ``register()`` entirely, so
+    # ``hermes auto_update disable`` is unreachable until the entry is removed.
+    # Prefer ``auto_update.enabled: false`` when you need the CLI to stay available.
     from plugins.auto_update.cli import auto_update_command, register_cli
-    from plugins.auto_update.config import load_auto_update_config, plugin_explicitly_disabled
-    from plugins.auto_update.platform import platform_supported
-    from plugins.auto_update.systemd import reconcile_units
 
     ctx.register_cli_command(
         name="auto_update",
@@ -24,12 +24,16 @@ def register(ctx) -> None:
         ),
     )
 
-    if not platform_supported():
-        return
-    if plugin_explicitly_disabled():
-        return
-    try:
-        cfg = load_auto_update_config()
-        reconcile_units(cfg, enabled=bool(cfg.get("enabled", True)))
-    except Exception as exc:
-        logger.debug("auto_update reconcile on load skipped: %s", exc)
+    def _on_gateway_start(**kwargs) -> None:
+        from plugins.auto_update.lifecycle import reconcile_scheduler_on_load
+
+        reconcile_kwargs = {}
+        if "scope" in kwargs:
+            reconcile_kwargs["scope"] = kwargs["scope"]
+        if "run_systemctl" in kwargs:
+            reconcile_kwargs["run_systemctl"] = kwargs["run_systemctl"]
+        reconcile_scheduler_on_load(**reconcile_kwargs)
+
+    register_hook = getattr(ctx, "register_hook", None)
+    if callable(register_hook):
+        register_hook("on_gateway_start", _on_gateway_start)

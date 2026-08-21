@@ -70,3 +70,86 @@ def test_compression_lock_blocks(db_path):
 def test_idle_when_no_active_sessions(db_path):
     snap = evaluate_idle(idle_minutes=8, db_path=db_path)
     assert snap.idle is True
+
+
+def test_live_turn_lease_blocks(db_path):
+    db = SessionDB(db_path=db_path)
+    now = time.time()
+    db._conn.execute(
+        """
+        INSERT INTO session_turn_leases
+            (conversation_id, holder, acquired_at, expires_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        ("conv-live", "holder-1", now, now + 60.0),
+    )
+    db._conn.commit()
+    snap = evaluate_idle(idle_minutes=8, db_path=db_path, now=now)
+    assert snap.idle is False
+    assert any(b.code == "live_turn" for b in snap.blockers)
+
+
+def test_expired_turn_lease_does_not_block(db_path):
+    db = SessionDB(db_path=db_path)
+    now = time.time()
+    db._conn.execute(
+        """
+        INSERT INTO session_turn_leases
+            (conversation_id, holder, acquired_at, expires_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        ("conv-expired", "holder-1", now - 120.0, now - 1.0),
+    )
+    db._conn.commit()
+    snap = evaluate_idle(idle_minutes=8, db_path=db_path, now=now)
+    assert snap.idle is True
+
+
+def test_running_delegation_blocks(db_path):
+    db = SessionDB(db_path=db_path)
+    now = time.time()
+    db._conn.execute(
+        """
+        INSERT INTO async_delegations
+            (delegation_id, origin_session, state, dispatched_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("delegation-running", "sess-1", "running", now, now),
+    )
+    db._conn.commit()
+    snap = evaluate_idle(idle_minutes=8, db_path=db_path, now=now)
+    assert snap.idle is False
+    assert any(b.code == "live_delegation" for b in snap.blockers)
+
+
+def test_finalizing_delegation_blocks(db_path):
+    db = SessionDB(db_path=db_path)
+    now = time.time()
+    db._conn.execute(
+        """
+        INSERT INTO async_delegations
+            (delegation_id, origin_session, state, dispatched_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("delegation-finalizing", "sess-1", "finalizing", now, now),
+    )
+    db._conn.commit()
+    snap = evaluate_idle(idle_minutes=8, db_path=db_path, now=now)
+    assert snap.idle is False
+    assert any(b.code == "live_delegation" for b in snap.blockers)
+
+
+def test_terminal_delegation_state_does_not_block(db_path):
+    db = SessionDB(db_path=db_path)
+    now = time.time()
+    db._conn.execute(
+        """
+        INSERT INTO async_delegations
+            (delegation_id, origin_session, state, dispatched_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("delegation-done", "sess-1", "completed", now, now),
+    )
+    db._conn.commit()
+    snap = evaluate_idle(idle_minutes=8, db_path=db_path, now=now)
+    assert snap.idle is True

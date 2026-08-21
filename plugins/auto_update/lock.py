@@ -24,6 +24,8 @@ def nonblocking_run_lock() -> Iterator[bool]:
     """Acquire the run lock or yield False on contention.
 
     Contention is a quiet successful deferral — callers should exit 0.
+    The lock file is left in place after release so a second opener cannot
+    recreate-and-reflock a fresh inode.
     """
     if fcntl is None:  # pragma: no cover - unsupported platform
         yield True
@@ -41,7 +43,3 @@ def nonblocking_run_lock() -> Iterator[bool]:
             yield True
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
