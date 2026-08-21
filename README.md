@@ -29,6 +29,7 @@ A developer edition of [Hermes Agent](https://github.com/NousResearch/hermes-age
   - Discord — only the completed turn-final answer reply-pings the user; streaming previews and interim messages stay standalone
   - Discord — resolve_ticket propose is terminal: the confirmation embed is the reply, no follow-up message
   - Discord — typing indicator stays lit while a background delegated task is still running
+  - Discord — MoA consult/debate progress renders as one self-editing embed per call
   - Cron — lifecycle guard blocks cron-spawned commands that would restart the gateway or rewrite the live checkout (quote-aware)
   - Memory — per-turn injection skips lines already delivered earlier in the session
   - Config — API retry backoff timing

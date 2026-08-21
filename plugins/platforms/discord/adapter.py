@@ -1024,6 +1024,88 @@ def _read_discord_prompt_timeout() -> int:
     return seconds
 
 
+# ── Tool stage embeds (self-editing MoA progress cards) ─────────────────────
+#
+# The gateway's generic tool-stage seam (agent.moa_loop's stage-event bus)
+# hands structured, allowlisted stage events to ``send_tool_stage_embed`` /
+# ``edit_tool_stage_embed``: the first event of a tool invocation creates ONE
+# embed and every later event edits that same message, so a consult/debate
+# shows its rounds without per-line bubbles. ``_tool_stage_appearance`` is a
+# pure function over the event's allowlisted fields (tool, stage, status,
+# integer counts) — it can never render a prompt, evidence, an advisor
+# answer, or raw tool arguments because those never enter the event.
+
+_TOOL_STAGE_TITLE_CAP = 100  # Discord embed title limit
+_TOOL_STAGE_DESC_CAP = 480  # conservative well under the 4096 description cap
+
+_TOOL_STAGE_LABELS: Dict[tuple[str, str], str] = {
+    ("moa_ask", "starting"): "starting",
+    ("moa_ask", "advisors"): "advisors running",
+    ("moa_ask", "aggregating"): "aggregating",
+    ("moa_debate", "starting"): "starting",
+    ("moa_debate", "proposal"): "proposal round",
+    ("moa_debate", "critique"): "critique round",
+    ("moa_debate", "revision"): "revision round",
+    ("moa_debate", "revision_skipped"): "revision round skipped",
+    ("moa_debate", "aggregating"): "aggregating",
+}
+
+_TOOL_STAGE_STATUS_MARKS: Dict[str, str] = {
+    "success": "✅ complete",
+    "partial": "⚠️ partial",
+    "degraded": "⚠️ degraded",
+    "failure": "❌ failed",
+}
+
+
+def _tool_stage_count_summary(counts: Dict[str, Any]) -> str:
+    """Render the event's integer counts as a short ' · '-joined summary."""
+    parts = []
+    for key in ("advisors", "models", "usable", "failed", "rounds"):
+        value = counts.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            parts.append(f"{value} {key}")
+    return " · ".join(parts)
+
+
+def _tool_stage_appearance(
+    tool: str, stage: str, status: Optional[str], counts: Dict[str, Any]
+) -> Tuple[str, str, str]:
+    """Map one allowlisted stage event to ``(title, description, color_key)``.
+
+    Unknown tools / stages / statuses fall back to a neutral rendering of
+    the raw ids (bounded by the title/description caps), so a future tool
+    publishing new stages still renders something sane.
+    """
+    tool = str(tool or "tool")
+    stage = str(stage or "stage")
+    summary = _tool_stage_count_summary(counts if isinstance(counts, dict) else {})
+
+    terminal_mark = _TOOL_STAGE_STATUS_MARKS.get(str(status or ""), "")
+    label = _TOOL_STAGE_LABELS.get((tool, stage), stage.replace("_", " "))
+
+    if terminal_mark:
+        title = f"{tool} — {terminal_mark}"
+        if summary:
+            description = f"Finished ({summary})"
+        else:
+            description = "Finished"
+        color_key = {
+            "success": "success",
+            "partial": "warn",
+            "degraded": "warn",
+            "failure": "failure",
+        }.get(str(status), "running")
+    else:
+        title = f"{tool} — {label}"
+        description = summary.capitalize() if summary else label.capitalize()
+        color_key = "running"
+
+    title = title[:_TOOL_STAGE_TITLE_CAP]
+    description = description[:_TOOL_STAGE_DESC_CAP]
+    return title, description, color_key
+
+
 class DiscordAdapter(BasePlatformAdapter):
     """
     Discord bot adapter.
@@ -5655,6 +5737,98 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send document, falling back to base adapter: %s", self.name, e, exc_info=True)
             return await super().send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)
+
+    def _build_tool_stage_embed(self, stage: Dict[str, Any]) -> Any:
+        """Build the embed for one allowlisted tool-stage event.
+
+        Pure rendering over ``_tool_stage_appearance``; the footer carries the
+        tool name plus a short slice of the invocation id so two concurrent
+        MoA calls are visually distinguishable in the same channel.
+        """
+        tool = str(stage.get("tool") or "tool")
+        title, description, color_key = _tool_stage_appearance(
+            tool,
+            stage.get("stage"),
+            stage.get("status"),
+            stage.get("counts") or {},
+        )
+        color_factory = {
+            "success": discord.Color.green,
+            "warn": discord.Color.orange,
+            "failure": discord.Color.red,
+            "running": discord.Color.gold,
+        }.get(color_key, discord.Color.gold)
+        embed = discord.Embed(title=title, description=description, color=color_factory())
+        invocation = str(stage.get("invocation_id") or "")
+        footer = f"{tool} · {invocation[:8]}" if invocation else tool
+        embed.set_footer(text=footer)
+        return embed
+
+    async def _tool_stage_channel(self, chat_id: str, metadata: Optional[Dict[str, Any]]):
+        """Resolve the channel a stage embed targets (thread metadata wins)."""
+        target_id = chat_id
+        if metadata and metadata.get("thread_id"):
+            target_id = metadata["thread_id"]
+        channel = self._client.get_channel(int(target_id))
+        if not channel:
+            channel = await self._client.fetch_channel(int(target_id))
+        return channel
+
+    async def send_tool_stage_embed(
+        self,
+        chat_id: str,
+        stage: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        """Send the first embed for one tool invocation's stage events.
+
+        Called by the gateway's tool-stage drain task when an invocation has
+        no embed yet; subsequent events for the same invocation go to
+        ``edit_tool_stage_embed`` instead, so each tool call owns exactly one
+        self-editing message. Failures are reported (not raised) — the
+        gateway drops them and the MoA tool result is unaffected.
+        """
+        if not self._client or not DISCORD_AVAILABLE:
+            return SendResult(success=False, error="Not connected")
+        try:
+            channel = await self._tool_stage_channel(chat_id, metadata)
+            embed = self._build_tool_stage_embed(stage)
+            msg = await channel.send(
+                embed=embed,
+                reference=self._reply_reference_for_send(reply_to, channel),
+            )
+            return SendResult(success=True, message_id=str(msg.id))
+        except Exception as e:
+            logger.debug(
+                "[%s] Failed to send tool stage embed: %s", self.name, e, exc_info=True
+            )
+            return SendResult(success=False, error=str(e))
+
+    async def edit_tool_stage_embed(
+        self,
+        chat_id: str,
+        message_id: str,
+        stage: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Edit an existing tool-stage embed in place (same message id)."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return SendResult(success=False, error="Not connected")
+        try:
+            channel = await self._tool_stage_channel(chat_id, metadata)
+            msg = channel.get_partial_message(int(message_id))
+            await msg.edit(embed=self._build_tool_stage_embed(stage))
+            return SendResult(success=True, message_id=message_id)
+        except Exception as e:
+            logger.debug(
+                "[%s] Failed to edit tool stage embed %s: %s",
+                self.name,
+                message_id,
+                e,
+                exc_info=True,
+            )
+            return SendResult(success=False, error=str(e))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Start a persistent typing indicator for a channel.
