@@ -29,7 +29,7 @@ def test_user_scope_when_home_owned_by_current_user(tmp_path, monkeypatch):
     )
     scope = detect_install_scope(
         hermes_home=home,
-        euid=1000,
+        euid=home.stat().st_uid or 1000,
         gateway_system_unit_exists=lambda: False,
         gateway_user_unit_exists=lambda: False,
         user_systemd_reachable=lambda: True,
@@ -75,7 +75,7 @@ def test_user_scope_unavailable_without_user_manager(tmp_path, monkeypatch):
     )
     assert detect_install_scope(
         hermes_home=home,
-        euid=1000,
+        euid=home.stat().st_uid or 1000,
         gateway_system_unit_exists=lambda: False,
         gateway_user_unit_exists=lambda: False,
         user_systemd_reachable=lambda: False,
