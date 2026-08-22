@@ -114,6 +114,9 @@ def request_fingerprint(
 
 def deterministic_client_agent_id(hermes_session_id: str, tool_call_id: Optional[str]) -> str:
     digest = binding_hash(hermes_session_id, tool_call_id)
+    # Cursor Cloud rejects bcIds whose UUID carries arbitrary version/variant
+    # bits (e.g. ``bc-c3aab122-5063-c41c-ee07-d0892fffa577``); force the
+    # version-5/RFC_4122 layout while keeping the value hash-derived.
     agent_uuid = uuid.UUID(digest[:32], version=5)
     return f"bc-{agent_uuid}"
 
