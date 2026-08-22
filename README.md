@@ -6,6 +6,7 @@ A developer edition of [Hermes Agent](https://github.com/NousResearch/hermes-age
 - **Tools**
   - Delegation — send coding tasks to a Cursor My Machines Cloud Agent in the target checkout, straight from chat
   - Delegation — send coding tasks to the Claude Code CLI, straight from chat
+  - Delegation — `delegate_claude_agent` supports Claude Code `/goal` headless: pass a `/goal <condition>` task and the run loops until a model judge confirms the condition met (verified with the claude-glm wrapper)
   - Delegation — delegate coding tools run unbounded by default; stall watchdog is the only kill switch
   - Delegation — `delegate_task action='list'` surfaces per-child liveness (current tool, iteration, seconds since activity, stalled flag) so a wedged subagent is distinguishable from a slow one
   - Delegation — one shared agent-CLI runner powers both delegate tools and the dev-pipeline build lanes
