@@ -387,7 +387,12 @@ DELEGATE_CLAUDE_AGENT_SCHEMA = {
         "properties": {
             "task": {
                 "type": "string",
-                "description": "The coding task brief for Claude Code to perform.",
+                "description": (
+                    "The coding task brief for Claude Code to perform. "
+                    "May start with '/goal <condition>' to run goal mode "
+                    "headless: the run auto-continues across turns until a "
+                    "model judge confirms the condition is met or impossible."
+                ),
             },
             "workdir": {
                 "type": "string",
