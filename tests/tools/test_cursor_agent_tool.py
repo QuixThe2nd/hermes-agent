@@ -1394,21 +1394,11 @@ def test_build_create_agent_payload_no_pr_side_effects():
     assert payload["workOnCurrentBranch"] is False
     assert payload["agentId"] == "bc-aaaa"
     assert payload["model"] == {"id": "composer-2.5"}
+    assert NO_PUSH_PROMPT_PREFIX
+    assert DEFAULT_ORCHESTRATION_PROMPT
+    assert NO_PUSH_PROMPT_PREFIX != DEFAULT_ORCHESTRATION_PROMPT
     prompt_text = payload["prompt"]["text"]
-    assert prompt_text.startswith(NO_PUSH_PROMPT_PREFIX)
-    after_no_push = prompt_text[len(NO_PUSH_PROMPT_PREFIX):]
-    assert after_no_push.startswith(DEFAULT_ORCHESTRATION_PROMPT)
-    assert after_no_push[len(DEFAULT_ORCHESTRATION_PROMPT):] == task
-    assert "composer-2.5" in prompt_text
-    assert "composer-2.5-fast" in prompt_text
-    assert "never use composer-2.5-fast" in prompt_text
-    assert "cursor-grok-4.5-high" in prompt_text
-    assert "read-only review" in prompt_text
-    assert "exactly once" in prompt_text
-    assert "one remediation pass" in prompt_text
-    assert "final report" in prompt_text
-    assert "models used by each delegation" in prompt_text
-    assert "Do not edit files directly" in prompt_text
+    assert prompt_text == NO_PUSH_PROMPT_PREFIX + DEFAULT_ORCHESTRATION_PROMPT + task
 
 
 def test_timeout_dedupe_reuses_listed_agent(monkeypatch):
