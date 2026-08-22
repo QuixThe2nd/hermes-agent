@@ -1159,3 +1159,17 @@ def test_repeat_invoke_terminal_receipt_agent_lookup_missing_fails_closed(cloud_
     assert cloud.get_agent_calls == 1
     assert cloud.poll_calls == 0
     assert cloud.list_calls == 0
+
+
+def test_deterministic_client_agent_id_rfc4122_uuid_v5():
+    import uuid
+
+    session_id = "sess-rfc4122"
+    tool_call_id = "call-rfc4122"
+    client_id = deterministic_client_agent_id(session_id, tool_call_id)
+    assert client_id.startswith("bc-")
+    parsed = uuid.UUID(client_id[3:])
+    assert parsed.version == 5
+    assert parsed.variant == uuid.RFC_4122
+    assert deterministic_client_agent_id(session_id, tool_call_id) == client_id
+    assert deterministic_client_agent_id("other-session", tool_call_id) != client_id

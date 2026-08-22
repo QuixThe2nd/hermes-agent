@@ -103,6 +103,16 @@ NO_PUSH_PROMPT_PREFIX = (
     "Do not git push, create a pull request, or request reviewers. "
     "Keep all changes local to this machine checkout.\n\n"
 )
+DEFAULT_ORCHESTRATION_PROMPT = (
+    "You are the parent orchestrator agent. Do not edit files directly yourself. "
+    "Delegate all implementation work to a Task subagent pinned to model composer-2.5 "
+    "(the standard variant; never use composer-2.5-fast). "
+    "After implementation completes, delegate exactly one read-only review Task pinned to model "
+    "cursor-grok-4.5-high. "
+    "If the review reports blocking findings, fix them exactly once via the implementer subagent "
+    "(one remediation pass only; do not loop). "
+    "In your final report, include the actual models used by each delegation.\n\n"
+)
 POST_TIMEOUT_SECONDS = 30.0
 HTTP_TIMEOUT_SECONDS = 30.0
 POLL_INTERVAL_SECONDS = 2.0
@@ -756,7 +766,7 @@ def build_create_agent_payload(
     """POST /v1/agents body. ``force`` must not enable pushes or PRs."""
     del force  # reserved; never maps to autoCreatePR / workOnCurrentBranch / pushes
     payload: Dict[str, Any] = {
-        "prompt": {"text": f"{NO_PUSH_PROMPT_PREFIX}{task}"},
+        "prompt": {"text": f"{NO_PUSH_PROMPT_PREFIX}{DEFAULT_ORCHESTRATION_PROMPT}{task}"},
         "name": machine_name,
         "agentId": agent_id,
         "env": {"type": "machine", "name": machine_name},
