@@ -763,13 +763,18 @@ def build_create_agent_payload(
     starting_ref: Optional[str] = None,
     force: bool = True,
 ) -> Dict[str, Any]:
-    """POST /v1/agents body. ``force`` must not enable pushes or PRs."""
+    """POST /v1/agents body. ``force`` must not enable pushes or PRs.
+
+    Runs are Cursor-hosted (no ``env`` field): self-hosted ``machine``
+    routing silently queues forever on accounts without self-hosted
+    entitlements, while Cursor-hosted runs execute and expose a live
+    ``cursor.com/agents/<id>`` progress page.
+    """
     del force  # reserved; never maps to autoCreatePR / workOnCurrentBranch / pushes
     payload: Dict[str, Any] = {
         "prompt": {"text": f"{NO_PUSH_PROMPT_PREFIX}{DEFAULT_ORCHESTRATION_PROMPT}{task}"},
         "name": machine_name,
         "agentId": agent_id,
-        "env": {"type": "machine", "name": machine_name},
         "repos": [{"url": repo_url}],
         "autoCreatePR": False,
         "skipReviewerRequest": True,
@@ -1469,16 +1474,6 @@ def _execute_cloud_delegation(
         or deterministic_client_agent_id(hermes_session_id, tool_call_id)
     )
 
-    binary = resolve_cursor_agent_binary()
-    if not binary:
-        return _make_result(
-            success=False,
-            error=(
-                "Cursor Agent CLI binary not found. Install the `agent` CLI and "
-                "ensure it is on PATH or at ~/.local/bin/agent."
-            ),
-        )
-
     cloud_agent_id = str(receipt.get("cloud_agent_id") or "")
     cloud_run_id = str(receipt.get("cloud_run_id") or "")
     agent_obj: Optional[Dict[str, Any]] = None
@@ -1560,48 +1555,38 @@ def _execute_cloud_delegation(
             starting_ref=starting_ref,
             force=force_enabled,
         )
-        worker = MachineWorker(
-            binary=binary,
-            name=machine_name,
-            workdir=str(workdir_path),
-            log_path=log_path,
-        )
         try:
-            try:
-                worker.start()
-                agent_obj, run_obj = create_agent_with_timeout_dedupe(payload, api_key=api_key)
-            except TimeoutError as exc:
-                result_json = _make_result(success=False, error=str(exc))
-                finalize_receipt(
-                    receipt_path,
-                    outcome="timeout",
-                    terminal_result={"result_json": result_json},
-                    log_path=str(log_path),
-                )
-                return result_json
-            except CursorCloudError as exc:
-                result_json = _make_result(success=False, error=str(exc))
-                finalize_receipt(
-                    receipt_path,
-                    outcome="failed",
-                    terminal_result={"result_json": result_json},
-                    log_path=str(log_path),
-                )
-                return result_json
-            except Exception as exc:
-                result_json = _make_result(
-                    success=False,
-                    error=_redact_secret(str(exc), api_key),
-                )
-                finalize_receipt(
-                    receipt_path,
-                    outcome="failed",
-                    terminal_result={"result_json": result_json},
-                    log_path=str(log_path),
-                )
-                return result_json
-        finally:
-            worker.cleanup()
+            agent_obj, run_obj = create_agent_with_timeout_dedupe(payload, api_key=api_key)
+        except TimeoutError as exc:
+            result_json = _make_result(success=False, error=str(exc))
+            finalize_receipt(
+                receipt_path,
+                outcome="timeout",
+                terminal_result={"result_json": result_json},
+                log_path=str(log_path),
+            )
+            return result_json
+        except CursorCloudError as exc:
+            result_json = _make_result(success=False, error=str(exc))
+            finalize_receipt(
+                receipt_path,
+                outcome="failed",
+                terminal_result={"result_json": result_json},
+                log_path=str(log_path),
+            )
+            return result_json
+        except Exception as exc:
+            result_json = _make_result(
+                success=False,
+                error=_redact_secret(str(exc), api_key),
+            )
+            finalize_receipt(
+                receipt_path,
+                outcome="failed",
+                terminal_result={"result_json": result_json},
+                log_path=str(log_path),
+            )
+            return result_json
 
         returned_agent_id = str(agent_obj.get("id") or "")
         if returned_agent_id != client_agent_id:

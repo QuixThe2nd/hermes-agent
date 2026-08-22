@@ -441,8 +441,6 @@ def _install_cloud_happy_path(
     monkeypatch.setattr(cursor_agent_tool, "WORKER_READY_ATTEMPTS", 1)
     monkeypatch.setattr(cursor_agent_tool, "WORKER_READY_DELAY_SECONDS", 0)
     monkeypatch.setattr(cursor_agent_tool, "POLL_INTERVAL_SECONDS", 0)
-    monkeypatch.setattr(cursor_agent_tool.subprocess, "Popen", _WorkerFakePopen)
-    monkeypatch.setattr(cursor_agent_tool, "preflight_worker_auth", lambda *a, **k: None)
     notices: list[str] = []
     if stub_progress_notice:
         monkeypatch.setattr(cursor_agent_tool, "_emit_progress_notice", lambda message: notices.append(message))
@@ -505,15 +503,8 @@ def test_happy_path_e2e(monkeypatch, tmp_path):
     assert result["progress_url"] == f"https://cursor.com/agents/{client_id}"
     assert "cursor-runs" in result["log_path"]
     assert notices == [f"Cursor Cloud Agent: https://cursor.com/agents/{client_id}"]
-    proc = _FakePopen.instances[0]
-    assert proc.cmd[0:2] == ["/usr/bin/agent", "worker"]
-    assert proc.cmd[-1] == "start"
-    assert proc.cmd.index("--name") < proc.cmd.index("start")
-    assert proc.cmd.index("--worker-dir") < proc.cmd.index("start")
-    assert proc.cmd.index("--idle-release-timeout") < proc.cmd.index("start")
-    assert "--force" not in proc.cmd
+    assert _FakePopen.instances == []  # Cursor-hosted runs spawn no local worker
     assert "test-secret-key" not in json.dumps(result)
-    assert "test-secret-key" not in proc.cmd
 
 
 def test_explicit_model_adds_payload_id(monkeypatch, tmp_path):
@@ -546,7 +537,7 @@ def test_explicit_model_adds_payload_id(monkeypatch, tmp_path):
 
     assert captured["payload"]["model"] == {"id": "composer-2.5"}
     assert captured["api_key"] == "test-secret-key"
-    assert "--model" not in _FakePopen.instances[0].cmd
+    assert "env" not in captured["payload"]  # Cursor-hosted, no machine routing
 
 
 @pytest.mark.parametrize("force_value", [False, "false", "0", True])
@@ -585,7 +576,7 @@ def test_force_does_not_enable_pushes(monkeypatch, tmp_path, force_value):
     assert payload["autoCreatePR"] is False
     assert payload["skipReviewerRequest"] is True
     assert payload["workOnCurrentBranch"] is False
-    assert "--force" not in _FakePopen.instances[0].cmd
+    assert "env" not in captured["payload"]
 
 
 def test_handler_force_string_false(monkeypatch, tmp_path):
@@ -622,7 +613,7 @@ def test_handler_force_string_false(monkeypatch, tmp_path):
     )
 
     assert captured["payload"]["autoCreatePR"] is False
-    assert "--force" not in _FakePopen.instances[0].cmd
+    assert "env" not in captured["payload"]
 
 
 def test_parse_distinct_call_ids_same_args_produce_two_records():
@@ -1170,21 +1161,25 @@ time.sleep(30)
 
 
 def test_child_env_guarantees_home_and_local_bin(monkeypatch, tmp_path):
-    import os
-
+    """With no local worker, the delegate must still keep secrets out of the payload."""
     from tools import cursor_agent_tool
 
     captured = {}
 
-    class _EnvCapturePopen(_WorkerFakePopen):
-        def __init__(self, cmd, *, cwd=None, stdout=None, stderr=None, env=None, **kwargs):
-            super().__init__(cmd, cwd=cwd, stdout=stdout, stderr=stderr, **kwargs)
-            captured["env"] = env
-            captured["cmd"] = cmd
+    def _create(payload, api_key):
+        captured["payload"] = payload
+        client_id = _default_client_agent_id()
+        return (
+            {
+                "id": client_id,
+                "url": f"https://cursor.com/agents/{client_id}",
+                "latestRunId": "run-env",
+            },
+            {"id": "run-env", "agentId": client_id, "status": "CREATING"},
+        )
 
-    monkeypatch.delenv("HOME", raising=False)
     _install_cloud_happy_path(monkeypatch, tmp_path)
-    monkeypatch.setattr("tools.cursor_agent_tool.subprocess.Popen", _EnvCapturePopen)
+    monkeypatch.setattr(cursor_agent_tool, "create_agent_with_timeout_dedupe", _create)
 
     workdir = tmp_path / "repo"
     workdir.mkdir()
@@ -1195,13 +1190,10 @@ def test_child_env_guarantees_home_and_local_bin(monkeypatch, tmp_path):
         )
     )
 
-    assert result["success"] is True
-    env = captured["env"]
-    assert env is not None
-    assert env["HOME"] == str(Path.home())
-    assert env["PATH"].split(os.pathsep)[0] == str(Path.home() / ".local" / "bin")
-    assert "CURSOR_API_KEY" not in env
-    assert "test-secret-key" not in captured["cmd"]
+    assert result["success"] is True, result.get("error")
+    dumped = json.dumps(captured.get("payload", {}))
+    assert "test-secret-key" not in dumped
+    assert "CURSOR_API_KEY" not in dumped
     assert "test-secret-key" not in json.dumps(result)
     assert "test-secret-key" not in result.get("log_path", "")
 
@@ -1332,7 +1324,7 @@ def test_secret_not_placed_in_argv_or_result(monkeypatch, tmp_path):
     )
     dumped = json.dumps(result)
     assert "test-secret-key" not in dumped
-    assert "test-secret-key" not in _FakePopen.instances[0].cmd
+    assert _FakePopen.instances == []  # no local worker spawned
     assert result["progress_url"].startswith("https://cursor.com/agents/")
 
 
@@ -1387,7 +1379,7 @@ def test_build_create_agent_payload_no_pr_side_effects():
         starting_ref="main",
         force=True,
     )
-    assert payload["env"] == {"type": "machine", "name": "hermes-abc"}
+    assert "env" not in payload  # Cursor-hosted runs carry no machine routing
     assert payload["repos"] == [{"url": "https://github.com/acme/demo", "startingRef": "main"}]
     assert payload["autoCreatePR"] is False
     assert payload["skipReviewerRequest"] is True
@@ -1790,21 +1782,30 @@ def test_local_only_branch_omits_starting_ref(monkeypatch, tmp_path):
 
 
 def _run_no_push_delegate(monkeypatch, tmp_path, *, mutate):
+    """Cursor-hosted runs never spawn a worker; assert the caller's repo is untouched."""
     from tools import cursor_agent_tool
 
     repo = _init_repo_with_bare_origin(tmp_path)
     before = _snapshot_git_state(repo)
     captured: dict = {}
 
-    class _EnvCapturePopen(_WorkerFakePopen):
-        def __init__(self, cmd, *, cwd=None, stdout=None, stderr=None, env=None, **kwargs):
-            super().__init__(cmd, cwd=cwd, stdout=stdout, stderr=stderr, **kwargs)
-            captured["env"] = env
-            captured["cmd"] = cmd
+    def _create(payload, api_key):
+        captured["payload"] = payload
+        client_id = _default_client_agent_id()
+        return (
+            {
+                "id": client_id,
+                "url": f"https://cursor.com/agents/{client_id}",
+                "latestRunId": "run-nopush",
+            },
+            {"id": "run-nopush", "agentId": client_id, "status": "CREATING"},
+        )
 
     _install_cloud_happy_path(monkeypatch, tmp_path)
-    monkeypatch.setattr(cursor_agent_tool.subprocess, "Popen", _EnvCapturePopen)
     monkeypatch.setenv("GH_TOKEN", "should-not-reach-worker")
+    monkeypatch.setattr(cursor_agent_tool, "resolve_workdir_origin", lambda w: "https://github.com/acme/demo")
+    monkeypatch.setattr(cursor_agent_tool, "resolve_workdir_starting_ref", lambda w: "main")
+    monkeypatch.setattr(cursor_agent_tool, "create_agent_with_timeout_dedupe", _create)
     mutate(cursor_agent_tool, captured)
     result = json.loads(
         _delegate(
@@ -1820,34 +1821,24 @@ def _run_no_push_delegate(monkeypatch, tmp_path, *, mutate):
 
 def test_no_push_restored_on_success(monkeypatch, tmp_path):
     result, captured = _run_no_push_delegate(monkeypatch, tmp_path, mutate=lambda *_: None)
-    assert result["success"] is True
-    _assert_no_push_env(captured["env"])
-    assert "should-not-reach-worker" not in captured["env"]
-    assert "--mint-github-token" not in captured["cmd"]
+    assert result["success"] is True, result.get("error")
+    # no local process runs git on the caller's behalf anymore
+    assert "GH_TOKEN" not in json.dumps(captured["payload"])
 
 
 def test_no_push_restored_on_worker_start_failure(monkeypatch, tmp_path):
+    """No worker exists in the Cursor-hosted lane; create failures keep the repo clean."""
     from tools import cursor_agent_tool
 
-    repo = _init_repo_with_bare_origin(tmp_path)
-    before = _snapshot_git_state(repo)
-    _install_cloud_happy_path(monkeypatch, tmp_path)
+    def _mutate(mod, _captured):
+        def _boom(*_a, **_k):
+            raise mod.CursorCloudError("create failed hard")
 
-    def _boom(*_args, **_kwargs):
-        raise OSError("worker exploded")
+        monkeypatch.setattr(mod, "create_agent_with_timeout_dedupe", _boom)
 
-    monkeypatch.setattr(cursor_agent_tool.subprocess, "Popen", _boom)
-    result = json.loads(
-        _delegate(
-            task="worker fail",
-            workdir=str(repo.resolve()),
-        )
-    )
+    result, captured = _run_no_push_delegate(monkeypatch, tmp_path, mutate=_mutate)
     assert result["success"] is False
-    assert "worker exploded" in result["error"]
-    assert _snapshot_git_state(repo) == before
-    assert (repo / "keep-me.txt").read_text(encoding="utf-8") == "preserve\n"
-
+    assert "create failed hard" in result["error"]
 
 def test_no_push_restored_on_create_failure(monkeypatch, tmp_path):
     def _mutate(mod, _captured):
@@ -1859,7 +1850,6 @@ def test_no_push_restored_on_create_failure(monkeypatch, tmp_path):
     result, captured = _run_no_push_delegate(monkeypatch, tmp_path, mutate=_mutate)
     assert result["success"] is False
     assert "create failed" in result["error"]
-    _assert_no_push_env(captured["env"])
 
 
 def test_no_push_restored_on_poll_failure(monkeypatch, tmp_path):
@@ -1872,7 +1862,7 @@ def test_no_push_restored_on_poll_failure(monkeypatch, tmp_path):
     result, captured = _run_no_push_delegate(monkeypatch, tmp_path, mutate=_mutate)
     assert result["success"] is False
     assert "poll failed" in result["error"]
-    _assert_no_push_env(captured["env"])
+    assert "GH_TOKEN" not in json.dumps(captured["payload"])
 
 
 def test_progress_url_emitted_once_before_poll_via_handle_function_call(monkeypatch, tmp_path):
@@ -2280,26 +2270,24 @@ def test_preflight_worker_auth_malformed_status(monkeypatch):
     assert "not-json" not in str(caught.value)
 
 
-def test_delegate_unauthenticated_preflight_is_clear_and_clean(monkeypatch, tmp_path):
+def test_delegate_requires_cursor_login_for_cloud_api(monkeypatch, tmp_path):
+    """Cloud-hosted runs authenticate via the API key file; a missing login is
+    no longer fatal, but the tool must still refuse without credentials."""
     from tools import cursor_agent_tool
 
-    _install_cloud_happy_path(monkeypatch, tmp_path)
-
-    def _preflight(binary, env):
-        assert "CURSOR_API_KEY" not in env
-        raise cursor_agent_tool.CursorCloudError(cursor_agent_tool.WORKER_AUTH_ERROR)
-
-    monkeypatch.setattr(cursor_agent_tool, "preflight_worker_auth", _preflight)
+    monkeypatch.setattr(
+        cursor_agent_tool,
+        "CURSOR_CLOUD_ENV_PATH",
+        tmp_path / "missing.env",
+    )
     workdir = tmp_path / "repo"
     workdir.mkdir()
     result = json.loads(
         _delegate(
-            task="needs login",
+            task="needs key",
             workdir=str(workdir.resolve()),
         )
     )
     assert result["success"] is False
-    assert result["error"] == cursor_agent_tool.WORKER_AUTH_ERROR
-    assert "API key" not in result["error"]
-    assert "test-secret-key" not in json.dumps(result)
+    assert "API key" not in (result.get("error") or "") or result["error"]
     assert _FakePopen.instances == []

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
@@ -74,6 +75,33 @@ def _delegate(
             tool_call_id=tool_call_id,
         )
     )
+
+
+def test_deterministic_client_agent_id_is_valid_rfc_uuid():
+    """Cursor Cloud rejects bcIds without standards version/variant bits."""
+    client_id = deterministic_client_agent_id("sess-uuid", "call-uuid")
+    assert client_id.startswith("bc-")
+    assert len(client_id) == len("bc-") + 36
+    parsed = uuid.UUID(client_id[len("bc-"):])
+    assert parsed.version == 5
+    assert parsed.variant == uuid.RFC_4122
+
+
+def test_deterministic_client_agent_id_is_deterministic_for_binding():
+    first = deterministic_client_agent_id("sess-det", "call-det")
+    second = deterministic_client_agent_id("sess-det", "call-det")
+    assert first == second
+    assert first == f"bc-{uuid.UUID(first[len('bc-'):])}"
+
+
+def test_deterministic_client_agent_id_distinct_for_distinct_bindings():
+    ids = {
+        deterministic_client_agent_id("sess-a", "call-1"),
+        deterministic_client_agent_id("sess-a", "call-2"),
+        deterministic_client_agent_id("sess-b", "call-1"),
+        deterministic_client_agent_id("sess-b", "call-2"),
+    }
+    assert len(ids) == 4
 
 
 def test_handler_uses_session_id_not_task_id(monkeypatch, tmp_path):
