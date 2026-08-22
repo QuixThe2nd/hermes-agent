@@ -579,6 +579,9 @@ def test_force_does_not_enable_pushes(monkeypatch, tmp_path, force_value):
 
     payload = captured["payload"]
     assert payload["prompt"]["text"].startswith(cursor_agent_tool.NO_PUSH_PROMPT_PREFIX)
+    after_no_push = payload["prompt"]["text"][len(cursor_agent_tool.NO_PUSH_PROMPT_PREFIX):]
+    assert after_no_push.startswith(cursor_agent_tool.DEFAULT_ORCHESTRATION_PROMPT)
+    assert payload["prompt"]["text"].endswith("no pushes")
     assert payload["autoCreatePR"] is False
     assert payload["skipReviewerRequest"] is True
     assert payload["workOnCurrentBranch"] is False
@@ -1368,10 +1371,15 @@ def test_worker_command_and_cleanup(monkeypatch, tmp_path):
 
 
 def test_build_create_agent_payload_no_pr_side_effects():
-    from tools.cursor_agent_tool import NO_PUSH_PROMPT_PREFIX, build_create_agent_payload
+    from tools.cursor_agent_tool import (
+        DEFAULT_ORCHESTRATION_PROMPT,
+        NO_PUSH_PROMPT_PREFIX,
+        build_create_agent_payload,
+    )
 
+    task = "fix the flaky test"
     payload = build_create_agent_payload(
-        task="fix the flaky test",
+        task=task,
         repo_url="https://github.com/acme/demo",
         machine_name="hermes-abc",
         agent_id="bc-aaaa",
@@ -1386,8 +1394,21 @@ def test_build_create_agent_payload_no_pr_side_effects():
     assert payload["workOnCurrentBranch"] is False
     assert payload["agentId"] == "bc-aaaa"
     assert payload["model"] == {"id": "composer-2.5"}
-    assert payload["prompt"]["text"].endswith("fix the flaky test")
-    assert payload["prompt"]["text"].startswith(NO_PUSH_PROMPT_PREFIX)
+    prompt_text = payload["prompt"]["text"]
+    assert prompt_text.startswith(NO_PUSH_PROMPT_PREFIX)
+    after_no_push = prompt_text[len(NO_PUSH_PROMPT_PREFIX):]
+    assert after_no_push.startswith(DEFAULT_ORCHESTRATION_PROMPT)
+    assert after_no_push[len(DEFAULT_ORCHESTRATION_PROMPT):] == task
+    assert "composer-2.5" in prompt_text
+    assert "composer-2.5-fast" in prompt_text
+    assert "never use composer-2.5-fast" in prompt_text
+    assert "cursor-grok-4.5-high" in prompt_text
+    assert "read-only review" in prompt_text
+    assert "exactly once" in prompt_text
+    assert "one remediation pass" in prompt_text
+    assert "final report" in prompt_text
+    assert "models used by each delegation" in prompt_text
+    assert "Do not edit files directly" in prompt_text
 
 
 def test_timeout_dedupe_reuses_listed_agent(monkeypatch):
